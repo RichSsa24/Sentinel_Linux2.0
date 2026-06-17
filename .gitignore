@@ -1,0 +1,63 @@
+# --- Secrets (never commit) -----------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+.secrets.baseline.local
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+*.egg-info/
+build/
+dist/
+pip-wheel-metadata/
+
+# --- Tooling ---------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- OneDrive / Windows sync artifacts -------------------------------------
+*.tmp
+~$*
+.~lock.*
+*.lnk
+
+# --- Sentinel runtime ------------------------------------------------------
+data/
+logs/
+*.sqlite
+*.sqlite3
+*.db
+fim_baseline.json
+sbom-*.json
+
+# --- Generated audit artifacts ---------------------------------------------
+requirements-audit.txt
