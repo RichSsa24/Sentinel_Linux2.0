@@ -1,0 +1,115 @@
+# Sentinel-Linux 2.0 — CI pipeline.
+#
+# Gates (must all pass): ruff lint, ruff format-check, mypy --strict, bandit,
+# pip-audit, pytest with coverage, pre-commit. Runs on a Python matrix to
+# prove forward compatibility.
+#
+# Hardening:
+# - `permissions: read-all` at the workflow level, narrowed per-job below.
+# - `concurrency` cancels stale runs on the same ref.
+# - Pinned tool versions where possible. Third-party actions are referenced by
+#   major-version tag with a comment noting SHA-pinning is recommended for
+#   production org-wide policies (see CIS Supply Chain guidance).
+
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: quality (py${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4   # SHA-pin in org policy for production
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies (frozen, hash-verified)
+        run: uv sync --frozen --python ${{ matrix.python-version }}
+
+      - name: Ruff — lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Ruff — format check
+        run: uv run ruff format --check .
+
+      - name: Mypy — strict types
+        run: uv run mypy
+
+      - name: Bandit — security lint
+        run: uv run bandit -r src/ -c pyproject.toml
+
+      - name: pip-audit — known-vulnerable dependencies
+        run: |
+          # `--quiet` silences the resolver status line that newer `uv` prints
+          # to stdout; without it the file gets a leading non-requirement line
+          # that pip-audit's strict mode rejects.
+          uv export --quiet --format requirements-txt --no-emit-project \
+            --no-hashes -o requirements-audit.txt
+          uv run pip-audit -r requirements-audit.txt --strict
+
+      - name: Pytest — coverage
+        run: |
+          uv run pytest \
+            --cov=src/sentinel \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=xml
+
+      - name: Upload coverage XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  precommit:
+    name: pre-commit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies (frozen)
+        run: uv sync --frozen
+
+      - name: Run pre-commit (all files)
+        run: uv run pre-commit run --all-files --show-diff-on-failure
