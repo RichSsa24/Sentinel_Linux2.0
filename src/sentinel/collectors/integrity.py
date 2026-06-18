@@ -43,17 +43,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
 from sentinel.collectors.base import AbstractCollector
-from sentinel.events import (
-    Event,
-    EventCategory,
-    EventKind,
-    EventMeta,
-    EventOutcome,
-    File,
-    FileHash,
-    Host,
-)
 from sentinel.logging import get_logger
+from sentinel.normalizer import Normalizer, RawFileEvent
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -100,6 +91,7 @@ class FileIntegrityCollector(AbstractCollector):
         host: str | None = None,
         max_hash_bytes: int = _DEFAULT_MAX_HASH_BYTES,
         max_files: int = _DEFAULT_MAX_FILES,
+        normalizer: Normalizer | None = None,
         name: str | None = None,
     ) -> None:
         super().__init__(name=name)
@@ -115,6 +107,7 @@ class FileIntegrityCollector(AbstractCollector):
         self._host = host or socket.gethostname() or "localhost"
         self._max_hash_bytes = max_hash_bytes
         self._max_files = max_files
+        self._normalizer = normalizer or Normalizer()
         self._log = get_logger("sentinel.collectors.integrity")
         self._baseline: dict[str, _FileState] = {}
         self._seeded = False
@@ -130,15 +123,18 @@ class FileIntegrityCollector(AbstractCollector):
         await self._drain_once(queue)
 
     async def _drain_once(self, queue: BoundedEventQueue) -> None:
-        """Scan, diff against the baseline, and enqueue the resulting events."""
+        """Scan, diff, normalize each change, and enqueue the resulting events."""
         snapshot = await asyncio.to_thread(self._scan)
         if not self._seeded:
             self._baseline = snapshot
             self._seeded = True
             return
-        events = self._diff(self._baseline, snapshot)
+        records = self._diff(self._baseline, snapshot)
         self._baseline = snapshot
-        for event in events:
+        for raw in records:
+            event = self._normalizer.normalize(raw)
+            if event is None:
+                continue  # unmappable record: dead-lettered by the normalizer
             self._emitted += 1
             await queue.put(event)
 
@@ -209,67 +205,65 @@ class FileIntegrityCollector(AbstractCollector):
 
     # ------------------------------------------------------------------ diffing
 
-    def _diff(self, old: dict[str, _FileState], new: dict[str, _FileState]) -> list[Event]:
-        """Compute the create/modify/attrs/delete events between two snapshots."""
-        events: list[Event] = []
+    def _diff(self, old: dict[str, _FileState], new: dict[str, _FileState]) -> list[RawFileEvent]:
+        """Compute create/modify/attrs/delete raw records between two snapshots."""
+        records: list[RawFileEvent] = []
         for path, state in new.items():
             previous = old.get(path)
             if previous is None:
-                events.append(self._created(path, state))
+                records.append(self._created(path, state))
             elif _content_changed(previous, state):
-                events.append(self._modified(path, state))
+                records.append(self._modified(path, state))
             elif previous.mode != state.mode:
-                events.append(self._attrs_modified(path, state))
+                records.append(self._attrs_modified(path, state))
         for path, previous in old.items():
             if path not in new:
-                events.append(self._deleted(path, previous))
-        return events
+                records.append(self._deleted(path, previous))
+        return records
 
     # ------------------------------------------------------------------ builders
 
-    def _created(self, path: str, state: _FileState) -> Event:
+    def _created(self, path: str, state: _FileState) -> RawFileEvent:
         seed = state.sha256 or f"{state.size}:{state.mtime_ns}"
-        return self._build(path, state, _ACTION_CREATED, _SEV_CREATED, seed)
+        return self._raw(path, state, _ACTION_CREATED, _SEV_CREATED, seed)
 
-    def _modified(self, path: str, state: _FileState) -> Event:
+    def _modified(self, path: str, state: _FileState) -> RawFileEvent:
         # Fall back to size+mtime as the fingerprint when the file is unhashable,
         # so a later edit (new mtime) still reads as a distinct modification.
         seed = state.sha256 or f"{state.size}:{state.mtime_ns}"
-        return self._build(path, state, _ACTION_MODIFIED, _SEV_MODIFIED, seed)
+        return self._raw(path, state, _ACTION_MODIFIED, _SEV_MODIFIED, seed)
 
-    def _attrs_modified(self, path: str, state: _FileState) -> Event:
-        return self._build(path, state, _ACTION_ATTRS, _SEV_ATTRS, f"{state.mode:04o}")
+    def _attrs_modified(self, path: str, state: _FileState) -> RawFileEvent:
+        return self._raw(path, state, _ACTION_ATTRS, _SEV_ATTRS, f"{state.mode:04o}")
 
-    def _deleted(self, path: str, state: _FileState) -> Event:
+    def _deleted(self, path: str, state: _FileState) -> RawFileEvent:
         seed = state.sha256 or f"{state.size}:{state.mtime_ns}"
-        return self._build(path, state, _ACTION_DELETED, _SEV_DELETED, seed)
+        return self._raw(path, state, _ACTION_DELETED, _SEV_DELETED, seed)
 
-    def _build(self, path: str, state: _FileState, action: str, severity: int, seed: str) -> Event:
-        """Assemble an ECS file event with a content-derived, dedup-safe id."""
-        return Event(
-            timestamp=datetime.now(tz=UTC),
-            event=EventMeta(
-                id=Event.compute_id(path, action, seed),
-                kind=EventKind.EVENT,
-                category=EventCategory.FILE,
-                action=action,
-                outcome=EventOutcome.SUCCESS,
-                severity=severity,
-            ),
-            host=Host(name=self._host),
-            file=File(
-                path=path,
-                size=state.size,
-                mode=f"{state.mode:04o}",
-                hash=FileHash(sha256=state.sha256),
-            ),
-            message=f"{action}: {path}",
+    def _raw(
+        self, path: str, state: _FileState, action: str, severity: int, seed: str
+    ) -> RawFileEvent:
+        """Build the raw file record the normalizer maps to an ECS Event."""
+        return RawFileEvent(
+            occurred_at=datetime.now(tz=UTC),
+            host=self._host,
+            action=action,
+            severity=severity,
+            path=path,
+            size=state.size,
+            mode=f"{state.mode:04o}",
+            sha256=state.sha256,
+            id_seed=seed,
         )
 
     @property
     def stats(self) -> dict[str, int]:
         """Snapshot counters for observability and tests."""
-        return {"emitted": self._emitted, "watched": len(self._baseline)}
+        return {
+            "emitted": self._emitted,
+            "watched": len(self._baseline),
+            "dead_lettered": self._normalizer.stats["dead_letters"],
+        }
 
 
 def _content_changed(old: _FileState, new: _FileState) -> bool:

@@ -25,10 +25,11 @@ from pathlib import Path
 import pytest
 
 from sentinel.collectors.authlog import AuthLogCollector, parse_auth_line
-from sentinel.events import Event, EventCategory, EventOutcome
+from sentinel.events import Event
+from sentinel.normalizer import Normalizer, RawSource
 from sentinel.pipeline.queue import BoundedEventQueue
 from sentinel.pipeline.runner import Pipeline
-from tests.conftest import settings_no_env_file
+from tests.conftest import DeadLetterNormalizer, settings_no_env_file
 
 YEAR = 2026
 
@@ -62,74 +63,74 @@ async def _wait_for(predicate: Callable[[], bool], timeout: float = 5.0) -> bool
 
 class TestParseRecognised:
     def test_failed_password(self) -> None:
-        event = parse_auth_line(_line(), year=YEAR)
+        raw = parse_auth_line(_line(), year=YEAR)
 
-        assert event is not None
-        assert event.event.category is EventCategory.AUTHENTICATION
-        assert event.event.action == "ssh_login_failed"
-        assert event.event.outcome is EventOutcome.FAILURE
-        assert event.event.severity == 4
-        assert event.source.ip == "10.0.0.9"
-        assert event.source.port == 4242
-        assert event.source.user == "bob"
-        assert event.host.name == "testhost"
-        assert event.timestamp == datetime(2026, 6, 16, 12, 0, 0, tzinfo=UTC)
+        assert raw is not None
+        assert raw.source is RawSource.AUTH
+        assert raw.action == "ssh_login_failed"
+        assert raw.outcome == "failure"
+        assert raw.severity == 4
+        assert raw.ip == "10.0.0.9"
+        assert raw.port == 4242
+        assert raw.user == "bob"
+        assert raw.host == "testhost"
+        assert raw.occurred_at == datetime(2026, 6, 16, 12, 0, 0, tzinfo=UTC)
 
     def test_failed_password_invalid_user_is_louder(self) -> None:
         body = "Failed password for invalid user root from 1.2.3.4 port 22 ssh2"
-        event = parse_auth_line(_line(body), year=YEAR)
+        raw = parse_auth_line(_line(body), year=YEAR)
 
-        assert event is not None
-        assert event.event.action == "ssh_login_failed"
-        assert event.event.severity == 5
-        assert event.source.user == "root"
+        assert raw is not None
+        assert raw.action == "ssh_login_failed"
+        assert raw.severity == 5
+        assert raw.user == "root"
 
     def test_accepted_password(self) -> None:
         body = "Accepted password for alice from 192.168.1.5 port 51000 ssh2"
-        event = parse_auth_line(_line(body), year=YEAR)
+        raw = parse_auth_line(_line(body), year=YEAR)
 
-        assert event is not None
-        assert event.event.action == "ssh_login_succeeded"
-        assert event.event.outcome is EventOutcome.SUCCESS
-        assert event.event.severity == 2
-        assert event.source.user == "alice"
+        assert raw is not None
+        assert raw.action == "ssh_login_succeeded"
+        assert raw.outcome == "success"
+        assert raw.severity == 2
+        assert raw.user == "alice"
 
     def test_accepted_publickey(self) -> None:
         body = "Accepted publickey for carol from 10.1.1.1 port 40000 ssh2: RSA SHA256:abc"
-        event = parse_auth_line(_line(body), year=YEAR)
+        raw = parse_auth_line(_line(body), year=YEAR)
 
-        assert event is not None
-        assert event.event.action == "ssh_login_succeeded"
-        assert event.source.user == "carol"
+        assert raw is not None
+        assert raw.action == "ssh_login_succeeded"
+        assert raw.user == "carol"
 
     def test_invalid_user_standalone(self) -> None:
         body = "Invalid user admin from 203.0.113.7 port 5000"
-        event = parse_auth_line(_line(body), year=YEAR)
+        raw = parse_auth_line(_line(body), year=YEAR)
 
-        assert event is not None
-        assert event.event.action == "ssh_login_failed"
-        assert event.event.severity == 5
-        assert event.source.user == "admin"
+        assert raw is not None
+        assert raw.action == "ssh_login_failed"
+        assert raw.severity == 5
+        assert raw.user == "admin"
 
     def test_double_space_day_field(self) -> None:
-        event = parse_auth_line(_line(day=" 6"), year=YEAR)
+        raw = parse_auth_line(_line(day=" 6"), year=YEAR)
 
-        assert event is not None
-        assert event.timestamp == datetime(2026, 6, 6, 12, 0, 0, tzinfo=UTC)
+        assert raw is not None
+        assert raw.occurred_at == datetime(2026, 6, 6, 12, 0, 0, tzinfo=UTC)
 
     def test_non_utc_timezone_is_converted(self) -> None:
         # 12:00 at a -04:00 offset is 16:00 UTC. A fixed offset keeps the test
         # independent of whether an IANA tz database is installed.
-        event = parse_auth_line(_line(), year=YEAR, tz=timezone(timedelta(hours=-4)))
+        raw = parse_auth_line(_line(), year=YEAR, tz=timezone(timedelta(hours=-4)))
 
-        assert event is not None
-        assert event.timestamp == datetime(2026, 6, 16, 16, 0, 0, tzinfo=UTC)
+        assert raw is not None
+        assert raw.occurred_at == datetime(2026, 6, 16, 16, 0, 0, tzinfo=UTC)
 
     def test_host_override_wins(self) -> None:
-        event = parse_auth_line(_line(), year=YEAR, host_override="canonical-host")
+        raw = parse_auth_line(_line(), year=YEAR, host_override="canonical-host")
 
-        assert event is not None
-        assert event.host.name == "canonical-host"
+        assert raw is not None
+        assert raw.host == "canonical-host"
 
 
 class TestParseRejected:
@@ -162,24 +163,21 @@ class TestParseRejected:
 
 
 class TestDeterministicId:
-    def test_same_line_yields_same_event_id(self) -> None:
-        first = parse_auth_line(_line(), year=YEAR)
-        second = parse_auth_line(_line(), year=YEAR)
+    def _id(self, line: str) -> str:
+        raw = parse_auth_line(line, year=YEAR)
+        assert raw is not None
+        event = Normalizer().normalize(raw)
+        assert event is not None
+        return event.event.id
 
-        assert first is not None
-        assert second is not None
-        assert first.event.id == second.event.id
+    def test_same_line_yields_same_event_id(self) -> None:
+        # The same line parsed and normalized twice must hash to the same id —
+        # this is what collapses a post-rotation re-read in the dedup window.
+        assert self._id(_line()) == self._id(_line())
 
     def test_different_source_yields_different_id(self) -> None:
-        a = parse_auth_line(_line(), year=YEAR)
-        b = parse_auth_line(
-            _line("Failed password for bob from 10.0.0.10 port 4242 ssh2"),
-            year=YEAR,
-        )
-
-        assert a is not None
-        assert b is not None
-        assert a.event.id != b.event.id
+        other = _line("Failed password for bob from 10.0.0.10 port 4242 ssh2")
+        assert self._id(_line()) != self._id(other)
 
 
 async def _collect_events(
@@ -201,6 +199,22 @@ async def _collect_events(
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2.0)
     return received
+
+
+class TestDeadLetter:
+    @pytest.mark.asyncio
+    async def test_dead_lettered_line_is_skipped_not_enqueued(self, tmp_path: Path) -> None:
+        log = tmp_path / "auth.log"
+        log.write_text(_line() + "\n", encoding="utf-8")  # a recognised auth line
+        collector = AuthLogCollector(
+            log, poll_interval=0.02, year=YEAR, normalizer=DeadLetterNormalizer()
+        )
+        queue = BoundedEventQueue(maxsize=4)
+
+        await collector._drain_once(queue)
+
+        assert queue.empty()
+        assert collector.stats["parsed"] == 0
 
 
 class TestConstruction:

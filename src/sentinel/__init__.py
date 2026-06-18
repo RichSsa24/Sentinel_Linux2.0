@@ -21,6 +21,7 @@ from sentinel.events import (
     Process,
     Source,
 )
+from sentinel.normalizer import Normalizer, RawEvent, RawSource
 from sentinel.pipeline import BoundedEventQueue, DedupWindow, EventConsumer, Pipeline
 from sentinel.settings import (
     BackpressurePolicy,
@@ -52,9 +53,12 @@ __all__ = [
     "LogFormat",
     "LogLevel",
     "NetworkCollector",
+    "Normalizer",
     "Pipeline",
     "Process",
     "ProcessCollector",
+    "RawEvent",
+    "RawSource",
     "Settings",
     "Source",
     "__version__",

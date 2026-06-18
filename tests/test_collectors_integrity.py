@@ -31,7 +31,7 @@ from sentinel.collectors.integrity import (
 from sentinel.events import Event
 from sentinel.pipeline.queue import BoundedEventQueue
 from sentinel.pipeline.runner import Pipeline
-from tests.conftest import settings_no_env_file
+from tests.conftest import DeadLetterNormalizer, settings_no_env_file
 
 H1 = "a" * 64
 H2 = "b" * 64
@@ -74,59 +74,57 @@ class TestConstruction:
 
 class TestDiff:
     def test_created(self, tmp_path: Path) -> None:
-        events = _collector(tmp_path)._diff({}, {"/etc/x": _state(H1)})
+        records = _collector(tmp_path)._diff({}, {"/etc/x": _state(H1)})
 
-        assert len(events) == 1
-        assert events[0].event.action == "file_created"
-        assert events[0].event.category.value == "file"
-        assert events[0].file is not None
-        assert events[0].file.path == "/etc/x"
-        assert events[0].file.hash.sha256 == H1
+        assert len(records) == 1
+        assert records[0].action == "file_created"
+        assert records[0].path == "/etc/x"
+        assert records[0].sha256 == H1
 
     def test_modified_on_content_change(self, tmp_path: Path) -> None:
-        events = _collector(tmp_path)._diff({"/etc/x": _state(H1)}, {"/etc/x": _state(H2)})
+        records = _collector(tmp_path)._diff({"/etc/x": _state(H1)}, {"/etc/x": _state(H2)})
 
-        assert len(events) == 1
-        assert events[0].event.action == "file_modified"
-        assert events[0].file is not None
-        assert events[0].file.hash.sha256 == H2
+        assert len(records) == 1
+        assert records[0].action == "file_modified"
+        assert records[0].sha256 == H2
 
     def test_attributes_modified_on_mode_change_only(self, tmp_path: Path) -> None:
-        events = _collector(tmp_path)._diff(
+        records = _collector(tmp_path)._diff(
             {"/etc/x": _state(H1, mode=0o644)},
             {"/etc/x": _state(H1, mode=0o600)},
         )
 
-        assert len(events) == 1
-        assert events[0].event.action == "file_attributes_modified"
-        assert events[0].file is not None
-        assert events[0].file.mode == "0600"
+        assert len(records) == 1
+        assert records[0].action == "file_attributes_modified"
+        assert records[0].mode == "0600"
 
     def test_content_change_takes_precedence_over_mode(self, tmp_path: Path) -> None:
-        events = _collector(tmp_path)._diff(
+        records = _collector(tmp_path)._diff(
             {"/etc/x": _state(H1, mode=0o644)},
             {"/etc/x": _state(H2, mode=0o600)},
         )
 
-        assert len(events) == 1
-        assert events[0].event.action == "file_modified"
+        assert len(records) == 1
+        assert records[0].action == "file_modified"
 
     def test_deleted(self, tmp_path: Path) -> None:
-        events = _collector(tmp_path)._diff({"/etc/x": _state(H1)}, {})
+        records = _collector(tmp_path)._diff({"/etc/x": _state(H1)}, {})
 
-        assert len(events) == 1
-        assert events[0].event.action == "file_deleted"
+        assert len(records) == 1
+        assert records[0].action == "file_deleted"
 
     def test_unchanged_emits_nothing(self, tmp_path: Path) -> None:
         snap = {"/etc/x": _state(H1)}
         assert _collector(tmp_path)._diff(snap, dict(snap)) == []
 
-    def test_same_change_is_deterministically_ided(self, tmp_path: Path) -> None:
+    def test_same_change_yields_the_same_id_seed(self, tmp_path: Path) -> None:
         collector = _collector(tmp_path)
         first = collector._diff({}, {"/etc/x": _state(H1)})
         second = collector._diff({}, {"/etc/x": _state(H1)})
 
-        assert first[0].event.id == second[0].event.id
+        # Same change -> same content fingerprint -> the normalizer derives the
+        # same event.id, collapsing a re-baseline race in the dedup window.
+        assert first[0].id_seed == second[0].id_seed
 
 
 class TestContentChanged:
@@ -296,6 +294,21 @@ class TestSafeDegradation:
 
         monkeypatch.setattr(Path, "open", _denied)
         assert _collector(tmp_path)._hash_file(target) is None
+
+
+class TestDeadLetter:
+    @pytest.mark.asyncio
+    async def test_unmappable_record_is_skipped_not_enqueued(self, tmp_path: Path) -> None:
+        watched = tmp_path / "f.txt"
+        watched.write_text("v1", encoding="utf-8")
+        collector = _collector(tmp_path, normalizer=DeadLetterNormalizer())
+        await _drain(collector)  # baseline includes f.txt
+
+        watched.write_text("v2-changed-content", encoding="utf-8")
+        events = await _drain(collector)
+
+        assert events == []
+        assert collector.stats["emitted"] == 0
 
 
 class TestExactlyOnceUnderRebaseline:

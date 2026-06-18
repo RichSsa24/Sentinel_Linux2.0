@@ -48,16 +48,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
 from sentinel.collectors.base import AbstractCollector
-from sentinel.events import (
-    Event,
-    EventCategory,
-    EventKind,
-    EventMeta,
-    EventOutcome,
-    Host,
-    Process,
-)
 from sentinel.logging import get_logger
+from sentinel.normalizer import Normalizer, RawProcessEvent
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -130,6 +122,7 @@ class ProcessCollector(AbstractCollector):
         poll_interval: float = 1.0,
         host: str | None = None,
         max_procs: int = _DEFAULT_MAX_PROCS,
+        normalizer: Normalizer | None = None,
         name: str | None = None,
     ) -> None:
         super().__init__(name=name)
@@ -140,6 +133,7 @@ class ProcessCollector(AbstractCollector):
         self._poll = poll_interval
         self._host = host or socket.gethostname() or "localhost"
         self._max_procs = max_procs
+        self._normalizer = normalizer or Normalizer()
         self._log = get_logger("sentinel.collectors.process")
         self._baseline: dict[int, _ProcState] = {}
         self._seeded = False
@@ -155,15 +149,18 @@ class ProcessCollector(AbstractCollector):
         await self._drain_once(queue)
 
     async def _drain_once(self, queue: BoundedEventQueue) -> None:
-        """Scan /proc, diff against the baseline, and enqueue the events."""
+        """Scan /proc, diff, normalize each change, and enqueue the events."""
         snapshot = await asyncio.to_thread(self._scan)
         if not self._seeded:
             self._baseline = snapshot
             self._seeded = True
             return
-        events = self._diff(self._baseline, snapshot)
+        records = self._diff(self._baseline, snapshot)
         self._baseline = snapshot
-        for event in events:
+        for raw in records:
+            event = self._normalizer.normalize(raw)
+            if event is None:
+                continue  # unmappable record: dead-lettered by the normalizer
             self._emitted += 1
             await queue.put(event)
 
@@ -237,52 +234,50 @@ class ProcessCollector(AbstractCollector):
 
     # ------------------------------------------------------------------ diffing
 
-    def _diff(self, old: dict[int, _ProcState], new: dict[int, _ProcState]) -> list[Event]:
-        """Compute start/stop events between two process snapshots."""
-        events: list[Event] = []
+    def _diff(
+        self, old: dict[int, _ProcState], new: dict[int, _ProcState]
+    ) -> list[RawProcessEvent]:
+        """Compute start/stop raw records between two process snapshots."""
+        records: list[RawProcessEvent] = []
         for pid, state in new.items():
             previous = old.get(pid)
             if previous is None:
-                events.append(self._started(state))
+                records.append(self._started(state))
             elif previous.starttime != state.starttime:
                 # pid recycled: the old instance ended, a new one began.
-                events.append(self._stopped(previous))
-                events.append(self._started(state))
+                records.append(self._stopped(previous))
+                records.append(self._started(state))
         for pid, previous in old.items():
             if pid not in new:
-                events.append(self._stopped(previous))
-        return events
+                records.append(self._stopped(previous))
+        return records
 
-    def _started(self, state: _ProcState) -> Event:
-        return self._build(state, _ACTION_STARTED, _SEV_STARTED)
+    def _started(self, state: _ProcState) -> RawProcessEvent:
+        return self._raw(state, _ACTION_STARTED, _SEV_STARTED)
 
-    def _stopped(self, state: _ProcState) -> Event:
-        return self._build(state, _ACTION_STOPPED, _SEV_STOPPED)
+    def _stopped(self, state: _ProcState) -> RawProcessEvent:
+        return self._raw(state, _ACTION_STOPPED, _SEV_STOPPED)
 
-    def _build(self, state: _ProcState, action: str, severity: int) -> Event:
-        """Assemble an ECS process event with a dedup-safe, identity-derived id."""
-        return Event(
-            timestamp=datetime.now(tz=UTC),
-            event=EventMeta(
-                id=Event.compute_id(state.pid, state.starttime, action),
-                kind=EventKind.EVENT,
-                category=EventCategory.PROCESS,
-                action=action,
-                outcome=EventOutcome.SUCCESS,
-                severity=severity,
-            ),
-            host=Host(name=self._host),
-            process=Process(
-                pid=state.pid,
-                ppid=state.ppid,
-                name=state.comm or None,
-                executable=state.executable,
-                command_line=state.cmdline,
-            ),
-            message=f"{action}: pid={state.pid} {state.comm}".rstrip(),
+    def _raw(self, state: _ProcState, action: str, severity: int) -> RawProcessEvent:
+        """Build the raw process record the normalizer maps to an ECS Event."""
+        return RawProcessEvent(
+            occurred_at=datetime.now(tz=UTC),
+            host=self._host,
+            action=action,
+            severity=severity,
+            pid=state.pid,
+            ppid=state.ppid,
+            starttime=state.starttime,
+            comm=state.comm,
+            cmdline=state.cmdline,
+            executable=state.executable,
         )
 
     @property
     def stats(self) -> dict[str, int]:
         """Snapshot counters for observability and tests."""
-        return {"emitted": self._emitted, "tracked": len(self._baseline)}
+        return {
+            "emitted": self._emitted,
+            "tracked": len(self._baseline),
+            "dead_lettered": self._normalizer.stats["dead_letters"],
+        }

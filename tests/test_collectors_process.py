@@ -31,7 +31,7 @@ from sentinel.collectors.process import (
 from sentinel.events import Event
 from sentinel.pipeline.queue import BoundedEventQueue
 from sentinel.pipeline.runner import Pipeline
-from tests.conftest import settings_no_env_file
+from tests.conftest import DeadLetterNormalizer, settings_no_env_file
 
 
 def _stat_line(pid: int, *, comm: str, ppid: int, starttime: int) -> str:
@@ -263,6 +263,19 @@ class TestScanning:
 
         assert len(events) == 1
         assert events[0].process.executable == "/usr/bin/python3"
+
+
+class TestDeadLetter:
+    @pytest.mark.asyncio
+    async def test_unmappable_record_is_skipped_not_enqueued(self, tmp_path: Path) -> None:
+        collector = _collector(tmp_path, normalizer=DeadLetterNormalizer())
+        await _drain(collector)  # baseline
+
+        _mkproc(tmp_path, 4321, comm="payload")
+        events = await _drain(collector)
+
+        assert events == []
+        assert collector.stats["emitted"] == 0
 
 
 class TestExactlyOnceUnderRebaseline:

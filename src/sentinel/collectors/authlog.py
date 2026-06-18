@@ -36,16 +36,8 @@ from typing import TYPE_CHECKING, Final, NamedTuple
 from pydantic import ValidationError
 
 from sentinel.collectors.base import AbstractCollector
-from sentinel.events import (
-    Event,
-    EventCategory,
-    EventKind,
-    EventMeta,
-    EventOutcome,
-    Host,
-    Source,
-)
 from sentinel.logging import get_logger
+from sentinel.normalizer import Normalizer, RawAuthEvent
 
 if TYPE_CHECKING:
     from sentinel.pipeline.queue import BoundedEventQueue
@@ -63,6 +55,11 @@ _SEV_INVALID: Final[int] = 5
 
 _ACTION_OK: Final[str] = "ssh_login_succeeded"
 _ACTION_FAIL: Final[str] = "ssh_login_failed"
+
+# ECS event.outcome values. Kept as plain strings here so the collector stays
+# decoupled from the event schema; the normalizer maps them onto EventOutcome.
+_OUTCOME_OK: Final[str] = "success"
+_OUTCOME_FAIL: Final[str] = "failure"
 
 # Locale-independent month lookup — never rely on strptime("%b") here.
 _MONTHS: Final[dict[str, int]] = {
@@ -97,7 +94,7 @@ class _Body(NamedTuple):
     ip: str
     port: str
     action: str
-    outcome: EventOutcome
+    outcome: str
     severity: int
 
 
@@ -108,19 +105,19 @@ def _match_body(msg: str) -> _Body | None:
         severity = _SEV_INVALID if failed["invalid"] else _SEV_FAILED
         return _Body(
             failed["user"], failed["ip"], failed["port"],
-            _ACTION_FAIL, EventOutcome.FAILURE, severity,
+            _ACTION_FAIL, _OUTCOME_FAIL, severity,
         )  # fmt: skip
     accepted = _ACCEPTED_RE.match(msg)
     if accepted is not None:
         return _Body(
             accepted["user"], accepted["ip"], accepted["port"],
-            _ACTION_OK, EventOutcome.SUCCESS, _SEV_ACCEPTED,
+            _ACTION_OK, _OUTCOME_OK, _SEV_ACCEPTED,
         )  # fmt: skip
     invalid = _INVALID_RE.match(msg)
     if invalid is not None:
         return _Body(
             invalid["user"], invalid["ip"], invalid["port"],
-            _ACTION_FAIL, EventOutcome.FAILURE, _SEV_INVALID,
+            _ACTION_FAIL, _OUTCOME_FAIL, _SEV_INVALID,
         )  # fmt: skip
     return None
 
@@ -148,13 +145,16 @@ def parse_auth_line(
     year: int,
     tz: tzinfo = UTC,
     host_override: str | None = None,
-) -> Event | None:
-    """Parse one auth-log line into an :class:`Event`, or ``None`` if unrecognised.
+) -> RawAuthEvent | None:
+    """Parse one auth-log line into a :class:`RawAuthEvent`, or ``None``.
 
-    ``year`` and ``tz`` supply the calendar context that syslog's timestamp
-    omits. The resulting ``event.id`` is a deterministic hash over the line's
-    identity fields, so the same line parsed twice yields the same id — which is
-    exactly what lets the dedup window collapse a post-rotation re-read.
+    Returns ``None`` for a line that is not a recognised sshd auth event, and
+    also for a structurally-auth-shaped line carrying an out-of-range value
+    (e.g. ``port > 65535``) — the raw model rejects it rather than coercing
+    (§3.3), and the collector counts it as skipped. ``year`` and ``tz`` supply
+    the calendar context syslog's timestamp omits; the raw ``syslog_ts`` is kept
+    so the normalizer derives a stable ``event.id`` (the same line yields the
+    same id, which is what lets the dedup window collapse a post-rotation re-read).
     """
     if len(line) > _MAX_LINE_LEN:
         return None
@@ -168,27 +168,21 @@ def parse_auth_line(
     if timestamp is None:
         return None
 
-    host = host_override or syslog["host"]
-    pid = syslog["pid"] or ""
-    event_id = Event.compute_id(syslog["ts"], host, pid, body.action, body.user, body.ip, body.port)
     try:
-        return Event(
-            timestamp=timestamp,
-            event=EventMeta(
-                id=event_id,
-                kind=EventKind.EVENT,
-                category=EventCategory.AUTHENTICATION,
-                action=body.action,
-                outcome=body.outcome,
-                severity=body.severity,
-            ),
-            host=Host(name=host),
-            source=Source(ip=body.ip, port=int(body.port), user=body.user),
+        return RawAuthEvent(
+            occurred_at=timestamp,
+            host=host_override or syslog["host"],
+            syslog_ts=syslog["ts"],
+            pid=syslog["pid"] or "",
+            action=body.action,
+            outcome=body.outcome,
+            severity=body.severity,
+            user=body.user,
+            ip=body.ip,
+            port=int(body.port),
             message=syslog["msg"],
         )
     except ValidationError:
-        # A structurally-auth-shaped but out-of-range line (e.g. port > 65535):
-        # reject rather than coerce. The collector counts it as skipped.
         return None
 
 
@@ -205,6 +199,7 @@ class AuthLogCollector(AbstractCollector):
         year: int | None = None,
         tz: tzinfo = UTC,
         host_override: str | None = None,
+        normalizer: Normalizer | None = None,
         name: str | None = None,
     ) -> None:
         super().__init__(name=name)
@@ -216,6 +211,7 @@ class AuthLogCollector(AbstractCollector):
         self._year = year if year is not None else datetime.now(tz=UTC).year
         self._tz = tz
         self._host_override = host_override
+        self._normalizer = normalizer or Normalizer()
         self._log = get_logger("sentinel.collectors.authlog")
         # Tail state. `_pos` is the byte offset already consumed; `_buf` holds a
         # trailing partial line (no newline yet) carried to the next read.
@@ -241,15 +237,18 @@ class AuthLogCollector(AbstractCollector):
             self._log.warning("authlog.read_error", path=str(self._path), error=str(exc))
             return
         for line in lines:
-            event = parse_auth_line(
+            raw = parse_auth_line(
                 line,
                 year=self._year,
                 tz=self._tz,
                 host_override=self._host_override,
             )
-            if event is None:
+            if raw is None:
                 self._skipped += 1
                 continue
+            event = self._normalizer.normalize(raw)
+            if event is None:
+                continue  # unmappable record: dead-lettered by the normalizer
             self._parsed += 1
             await queue.put(event)
 
@@ -284,4 +283,5 @@ class AuthLogCollector(AbstractCollector):
             "parsed": self._parsed,
             "skipped": self._skipped,
             "position": self._pos,
+            "dead_lettered": self._normalizer.stats["dead_letters"],
         }

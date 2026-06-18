@@ -8,6 +8,19 @@ from collections.abc import Iterator
 import pytest
 
 from sentinel import Settings
+from sentinel.events import Event
+from sentinel.normalizer import Normalizer, RawEvent
+
+
+class DeadLetterNormalizer(Normalizer):
+    """A normalizer that dead-letters every record.
+
+    Injected into a collector to exercise its fail-closed skip path: an
+    unmappable record must be dropped (not enqueued, not crashing the producer).
+    """
+
+    def normalize(self, raw: RawEvent) -> Event | None:
+        return None
 
 
 @pytest.fixture(autouse=True)

@@ -55,17 +55,8 @@ from sentinel.collectors.netparse import (
     SocketKey,
     parse_net_line,
 )
-from sentinel.events import (
-    Destination,
-    Event,
-    EventCategory,
-    EventKind,
-    EventMeta,
-    EventOutcome,
-    Host,
-    Source,
-)
 from sentinel.logging import get_logger
+from sentinel.normalizer import Normalizer, RawNetworkEvent
 
 if TYPE_CHECKING:
     from sentinel.pipeline.queue import BoundedEventQueue
@@ -107,6 +98,7 @@ class NetworkCollector(AbstractCollector):
         host: str | None = None,
         max_sockets: int = _DEFAULT_MAX_SOCKETS,
         track_connections: bool = True,
+        normalizer: Normalizer | None = None,
         name: str | None = None,
     ) -> None:
         super().__init__(name=name)
@@ -120,6 +112,7 @@ class NetworkCollector(AbstractCollector):
         # When False, only listening sockets are tracked — far lower volume on a
         # busy host, at the cost of outbound-connection (beaconing) visibility.
         self._tracked_states = _TRACKED_STATES if track_connections else _LISTEN_ONLY
+        self._normalizer = normalizer or Normalizer()
         self._log = get_logger("sentinel.collectors.network")
         self._baseline: dict[SocketKey, Socket] = {}
         self._seeded = False
@@ -135,15 +128,18 @@ class NetworkCollector(AbstractCollector):
         await self._drain_once(queue)
 
     async def _drain_once(self, queue: BoundedEventQueue) -> None:
-        """Scan /proc/net, diff against the baseline, and enqueue the events."""
+        """Scan /proc/net, diff, normalize each change, and enqueue the events."""
         snapshot = await asyncio.to_thread(self._scan)
         if not self._seeded:
             self._baseline = snapshot
             self._seeded = True
             return
-        events = self._diff(self._baseline, snapshot)
+        records = self._diff(self._baseline, snapshot)
         self._baseline = snapshot
-        for event in events:
+        for raw in records:
+            event = self._normalizer.normalize(raw)
+            if event is None:
+                continue  # unmappable record: dead-lettered by the normalizer
             self._emitted += 1
             await queue.put(event)
 
@@ -174,59 +170,52 @@ class NetworkCollector(AbstractCollector):
 
     # ------------------------------------------------------------------ diffing
 
-    def _diff(self, old: dict[SocketKey, Socket], new: dict[SocketKey, Socket]) -> list[Event]:
-        """Compute open/close events between two socket snapshots."""
-        events: list[Event] = []
-        events.extend(self._appeared(s) for k, s in new.items() if k not in old)
-        events.extend(self._disappeared(s) for k, s in old.items() if k not in new)
-        return events
+    def _diff(
+        self, old: dict[SocketKey, Socket], new: dict[SocketKey, Socket]
+    ) -> list[RawNetworkEvent]:
+        """Compute open/close raw records between two socket snapshots."""
+        records: list[RawNetworkEvent] = []
+        records.extend(self._appeared(s) for k, s in new.items() if k not in old)
+        records.extend(self._disappeared(s) for k, s in old.items() if k not in new)
+        return records
 
-    def _appeared(self, sock: Socket) -> Event:
+    def _appeared(self, sock: Socket) -> RawNetworkEvent:
         if sock.state == STATE_LISTEN:
-            return self._build(sock, _ACTION_LISTEN_OPEN, _SEV_LISTEN_OPEN)
-        return self._build(sock, _ACTION_CONN_OPEN, _SEV_CONN_OPEN)
+            return self._raw(sock, _ACTION_LISTEN_OPEN, _SEV_LISTEN_OPEN)
+        return self._raw(sock, _ACTION_CONN_OPEN, _SEV_CONN_OPEN)
 
-    def _disappeared(self, sock: Socket) -> Event:
+    def _disappeared(self, sock: Socket) -> RawNetworkEvent:
         if sock.state == STATE_LISTEN:
-            return self._build(sock, _ACTION_LISTEN_CLOSE, _SEV_LISTEN_CLOSE)
-        return self._build(sock, _ACTION_CONN_CLOSE, _SEV_CONN_CLOSE)
+            return self._raw(sock, _ACTION_LISTEN_CLOSE, _SEV_LISTEN_CLOSE)
+        return self._raw(sock, _ACTION_CONN_CLOSE, _SEV_CONN_CLOSE)
 
-    def _build(self, sock: Socket, action: str, severity: int) -> Event:
-        """Assemble an ECS network event with a dedup-safe, identity-derived id."""
-        event_id = Event.compute_id(
-            sock.proto, sock.local_ip, sock.local_port,
-            sock.remote_ip, sock.remote_port, sock.inode, action,
-        )  # fmt: skip
-        return Event(
-            timestamp=datetime.now(tz=UTC),
-            event=EventMeta(
-                id=event_id,
-                kind=EventKind.EVENT,
-                category=EventCategory.NETWORK,
-                action=action,
-                outcome=EventOutcome.SUCCESS,
-                severity=severity,
-            ),
-            host=Host(name=self._host),
-            source=Source(ip=sock.local_ip, port=sock.local_port),
-            destination=self._destination(sock),
-            message=self._message(sock, action),
+    def _raw(self, sock: Socket, action: str, severity: int) -> RawNetworkEvent:
+        """Build the raw socket record the normalizer maps to an ECS Event.
+
+        The decoded ``state`` rides along so the normalizer can decide whether a
+        record has a peer (a connection) or not (a listener) — that ECS shaping
+        is the normalizer's job, not the collector's.
+        """
+        return RawNetworkEvent(
+            occurred_at=datetime.now(tz=UTC),
+            host=self._host,
+            action=action,
+            severity=severity,
+            proto=sock.proto,
+            local_ip=sock.local_ip,
+            local_port=sock.local_port,
+            remote_ip=sock.remote_ip,
+            remote_port=sock.remote_port,
+            state=sock.state,
+            uid=sock.uid,
+            inode=sock.inode,
         )
-
-    def _destination(self, sock: Socket) -> Destination:
-        """Remote peer for a connection; empty for a listener (no fixed peer)."""
-        if sock.state == STATE_LISTEN:
-            return Destination()
-        return Destination(ip=sock.remote_ip, port=sock.remote_port)
-
-    def _message(self, sock: Socket, action: str) -> str:
-        local = f"{sock.local_ip}:{sock.local_port}"
-        if sock.state == STATE_LISTEN:
-            return f"{action}: {sock.proto} {local} (uid={sock.uid})"
-        remote = f"{sock.remote_ip}:{sock.remote_port}"
-        return f"{action}: {sock.proto} {local} -> {remote} (uid={sock.uid})"
 
     @property
     def stats(self) -> dict[str, int]:
         """Snapshot counters for observability and tests."""
-        return {"emitted": self._emitted, "tracked": len(self._baseline)}
+        return {
+            "emitted": self._emitted,
+            "tracked": len(self._baseline),
+            "dead_lettered": self._normalizer.stats["dead_letters"],
+        }

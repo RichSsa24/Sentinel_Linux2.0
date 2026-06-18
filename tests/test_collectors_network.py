@@ -28,7 +28,7 @@ from sentinel.collectors.network import NetworkCollector
 from sentinel.events import Event
 from sentinel.pipeline.queue import BoundedEventQueue
 from sentinel.pipeline.runner import Pipeline
-from tests.conftest import settings_no_env_file
+from tests.conftest import DeadLetterNormalizer, settings_no_env_file
 
 _HEADER = (
     "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
@@ -363,6 +363,20 @@ class TestScanning:
         actions = sorted(e.event.action for e in events)
         assert actions == ["network_listen_started", "network_listen_stopped"]
         assert len({e.event.id for e in events}) == 2
+
+
+class TestDeadLetter:
+    @pytest.mark.asyncio
+    async def test_unmappable_record_is_skipped_not_enqueued(self, tmp_path: Path) -> None:
+        _mk_net(tmp_path, tcp=[])
+        collector = _collector(tmp_path, normalizer=DeadLetterNormalizer())
+        await _drain(collector)  # empty baseline
+
+        _mk_net(tmp_path, tcp=[_row(local="0.0.0.0", lport=4444, inode=77)])
+        events = await _drain(collector)
+
+        assert events == []
+        assert collector.stats["emitted"] == 0
 
 
 class TestExactlyOnceUnderRebaseline:
