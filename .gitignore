@@ -61,3 +61,6 @@ sbom-*.json
 
 # --- Generated audit artifacts ---------------------------------------------
 requirements-audit.txt
+
+# --- Internal working notes (not shipped) ----------------------------------
+CHECKPOINT.md
