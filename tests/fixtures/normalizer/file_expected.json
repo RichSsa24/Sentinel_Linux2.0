@@ -1,0 +1,40 @@
+{
+  "timestamp": "2026-06-17T12:00:02Z",
+  "event": {
+    "id": "ab546aa856b071ffdfdacf252f359bdd8d0583967e16b6cfa18980f684385475",
+    "kind": "event",
+    "category": "file",
+    "action": "file_modified",
+    "outcome": "success",
+    "severity": 4
+  },
+  "host": {
+    "name": "web-01"
+  },
+  "source": {
+    "ip": null,
+    "port": null,
+    "user": null
+  },
+  "destination": {
+    "ip": null,
+    "port": null,
+    "user": null
+  },
+  "process": {
+    "pid": null,
+    "ppid": null,
+    "name": null,
+    "executable": null,
+    "command_line": null
+  },
+  "file": {
+    "path": "/etc/passwd",
+    "size": 2048,
+    "mode": "0644",
+    "hash": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "message": "file_modified: /etc/passwd"
+}

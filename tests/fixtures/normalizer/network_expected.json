@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-06-17T12:00:03Z",
+  "event": {
+    "id": "f03983bfe9cc337005631816151a3a4a5f245b8836f4e3965266204a3bcf3eb0",
+    "kind": "event",
+    "category": "network",
+    "action": "network_listen_started",
+    "outcome": "success",
+    "severity": 4
+  },
+  "host": {
+    "name": "web-01"
+  },
+  "source": {
+    "ip": "0.0.0.0",
+    "port": 4444,
+    "user": null
+  },
+  "destination": {
+    "ip": null,
+    "port": null,
+    "user": null
+  },
+  "process": {
+    "pid": null,
+    "ppid": null,
+    "name": null,
+    "executable": null,
+    "command_line": null
+  },
+  "file": null,
+  "message": "network_listen_started: tcp 0.0.0.0:4444 (uid=0)"
+}

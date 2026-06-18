@@ -1,0 +1,15 @@
+{
+  "source": "network",
+  "occurred_at": "2026-06-17T12:00:03Z",
+  "host": "web-01",
+  "action": "network_listen_started",
+  "severity": 4,
+  "proto": "tcp",
+  "local_ip": "0.0.0.0",
+  "local_port": 4444,
+  "remote_ip": "0.0.0.0",
+  "remote_port": 0,
+  "state": "LISTEN",
+  "uid": 0,
+  "inode": 90210
+}

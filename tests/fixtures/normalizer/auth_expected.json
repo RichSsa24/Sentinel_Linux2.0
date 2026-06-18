@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-06-17T12:00:00Z",
+  "event": {
+    "id": "186e33648222119314e35e51904d7af89ed8d8c69d7183a9f489743944ca8d56",
+    "kind": "event",
+    "category": "authentication",
+    "action": "ssh_login_failed",
+    "outcome": "failure",
+    "severity": 5
+  },
+  "host": {
+    "name": "web-01"
+  },
+  "source": {
+    "ip": "203.0.113.7",
+    "port": 51234,
+    "user": "root"
+  },
+  "destination": {
+    "ip": null,
+    "port": null,
+    "user": null
+  },
+  "process": {
+    "pid": null,
+    "ppid": null,
+    "name": null,
+    "executable": null,
+    "command_line": null
+  },
+  "file": null,
+  "message": "Failed password for invalid user root from 203.0.113.7 port 51234 ssh2"
+}

