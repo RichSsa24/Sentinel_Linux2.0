@@ -56,7 +56,8 @@ repos:
           (?x)^(
             \.secrets\.baseline|
             uv\.lock|
-            \.env\.example
+            \.env\.example|
+            tests/fixtures/.*
           )$
 
   # --- Mypy (strict, first-party only) ----------------------------------
