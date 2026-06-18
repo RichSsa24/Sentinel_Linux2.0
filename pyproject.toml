@@ -29,9 +29,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/RichSsa24/Sentinel_Linux"
-Repository = "https://github.com/RichSsa24/Sentinel_Linux"
-Issues = "https://github.com/RichSsa24/Sentinel_Linux/issues"
+Homepage = "https://github.com/RichSsa24/Sentinel_Linux2.0"
+Repository = "https://github.com/RichSsa24/Sentinel_Linux2.0"
+Issues = "https://github.com/RichSsa24/Sentinel_Linux2.0/issues"
 
 [dependency-groups]
 dev = [
@@ -105,6 +105,7 @@ ignore = [
     "ANN",     # tests don't need full annotations
     "ARG",     # fixtures appear unused
     "PLR2004", # magic numbers in assertions
+    "S104",    # "0.0.0.0" is fixture data (a simulated listener), not a real bind
     "S105",    # hard-coded fake passwords for redaction tests
     "S106",    # hard-coded fake passwords as kwargs
 ]
