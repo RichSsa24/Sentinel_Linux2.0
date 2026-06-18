@@ -43,6 +43,20 @@ class LogFormat(StrEnum):
     CONSOLE = "console"
 
 
+class BackpressurePolicy(StrEnum):
+    """How the bounded event queue behaves when a producer outpaces the consumer.
+
+    `BLOCK` is the safe default: the producer awaits a free slot and slows down
+    to match consumer throughput (lossless). `DROP_NEWEST` is for hard-real-time
+    paths where falling behind is preferable to blocking the producer — a
+    counter records how many events were dropped so the loss is observable
+    rather than silent (OWASP A09 — log everything that matters).
+    """
+
+    BLOCK = "block"
+    DROP_NEWEST = "drop_newest"
+
+
 ENV_PREFIX: Final[str] = "SENTINEL_"
 
 
@@ -73,6 +87,41 @@ class Settings(BaseSettings):
     log_format: LogFormat = Field(
         default=LogFormat.JSON,
         description="Renderer for the structlog pipeline. Use json in production.",
+    )
+    queue_maxsize: int = Field(
+        default=10_000,
+        ge=1,
+        le=1_000_000,
+        description=(
+            "Bounded asyncio.Queue capacity for the pipeline spine. "
+            "Caps memory under flood (no unbounded growth)."
+        ),
+    )
+    queue_backpressure: BackpressurePolicy = Field(
+        default=BackpressurePolicy.BLOCK,
+        description=(
+            "Policy when the queue is full. BLOCK is lossless and applies "
+            "backpressure to the producer; DROP_NEWEST is lossy but bounded."
+        ),
+    )
+    dedup_window_seconds: float = Field(
+        default=60.0,
+        gt=0.0,
+        le=86_400.0,
+        description=(
+            "TTL for the dedup window. Two events with the same content-hash "
+            "inside this window are treated as the same event (the v1 "
+            "race-condition kill)."
+        ),
+    )
+    dedup_max_entries: int = Field(
+        default=100_000,
+        ge=1,
+        le=10_000_000,
+        description=(
+            "Hard cap on dedup window size. Memory bound — oldest entries are "
+            "evicted first when the cap is hit."
+        ),
     )
 
     @model_validator(mode="after")

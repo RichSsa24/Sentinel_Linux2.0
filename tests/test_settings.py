@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from sentinel import Environment, LogFormat, LogLevel
+from sentinel import BackpressurePolicy, Environment, LogFormat, LogLevel
 from tests.conftest import settings_no_env_file
 
 
@@ -77,3 +77,43 @@ class TestSettingsImmutability:
         settings = settings_no_env_file()
         with pytest.raises(ValidationError):
             settings.env = Environment.PRODUCTION
+
+
+class TestPipelineSettings:
+    def test_safe_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "development")
+        s = settings_no_env_file()
+        assert s.queue_maxsize == 10_000
+        assert s.queue_backpressure is BackpressurePolicy.BLOCK
+        assert s.dedup_window_seconds == 60.0
+        assert s.dedup_max_entries == 100_000
+
+    def test_overrides_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "production")
+        monkeypatch.setenv("SENTINEL_QUEUE_MAXSIZE", "256")
+        monkeypatch.setenv("SENTINEL_QUEUE_BACKPRESSURE", "drop_newest")
+        monkeypatch.setenv("SENTINEL_DEDUP_WINDOW_SECONDS", "30")
+        monkeypatch.setenv("SENTINEL_DEDUP_MAX_ENTRIES", "5000")
+        s = settings_no_env_file()
+        assert s.queue_maxsize == 256
+        assert s.queue_backpressure is BackpressurePolicy.DROP_NEWEST
+        assert s.dedup_window_seconds == 30.0
+        assert s.dedup_max_entries == 5000
+
+    def test_rejects_zero_queue_maxsize(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "development")
+        monkeypatch.setenv("SENTINEL_QUEUE_MAXSIZE", "0")
+        with pytest.raises(ValidationError):
+            settings_no_env_file()
+
+    def test_rejects_negative_dedup_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "development")
+        monkeypatch.setenv("SENTINEL_DEDUP_WINDOW_SECONDS", "-1")
+        with pytest.raises(ValidationError):
+            settings_no_env_file()
+
+    def test_rejects_invalid_backpressure_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "development")
+        monkeypatch.setenv("SENTINEL_QUEUE_BACKPRESSURE", "panic")
+        with pytest.raises(ValidationError):
+            settings_no_env_file()
