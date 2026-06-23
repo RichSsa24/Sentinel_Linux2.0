@@ -25,6 +25,8 @@ classifiers = [
 dependencies = [
     "pydantic>=2.8,<3",
     "pydantic-settings>=2.5,<3",
+    "pyyaml>=6.0",
+    "regex>=2024.5.15",
     "structlog>=24.4",
 ]
 
@@ -108,8 +110,12 @@ ignore = [
     "S104",    # "0.0.0.0" is fixture data (a simulated listener), not a real bind
     "S105",    # hard-coded fake passwords for redaction tests
     "S106",    # hard-coded fake passwords as kwargs
+    "S108",    # "/tmp/..." paths are fixture data (simulated malware), not real temp use
 ]
 "scripts/**/*.py" = ["T20"]  # scripts may print
+# Stubs mirror external APIs whose names we don't control (regex.compile,
+# regex.error); allow the builtin-shadowing and non-CapWords those require.
+"stubs/**/*.pyi" = ["A001", "A002", "N801", "N802", "N818"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["sentinel"]
@@ -126,6 +132,8 @@ docstring-code-format = true
 [tool.mypy]
 python_version = "3.12"
 strict = true
+# Local stubs for untyped third-party deps (yaml, regex) — see stubs/.
+mypy_path = "stubs"
 show_error_codes = true
 show_column_numbers = true
 warn_unreachable = true
