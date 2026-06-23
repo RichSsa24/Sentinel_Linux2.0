@@ -70,4 +70,5 @@ repos:
           - pydantic>=2.8
           - pydantic-settings>=2.5
           - structlog>=24.4
+          - httpx>=0.27
         files: ^src/sentinel/
