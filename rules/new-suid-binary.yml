@@ -1,0 +1,17 @@
+id: new-suid-binary
+title: New or newly-setuid binary
+description: >-
+  A file appears or has its mode changed to carry the setuid bit (mode 4xxx-7xxx).
+  A fresh setuid root binary is a textbook privilege-escalation persistence trick.
+severity: 6
+attack: [T1548.001]
+nist_csf: [DE.CM]
+d3fend: [D3-FA]
+references:
+  - https://attack.mitre.org/techniques/T1548/001/
+condition:
+  all:
+    - any:
+        - {field: event.action, op: equals, value: file_created}
+        - {field: event.action, op: equals, value: file_attributes_modified}
+    - {field: file.mode, op: regex, value: '^[4-7][0-7]{3}$'}

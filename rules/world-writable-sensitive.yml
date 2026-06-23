@@ -1,0 +1,15 @@
+id: world-writable-sensitive
+title: World-writable file in a system path
+description: >-
+  A file under /etc, /bin, /sbin, or /usr made writable by everyone (other-write
+  bit set). World-writable system files invite tampering and privilege abuse.
+severity: 5
+attack: [T1222.002]
+nist_csf: [DE.CM]
+d3fend: [D3-FA]
+references:
+  - https://attack.mitre.org/techniques/T1222/002/
+condition:
+  all:
+    - {field: file.path, op: regex, value: '^/(?:etc|bin|sbin|usr)/'}
+    - {field: file.mode, op: regex, value: '[2367]$'}

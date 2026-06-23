@@ -1,0 +1,15 @@
+id: suspicious-tmp-exec
+title: Process executing from a temporary directory
+description: >-
+  A process started from /tmp, /var/tmp, or /dev/shm. Legitimate software rarely
+  runs from world-writable temp dirs; dropped malware frequently does.
+severity: 6
+attack: [T1059]
+nist_csf: [DE.CM]
+d3fend: [D3-PSA]
+references:
+  - https://attack.mitre.org/techniques/T1059/
+condition:
+  all:
+    - {field: event.action, op: equals, value: process_started}
+    - {field: process.executable, op: regex, value: '^/(?:tmp|var/tmp|dev/shm)/'}

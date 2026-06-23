@@ -1,0 +1,15 @@
+id: ssh-root-login
+title: Successful SSH login as root
+description: >-
+  A successful interactive SSH session opened directly as root. Direct root
+  login is widely disabled; a success is either misconfiguration or a foothold.
+severity: 5
+attack: [T1078.003]
+nist_csf: [DE.CM]
+d3fend: [D3-UBA]
+references:
+  - https://attack.mitre.org/techniques/T1078/003/
+condition:
+  all:
+    - {field: event.action, op: equals, value: ssh_login_succeeded}
+    - {field: source.user, op: equals, value: root}

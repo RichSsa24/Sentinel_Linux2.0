@@ -1,0 +1,15 @@
+id: passwd-file-modified
+title: Account database (/etc/passwd) modified
+description: >-
+  A content change to /etc/passwd, consistent with adding a backdoor account or
+  altering a uid/shell for persistence or privilege escalation.
+severity: 6
+attack: [T1098]
+nist_csf: [DE.CM]
+d3fend: [D3-FA]
+references:
+  - https://attack.mitre.org/techniques/T1098/
+condition:
+  all:
+    - {field: file.path, op: equals, value: /etc/passwd}
+    - {field: event.action, op: equals, value: file_modified}

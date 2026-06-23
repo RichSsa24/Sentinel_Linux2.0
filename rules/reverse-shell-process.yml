@@ -1,0 +1,16 @@
+id: reverse-shell-process
+title: Reverse-shell-style process invocation
+description: >-
+  A command line bearing the hallmarks of an interactive reverse shell —
+  netcat with -e, a /dev/tcp redirection, an interactive shell flag, or a
+  Python pty/socket one-liner.
+severity: 7
+attack: [T1059.004]
+nist_csf: [DE.CM, DE.AE]
+d3fend: [D3-PSA]
+references:
+  - https://attack.mitre.org/techniques/T1059/004/
+condition:
+  field: process.command_line
+  op: regex
+  value: '(?:\bnc\b|\bncat\b|\bnetcat\b).*\s-e|/dev/(?:tcp|udp)/|(?:bash|sh|zsh|dash)\s+-i|python[0-9]?\b.*(?:pty\.spawn|socket\.socket)'

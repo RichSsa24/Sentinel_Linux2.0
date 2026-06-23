@@ -1,0 +1,15 @@
+id: shadow-file-modified
+title: Shadow password file modified
+description: >-
+  A change to /etc/shadow or /etc/gshadow. These hold password hashes; a write
+  is consistent with credential theft, backdoor accounts, or hash tampering.
+severity: 7
+attack: [T1003.008]
+nist_csf: [DE.CM]
+d3fend: [D3-FA]
+references:
+  - https://attack.mitre.org/techniques/T1003/008/
+condition:
+  field: file.path
+  op: regex
+  value: '^/etc/g?shadow$'

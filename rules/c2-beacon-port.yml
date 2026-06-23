@@ -1,0 +1,17 @@
+id: c2-beacon-port
+title: Outbound connection to a known C2 port
+description: >-
+  An established outbound connection whose destination port matches ports
+  commonly used by reverse shells and C2 frameworks (Metasploit, Empire, etc.).
+severity: 6
+attack: [T1571]
+nist_csf: [DE.AE]
+d3fend: [D3-NTA]
+references:
+  - https://attack.mitre.org/techniques/T1571/
+condition:
+  all:
+    - {field: event.action, op: equals, value: network_connection_opened}
+    - field: destination.port
+      op: in
+      value: [1337, 4444, 4445, 5555, 6666, 6667, 8888, 9001, 12345, 31337]

@@ -1,0 +1,18 @@
+id: new-listening-service
+title: New listening service on an unexpected port
+description: >-
+  A socket began listening on a port outside the set of common, expected
+  services — the shape of a backdoor or an unauthorized daemon.
+severity: 4
+attack: [T1571]
+nist_csf: [DE.CM]
+d3fend: [D3-NTA]
+references:
+  - https://attack.mitre.org/techniques/T1571/
+condition:
+  all:
+    - {field: event.action, op: equals, value: network_listen_started}
+    - field: source.port
+      op: not_in
+      value: [22, 25, 53, 80, 110, 111, 123, 143, 443, 465, 587, 631, 993, 995,
+              3306, 5432, 5353, 6379, 8080, 8443, 11211, 27017]

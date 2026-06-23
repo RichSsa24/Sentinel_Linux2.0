@@ -1,0 +1,15 @@
+id: base64-execution
+title: Base64-decoded command execution
+description: >-
+  A command line that pipes or decodes base64, a common obfuscation wrapper for
+  staging and executing a payload while evading naive string matching.
+severity: 5
+attack: [T1027]
+nist_csf: [DE.CM]
+d3fend: [D3-PSA]
+references:
+  - https://attack.mitre.org/techniques/T1027/
+condition:
+  field: process.command_line
+  op: regex
+  value: 'base64\s+(?:-d|--decode|-{1,2}d)\b|\|\s*base64\b'

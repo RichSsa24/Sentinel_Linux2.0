@@ -1,0 +1,15 @@
+id: cron-persistence
+title: Cron-based persistence
+description: >-
+  A change to a cron location (/etc/cron*, /etc/crontab, /var/spool/cron).
+  Scheduled tasks are a common, durable persistence mechanism.
+severity: 5
+attack: [T1053.003]
+nist_csf: [DE.CM, PR.PS]
+d3fend: [D3-FA]
+references:
+  - https://attack.mitre.org/techniques/T1053/003/
+condition:
+  field: file.path
+  op: regex
+  value: '^(?:/etc/cron|/etc/crontab|/var/spool/cron)'

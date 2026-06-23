@@ -1,0 +1,15 @@
+id: account-creation
+title: Local account creation
+description: >-
+  Invocation of useradd/adduser/newusers. Creating a local account can be
+  legitimate administration or an attacker establishing persistence.
+severity: 5
+attack: [T1136.001]
+nist_csf: [DE.CM]
+d3fend: [D3-PSA]
+references:
+  - https://attack.mitre.org/techniques/T1136/001/
+condition:
+  field: process.command_line
+  op: regex
+  value: '\b(?:useradd|adduser|newusers)\b'

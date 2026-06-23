@@ -1,0 +1,15 @@
+id: sudoers-modified
+title: Sudoers policy modified
+description: >-
+  A change under /etc/sudoers or /etc/sudoers.d/. Editing sudo policy is a
+  direct route to privilege escalation and persistence.
+severity: 6
+attack: [T1548.003]
+nist_csf: [DE.CM]
+d3fend: [D3-FA]
+references:
+  - https://attack.mitre.org/techniques/T1548/003/
+condition:
+  field: file.path
+  op: startswith
+  value: /etc/sudoers

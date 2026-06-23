@@ -1,0 +1,15 @@
+id: log-tampering
+title: Log file deleted
+description: >-
+  Deletion of a file under /var/log — a hallmark of anti-forensics, an intruder
+  removing evidence of their activity.
+severity: 6
+attack: [T1070.002]
+nist_csf: [DE.CM, PR.PS]
+d3fend: [D3-FA]
+references:
+  - https://attack.mitre.org/techniques/T1070/002/
+condition:
+  all:
+    - {field: event.action, op: equals, value: file_deleted}
+    - {field: file.path, op: startswith, value: /var/log}

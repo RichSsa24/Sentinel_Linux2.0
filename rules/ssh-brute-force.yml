@@ -1,0 +1,18 @@
+id: ssh-brute-force
+title: SSH brute-force login attempts
+description: >-
+  Five or more failed SSH authentications from a single source IP within one
+  minute — the classic password-guessing signature.
+severity: 6
+attack: [T1110]
+nist_csf: [DE.CM, DE.AE]
+d3fend: [D3-UBA]
+references:
+  - https://attack.mitre.org/techniques/T1110/
+throttle: {window_seconds: 300, max_alerts: 1}
+condition:
+  threshold:
+    match: {field: event.action, op: equals, value: ssh_login_failed}
+    window_seconds: 60
+    count: 5
+    group_by: source.ip

@@ -1,0 +1,15 @@
+id: kernel-module-load
+title: Kernel module load
+description: >-
+  Invocation of insmod/modprobe. Loading a kernel module is a powerful
+  rootkit/persistence primitive that runs code in ring 0.
+severity: 5
+attack: [T1547.006]
+nist_csf: [DE.CM]
+d3fend: [D3-PSA]
+references:
+  - https://attack.mitre.org/techniques/T1547/006/
+condition:
+  field: process.command_line
+  op: regex
+  value: '\b(?:insmod|modprobe)\b'

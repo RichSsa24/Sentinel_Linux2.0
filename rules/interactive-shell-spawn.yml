@@ -1,0 +1,15 @@
+id: interactive-shell-spawn
+title: Interactive shell spawned with -i
+description: >-
+  A shell started with the interactive flag (sh -i, bash -i, ...). Common in
+  reverse shells and hands-on-keyboard activity from a non-login context.
+severity: 5
+attack: [T1059.004]
+nist_csf: [DE.CM]
+d3fend: [D3-PSA]
+references:
+  - https://attack.mitre.org/techniques/T1059/004/
+condition:
+  all:
+    - {field: event.action, op: equals, value: process_started}
+    - {field: process.command_line, op: regex, value: '\b(?:bash|sh|zsh|dash|ksh)\s+-i\b'}
