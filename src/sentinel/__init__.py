@@ -8,6 +8,13 @@ from sentinel.collectors.integrity import FileIntegrityCollector
 from sentinel.collectors.netparse import parse_net_line
 from sentinel.collectors.network import NetworkCollector
 from sentinel.collectors.process import ProcessCollector, parse_stat
+from sentinel.detection import (
+    Detection,
+    DetectionEngine,
+    Rule,
+    RuleLoadError,
+    load_rules,
+)
 from sentinel.events import (
     Destination,
     Event,
@@ -39,6 +46,8 @@ __all__ = [
     "BoundedEventQueue",
     "DedupWindow",
     "Destination",
+    "Detection",
+    "DetectionEngine",
     "Environment",
     "Event",
     "EventCategory",
@@ -59,9 +68,12 @@ __all__ = [
     "ProcessCollector",
     "RawEvent",
     "RawSource",
+    "Rule",
+    "RuleLoadError",
     "Settings",
     "Source",
     "__version__",
+    "load_rules",
     "parse_auth_line",
     "parse_net_line",
     "parse_stat",
