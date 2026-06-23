@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+from sentinel.alerting import (
+    Alert,
+    AlertManager,
+    AlertSink,
+    ConsoleSink,
+    EmailSink,
+    WebhookSink,
+)
 from sentinel.collectors.authlog import AuthLogCollector, parse_auth_line
 from sentinel.collectors.base import AbstractCollector
 from sentinel.collectors.integrity import FileIntegrityCollector
@@ -41,13 +49,18 @@ from sentinel.settings import (
 __version__ = "0.1.0.dev0"
 __all__ = [
     "AbstractCollector",
+    "Alert",
+    "AlertManager",
+    "AlertSink",
     "AuthLogCollector",
     "BackpressurePolicy",
     "BoundedEventQueue",
+    "ConsoleSink",
     "DedupWindow",
     "Destination",
     "Detection",
     "DetectionEngine",
+    "EmailSink",
     "Environment",
     "Event",
     "EventCategory",
@@ -72,6 +85,7 @@ __all__ = [
     "RuleLoadError",
     "Settings",
     "Source",
+    "WebhookSink",
     "__version__",
     "load_rules",
     "parse_auth_line",
