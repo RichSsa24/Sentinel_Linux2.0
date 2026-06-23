@@ -4,12 +4,47 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from datetime import UTC, datetime
 
 import pytest
 
 from sentinel import Settings
+from sentinel.alerting.model import Alert
+from sentinel.detection.engine import Detection
 from sentinel.events import Event
 from sentinel.normalizer import Normalizer, RawEvent
+
+_FIXED_TS = datetime(2026, 6, 22, 12, 0, 0, tzinfo=UTC)
+
+
+def make_detection(
+    *,
+    rule_id: str = "reverse-shell-process",
+    severity: int = 5,
+    attack: tuple[str, ...] = ("T1059.004",),
+    nist_csf: tuple[str, ...] = ("DE.CM",),
+    event_id: str = "0" * 64,
+    host: str = "host1",
+    message: str = "reverse shell detected",
+) -> Detection:
+    """Build a Detection for alerting tests."""
+    return Detection(
+        rule_id=rule_id,
+        title="Test rule",
+        severity=severity,
+        attack=attack,
+        nist_csf=nist_csf,
+        d3fend=(),
+        event_id=event_id,
+        host=host,
+        timestamp=_FIXED_TS,
+        message=message,
+    )
+
+
+def make_alert(**overrides: object) -> Alert:
+    """Build an Alert from a (possibly customized) Detection."""
+    return Alert.from_detection(make_detection(**overrides))  # type: ignore[arg-type]
 
 
 class DeadLetterNormalizer(Normalizer):
