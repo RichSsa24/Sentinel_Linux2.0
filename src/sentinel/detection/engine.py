@@ -52,6 +52,7 @@ class Detection(BaseModel):
     nist_csf: tuple[str, ...]
     d3fend: tuple[str, ...]
     event_id: str
+    host: str
     timestamp: datetime
     message: str
 
@@ -137,6 +138,7 @@ class DetectionEngine:
             nist_csf=tuple(rule.nist_csf),
             d3fend=tuple(rule.d3fend),
             event_id=event.event.id,
+            host=event.host.name,
             timestamp=event.timestamp,
             message=f"{rule.title} [{techniques}] — {event.event.action} on {event.host.name}",
         )
