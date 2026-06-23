@@ -14,7 +14,7 @@ import os
 from enum import StrEnum
 from typing import Final
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -123,6 +123,49 @@ class Settings(BaseSettings):
             "evicted first when the cap is hit."
         ),
     )
+
+    # --- Alerting ------------------------------------------------------------
+    alert_min_severity: int = Field(
+        default=0, ge=0, le=7, description="Drop alerts below this ECS severity."
+    )
+    alert_dedup_window_seconds: float = Field(
+        default=300.0,
+        gt=0.0,
+        le=86_400.0,
+        description="Collapse identical alerts (same rule+event) within this TTL.",
+    )
+    alert_throttle_max: int = Field(
+        default=10, ge=1, le=10_000, description="Max alerts per rule per throttle window."
+    )
+    alert_throttle_window_seconds: float = Field(default=60.0, gt=0.0, le=86_400.0)
+
+    # --- Webhook sink (optional; secret from env only, never a default) ------
+    webhook_url: str | None = Field(
+        default=None, description="HTTPS webhook endpoint. None disables the sink."
+    )
+    webhook_hmac_secret: SecretStr | None = Field(
+        default=None, description="Shared secret for HMAC-signing webhook payloads."
+    )
+    webhook_allow_private: bool = Field(
+        default=False,
+        description="Allow webhook delivery to private/loopback targets (SSRF guard off). "
+        "Keep False in production.",
+    )
+
+    # --- Email sink (optional; credentials from env only) --------------------
+    smtp_host: str | None = Field(
+        default=None, description="SMTP host. None disables the email sink."
+    )
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = Field(
+        default=None, description="SMTP password — sourced from env, never logged."
+    )
+    email_from: str | None = None
+    email_recipients: str | None = Field(
+        default=None, description="Comma-separated alert recipient addresses."
+    )
+    smtp_starttls: bool = True
 
     @model_validator(mode="after")
     def _reject_unknown_prefixed_env(self) -> Settings:

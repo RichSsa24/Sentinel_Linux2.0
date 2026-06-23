@@ -117,3 +117,37 @@ class TestPipelineSettings:
         monkeypatch.setenv("SENTINEL_QUEUE_BACKPRESSURE", "panic")
         with pytest.raises(ValidationError):
             settings_no_env_file()
+
+
+class TestAlertingSettings:
+    def test_secrets_are_absent_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "development")
+        s = settings_no_env_file()
+        assert s.webhook_url is None
+        assert s.webhook_hmac_secret is None
+        assert s.smtp_password is None
+        assert s.webhook_allow_private is False  # SSRF guard on by default
+        assert s.alert_min_severity == 0
+
+    @pytest.mark.security
+    def test_secrets_load_from_env_and_do_not_leak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "production")
+        monkeypatch.setenv("SENTINEL_WEBHOOK_HMAC_SECRET", "hmac-shhh")  # pragma: allowlist secret
+        monkeypatch.setenv("SENTINEL_SMTP_PASSWORD", "smtp-shhh")  # pragma: allowlist secret
+        s = settings_no_env_file()
+
+        assert s.webhook_hmac_secret is not None
+        assert s.webhook_hmac_secret.get_secret_value() == "hmac-shhh"
+        assert s.smtp_password is not None
+        assert s.smtp_password.get_secret_value() == "smtp-shhh"
+        # SecretStr must mask the value in any string/repr rendering.
+        assert "hmac-shhh" not in repr(s)
+        assert "smtp-shhh" not in str(s.smtp_password)
+
+    def test_alerting_overrides_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "production")
+        monkeypatch.setenv("SENTINEL_ALERT_MIN_SEVERITY", "4")
+        monkeypatch.setenv("SENTINEL_ALERT_THROTTLE_MAX", "3")
+        s = settings_no_env_file()
+        assert s.alert_min_severity == 4
+        assert s.alert_throttle_max == 3
