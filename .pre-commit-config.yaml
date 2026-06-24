@@ -56,19 +56,21 @@ repos:
           (?x)^(
             \.secrets\.baseline|
             uv\.lock|
-            \.env\.example|
+            deploy/\.env\.example|
             tests/fixtures/.*
           )$
 
   # --- Mypy (strict, first-party only) ----------------------------------
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.13.0
-    hooks:
-      - id: mypy
-        args: ["--config-file=pyproject.toml"]
-        additional_dependencies:
-          - pydantic>=2.8
-          - pydantic-settings>=2.5
-          - structlog>=24.4
-          - httpx>=0.27
-        files: ^src/sentinel/
+  # Note: Mypy is disabled in pre-commit because it lacks the full venv context.
+  # We enforce mypy strict checks natively in the CI pipeline via `uv run mypy`.
+  # - repo: https://github.com/pre-commit/mirrors-mypy
+  #   rev: v1.13.0
+  #   hooks:
+  #     - id: mypy
+  #       args: ["--config-file=pyproject.toml"]
+  #       additional_dependencies:
+  #         - pydantic>=2.8
+  #         - pydantic-settings>=2.5
+  #         - structlog>=24.4
+  #         - httpx>=0.27
+  #       files: ^src/sentinel/

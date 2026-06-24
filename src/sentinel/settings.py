@@ -167,6 +167,29 @@ class Settings(BaseSettings):
     )
     smtp_starttls: bool = True
 
+    # --- Persistence ---------------------------------------------------------
+    database_url: str = Field(
+        default="sqlite+aiosqlite:///./sentinel.db",
+        min_length=1,
+        description="Async SQLAlchemy URL. SQLite by default; PostgreSQL via env.",
+    )
+
+    # --- Read API ------------------------------------------------------------
+    api_key: SecretStr | None = Field(
+        default=None,
+        description="Bearer key for the read API. Unset = the API denies every "
+        "request (default-deny / fail-closed).",
+    )
+    api_cors_origins: str = Field(
+        default="",
+        description="Comma-separated exact CORS origins. Empty = none (no wildcard).",
+    )
+    api_rate_limit: int = Field(
+        default=100, ge=1, le=100_000, description="Max requests per window per client."
+    )
+    api_rate_window_seconds: float = Field(default=60.0, gt=0.0, le=3_600.0)
+    api_max_page_size: int = Field(default=100, ge=1, le=1_000)
+
     @model_validator(mode="after")
     def _reject_unknown_prefixed_env(self) -> Settings:
         """Refuse to start when unknown `SENTINEL_*` env vars are set.

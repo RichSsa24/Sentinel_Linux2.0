@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "sentinel"
+    # The API key must be provided as a bearer token since all endpoints require auth
+    authorization:
+      credentials: "${SENTINEL_API_KEY}"
+    static_configs:
+      - targets: ["sentinel:8000"]

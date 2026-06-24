@@ -1,0 +1,109 @@
+services:
+  sentinel:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+    image: sentinel:v1.0.0
+    container_name: sentinel
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - .env
+    volumes:
+      # Required for FIM and authlog/audit collectors
+      - /var/log:/var/log:ro
+      - /etc:/etc:ro
+      # Required for process/network collectors
+      - /proc:/host/proc:ro
+    ports:
+      - "8000:8000"
+    networks:
+      - sentinel-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine@sha256:d8b2e59e517865261d7eb6e55909ff7b63fdf396bbafbe05b76cf5fb6850bb3b
+    container_name: sentinel_db
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+    environment:
+      POSTGRES_USER: sentinel_db_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_password}
+      POSTGRES_DB: sentinel_db
+    volumes:
+      - sentinel-db-data:/var/lib/postgresql/data
+    networks:
+      - sentinel-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel_db_user -d sentinel_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.54.1@sha256:3eab0b73062ce5bc15bce66bb4a2b9e6e14ca0ecdeff1b83e491c1363ab54559
+    container_name: sentinel_prometheus
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      SENTINEL_API_KEY: ${SENTINEL_API_KEY:-change_this_to_a_secure_bearer_token}
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - sentinel-prom-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--enable-feature=envvar-expansion"
+    networks:
+      - sentinel-net
+
+  grafana:
+    image: grafana/grafana:11.2.0@sha256:69b7f58b093fbd23dd9e3b3209d7df9d9441f71aebbf0b49cb376d8b3711d95d
+    container_name: sentinel_grafana
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/lib/grafana
+      - /var/log/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - sentinel-net
+    depends_on:
+      - prometheus
+
+networks:
+  sentinel-net:
+    driver: bridge
+
+volumes:
+  sentinel-db-data:
+  sentinel-prom-data:
