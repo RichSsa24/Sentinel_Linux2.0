@@ -1,4 +1,4 @@
-# 🛡️ Sentinel-Linux 2.0
+#  Sentinel-Linux 2.0
 
 ![CI Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![Coverage](https://img.shields.io/badge/coverage-98.9%25-brightgreen)
