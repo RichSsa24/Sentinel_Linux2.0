@@ -5,11 +5,10 @@
 # - Healthcheck implemented
 # - Designed for read-only root filesystem (no writes to /)
 
-# Builder stage
-FROM python:3.12-slim-bookworm@sha256:0d5886ac89de57f35496a8ebba075dcb0e7646cd68407cf1c3ab3ebc0a66d1f0 AS builder
+FROM python:3.12-slim-bookworm AS builder
 
 # Install uv for deterministic dependency resolution
-COPY --from=ghcr.io/astral-sh/uv:0.2.14@sha256:1a129035bfd908ec2d82de292daab56b7cbfce165561a03f3fb6222bde958bf6 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.2.14 /uv /bin/uv
 
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
@@ -28,7 +27,7 @@ COPY README.md README.md
 RUN uv sync --frozen --no-dev
 
 # Final execution stage
-FROM python:3.12-slim-bookworm@sha256:0d5886ac89de57f35496a8ebba075dcb0e7646cd68407cf1c3ab3ebc0a66d1f0
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/app/.venv/bin:$PATH"
