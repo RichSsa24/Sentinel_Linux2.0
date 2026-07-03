@@ -24,6 +24,7 @@ COPY src/ src/
 COPY alembic.ini alembic.ini
 COPY migrations/ migrations/
 COPY README.md README.md
+COPY LICENSE LICENSE
 RUN uv sync --frozen --no-dev
 
 # Final execution stage
