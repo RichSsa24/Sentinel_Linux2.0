@@ -70,7 +70,7 @@ async def _pipeline_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     alert_mgr = AlertManager([ConsoleSink()])
 
     pipeline.register(AuthLogCollector())
-    pipeline.register(FileIntegrityCollector())
+    pipeline.register(FileIntegrityCollector(paths=["/etc", "/tmp"]))  # noqa: S108  # nosec B108
     pipeline.register(NetworkCollector())
     pipeline.register(ProcessCollector())
 
