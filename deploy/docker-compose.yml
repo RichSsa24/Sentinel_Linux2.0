@@ -13,6 +13,8 @@ services:
       - no-new-privileges:true
     env_file:
       - .env
+    environment:
+      SENTINEL_API_KEY: ${SENTINEL_API_KEY:-change_this_to_a_secure_bearer_token}
     volumes:
       # Required for FIM and authlog/audit collectors
       - /var/log:/var/log:ro
