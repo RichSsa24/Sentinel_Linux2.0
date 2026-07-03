@@ -14,6 +14,7 @@ page size.
 # stringified (PEP 563) annotations break.
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Query, Request
@@ -30,6 +31,7 @@ from sentinel.api.security import (
     SecurityHeadersMiddleware,
     require_api_key,
 )
+from sentinel.detection.loader import load_rules
 from sentinel.detection.schema import Rule
 from sentinel.logging import get_logger
 from sentinel.metrics import Metrics
@@ -171,3 +173,17 @@ _CODES: dict[int, str] = {
     429: "RATE_LIMITED",
     503: "SERVICE_UNAVAILABLE",
 }
+
+
+def get_app() -> FastAPI:
+    """Zero-argument factory for Uvicorn to initialize the app."""
+    settings = Settings()
+    database = Database(settings.database_url)
+    metrics = Metrics()
+
+    rules_dir = Path("/app/rules")
+    if not rules_dir.exists():
+        rules_dir = Path(__file__).resolve().parent.parent.parent.parent / "rules"
+    rules = load_rules(rules_dir)
+
+    return create_app(settings, database=database, metrics=metrics, rules=rules)
