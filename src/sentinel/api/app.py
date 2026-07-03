@@ -82,13 +82,15 @@ async def _pipeline_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 async with app.state.database.session() as session:
                     repo = Repository(session)
                     await repo.save_alert(alert)
-                app.state.metrics.inc_alerts(detection.rule_id, detection.severity)
+                app.state.metrics.detections_fired.labels(
+                    rule_id=detection.rule_id, severity=str(detection.severity)
+                ).inc()
 
         async with app.state.database.session() as session:
             repo = Repository(session)
             await repo.save_event(event)
 
-        app.state.metrics.inc_events(event.event.category.value)
+        app.state.metrics.events_ingested.inc()
 
     pipeline.set_consumer(consumer)
     pipeline_task = asyncio.create_task(pipeline.run())
