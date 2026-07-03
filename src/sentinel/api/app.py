@@ -75,8 +75,8 @@ async def _pipeline_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     pipeline.register(ProcessCollector())
 
     async def consumer(event: Event) -> None:
-        detection = engine.evaluate(event)
-        if detection:
+        detections = engine.evaluate(event)
+        for detection in detections:
             alert = await alert_mgr.process(detection)
             if alert:
                 async with app.state.database.session() as session:
