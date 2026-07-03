@@ -13,7 +13,9 @@ page size.
 # `Annotated[int, Query(...)]` route-parameter annotations at runtime, which
 # stringified (PEP 563) annotations break.
 
-from collections.abc import Iterable
+import asyncio
+from collections.abc import AsyncGenerator, Iterable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
@@ -24,6 +26,7 @@ from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 
+from sentinel.alerting import AlertManager, ConsoleSink
 from sentinel.api.schemas import AlertOut, EventOut, Page, Pagination, RuleOut
 from sentinel.api.security import (
     RateLimitMiddleware,
@@ -31,10 +34,17 @@ from sentinel.api.security import (
     SecurityHeadersMiddleware,
     require_api_key,
 )
+from sentinel.collectors.authlog import AuthLogCollector
+from sentinel.collectors.integrity import FileIntegrityCollector
+from sentinel.collectors.network import NetworkCollector
+from sentinel.collectors.process import ProcessCollector
+from sentinel.detection import DetectionEngine
 from sentinel.detection.loader import load_rules
 from sentinel.detection.schema import Rule
+from sentinel.events import Event
 from sentinel.logging import get_logger
 from sentinel.metrics import Metrics
+from sentinel.pipeline import Pipeline
 from sentinel.settings import Settings
 from sentinel.storage.database import Database
 from sentinel.storage.repository import Repository
@@ -53,6 +63,40 @@ def _error(
     )
 
 
+@asynccontextmanager
+async def _pipeline_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    pipeline = Pipeline(app.state.settings)
+    engine = DetectionEngine(app.state.rules)
+    alert_mgr = AlertManager([ConsoleSink()])
+
+    pipeline.register(AuthLogCollector())
+    pipeline.register(FileIntegrityCollector())
+    pipeline.register(NetworkCollector())
+    pipeline.register(ProcessCollector())
+
+    async def consumer(event: Event) -> None:
+        detection = engine.evaluate(event)
+        if detection:
+            alert = await alert_mgr.process(detection)
+            if alert:
+                async with app.state.database.session() as session:
+                    repo = Repository(session)
+                    await repo.save_alert(alert)
+                app.state.metrics.inc_alerts(detection.rule_id, detection.severity)
+
+        async with app.state.database.session() as session:
+            repo = Repository(session)
+            await repo.save_event(event)
+
+        app.state.metrics.inc_events(event.event.category.value)
+
+    pipeline.set_consumer(consumer)
+    pipeline_task = asyncio.create_task(pipeline.run())
+    yield
+    await pipeline.stop()
+    await pipeline_task
+
+
 def create_app(
     settings: Settings,
     *,
@@ -67,9 +111,13 @@ def create_app(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=_pipeline_lifespan,
     )
     app.state.settings = settings
-    rule_list: tuple[Rule, ...] = tuple(rules)
+    app.state.database = database
+    app.state.metrics = metrics
+    app.state.rules = tuple(rules)
+    rule_list: tuple[Rule, ...] = app.state.rules
     max_page = settings.api_max_page_size
     page_default = min(_DEFAULT_PAGE_SIZE, max_page)
 
