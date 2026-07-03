@@ -58,12 +58,16 @@ def require_api_key(request: Request) -> None:
         )
     scheme, _, token = request.headers.get("Authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not token:
+        _log.error(f"Missing bearer token. Header: {request.headers.get('Authorization', '')!r}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
     if not hmac.compare_digest(token, configured.get_secret_value()):
+        _log.error(
+            f"Token mismatch! Received: {token!r} Expected: {configured.get_secret_value()!r}"
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid token",
