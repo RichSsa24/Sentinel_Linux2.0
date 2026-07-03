@@ -33,6 +33,7 @@ FROM python:3.12-slim-bookworm
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/app/.venv/bin:$PATH"
 ENV SENTINEL_ENV="production"
+ENV PYTHONPATH="/app/src"
 
 # Create a non-root user and group
 RUN groupadd -r sentinel && useradd -r -g sentinel -s /sbin/nologin sentinel
