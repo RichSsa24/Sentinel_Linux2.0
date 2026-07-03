@@ -56,15 +56,17 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    tmpfs:
+      - /tmp
     environment:
       SENTINEL_API_KEY: ${SENTINEL_API_KEY:-change_this_to_a_secure_bearer_token}
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - sentinel-prom-data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--enable-feature=envvar-expansion"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "echo -n \"$$SENTINEL_API_KEY\" > /tmp/token && exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus"
     networks:
       - sentinel-net
 
