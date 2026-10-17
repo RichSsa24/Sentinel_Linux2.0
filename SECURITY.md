@@ -64,7 +64,8 @@ of these is in-scope at High severity by default:
 - **NIST SP 800-207 (Zero Trust)** for inter-component trust: every API call
   is authenticated; no implicit network trust; fail-closed on policy errors.
 - **CIS Docker Benchmark** for container hardening (non-root, read-only root
-  filesystem, dropped capabilities, `no-new-privileges`, pinned digests).
+  filesystem, dropped capabilities, `no-new-privileges`, version-pinned base
+  images scanned by Trivy in CI).
 - **No code execution from rule files** — rule YAML is parsed with
   `yaml.safe_load` and evaluated against an allowlisted operator grammar.
 - **No string-interpolated SQL** — parameterized queries only.

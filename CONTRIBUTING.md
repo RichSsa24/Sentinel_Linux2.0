@@ -21,8 +21,8 @@ code is read by people who will judge its quality forensically.
 
 ```bash
 # Prereqs: uv (https://docs.astral.sh/uv/), git
-git clone https://github.com/RichSsa24/Sentinel_Linux.git
-cd Sentinel_Linux
+git clone https://github.com/RichSsa24/Sentinel_Linux2.0.git
+cd Sentinel_Linux2.0
 
 # Pin Python and install everything (creates .venv, writes uv.lock if needed).
 uv python install 3.12
@@ -42,12 +42,17 @@ The same gates run in CI. Run them locally first.
 ```bash
 uv run ruff check .            # lint + import order + common bug patterns
 uv run ruff format --check .   # formatting
-uv run mypy src                # strict typing
+uv run mypy                    # strict typing (src + tests, pydantic plugin)
 uv run bandit -r src/ -c pyproject.toml
-uv run pip-audit               # known-vulnerable dependencies
-uv run pytest --cov=src/sentinel --cov-report=term-missing
+uv export --quiet --format requirements-txt --no-emit-project --no-hashes \
+  -o requirements-audit.txt && uv run pip-audit -r requirements-audit.txt --strict
+uv run pytest --cov=src/sentinel --cov-report=term-missing   # fails below 95%
 uv run pre-commit run --all-files
 ```
+
+Performance changes ship with numbers: run `uv run python scripts/benchmark.py`
+before and after, and quote both in the commit message. Changes to the
+container or Compose stack should pass `scripts/smoke_test_image.sh` locally.
 
 `mypy --strict` is non-negotiable on first-party code. `# type: ignore` is
 allowed only with a comment explaining the specific upstream stub gap.

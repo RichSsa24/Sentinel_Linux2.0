@@ -102,6 +102,12 @@ and why.
   workflow file carries a comment noting that SHA pinning is recommended
   for production. Container base images (Phase 7) **are** pinned by
   digest.
+  > **Amended 2026-10-17 (see ADR 0003):** superseded. In March 2026 the
+  > `aquasecurity/trivy-action` tags were force-pushed to malicious commits,
+  > which is exactly the risk tag pinning accepts. Every action is now pinned
+  > by full commit SHA with the version in a comment, and Dependabot proposes
+  > updates. Base images are pinned by version tag (multi-arch builds) and
+  > scanned by Trivy on every push.
 - **Filter warnings = error in pytest.** Surfaces upstream deprecations
   early. If a noisy upstream needs to be tolerated, it is allowlisted
   narrowly in `pyproject.toml` rather than globally silenced.
