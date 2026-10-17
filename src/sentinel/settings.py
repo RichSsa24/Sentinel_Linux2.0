@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import os
 from enum import StrEnum
+from pathlib import Path
 from typing import Final
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -58,6 +59,14 @@ class BackpressurePolicy(StrEnum):
 
 
 ENV_PREFIX: Final[str] = "SENTINEL_"
+
+# Collector names accepted by `SENTINEL_COLLECTORS` (each is a collector's `name`).
+KNOWN_COLLECTORS: Final[tuple[str, ...]] = ("auth-log", "file-integrity", "process", "network")
+
+
+def split_csv(value: str) -> tuple[str, ...]:
+    """Split a comma-separated setting into its non-empty, stripped items."""
+    return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
 class Settings(BaseSettings):
@@ -190,6 +199,60 @@ class Settings(BaseSettings):
     api_rate_window_seconds: float = Field(default=60.0, gt=0.0, le=3_600.0)
     api_max_page_size: int = Field(default=100, ge=1, le=1_000)
 
+    # --- Collectors ----------------------------------------------------------
+    collectors: str = Field(
+        default=",".join(KNOWN_COLLECTORS),
+        description=f"Comma-separated collectors to run; any of {', '.join(KNOWN_COLLECTORS)}.",
+    )
+    host_root: Path = Field(
+        default=Path("/"),
+        description="Where the monitored host's filesystem is visible. '/' on bare metal; "
+        "'/host' in a container with the host's /etc, /var/log and /proc bind-mounted "
+        "read-only beneath it (the Falco/osquery HOST_ROOT convention). Collectors read "
+        "under this root but always report host-native paths.",
+    )
+    auth_log_path: Path = Field(
+        default=Path("/var/log/auth.log"), description="Host path of the sshd auth log."
+    )
+    fim_paths: str = Field(
+        default="/etc",
+        description="Comma-separated absolute host paths watched for file integrity.",
+    )
+    rules_dir: Path = Field(
+        default=Path("rules"),
+        description="Directory of YAML detection rules (relative to the working directory).",
+    )
+
+    @field_validator("host_root", "auth_log_path")
+    @classmethod
+    def _require_absolute(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            msg = f"must be an absolute path; got {str(value)!r}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("collectors")
+    @classmethod
+    def _check_collectors(cls, value: str) -> str:
+        names = split_csv(value)
+        if not names:
+            msg = "at least one collector must be enabled"
+            raise ValueError(msg)
+        unknown = sorted(set(names) - set(KNOWN_COLLECTORS))
+        if unknown:
+            msg = f"unknown collectors {unknown}; expected any of {list(KNOWN_COLLECTORS)}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("fim_paths")
+    @classmethod
+    def _check_fim_paths(cls, value: str) -> str:
+        relative = [path for path in split_csv(value) if not Path(path).is_absolute()]
+        if relative:
+            msg = f"fim_paths entries must be absolute host paths; got {relative}"
+            raise ValueError(msg)
+        return value
+
     @model_validator(mode="after")
     def _reject_unknown_prefixed_env(self) -> Settings:
         """Refuse to start when unknown `SENTINEL_*` env vars are set.
@@ -219,3 +282,23 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         """True when running in the production environment."""
         return self.env is Environment.PRODUCTION
+
+    @property
+    def enabled_collectors(self) -> tuple[str, ...]:
+        """The validated collector names from `collectors`."""
+        return split_csv(self.collectors)
+
+    @property
+    def fim_path_list(self) -> tuple[str, ...]:
+        """The validated FIM watch paths from `fim_paths`."""
+        return split_csv(self.fim_paths)
+
+    @property
+    def email_recipient_list(self) -> tuple[str, ...]:
+        """The alert recipients from `email_recipients`."""
+        return split_csv(self.email_recipients or "")
+
+    @property
+    def cors_origin_list(self) -> tuple[str, ...]:
+        """The exact CORS origins from `api_cors_origins`."""
+        return split_csv(self.api_cors_origins)

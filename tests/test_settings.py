@@ -152,3 +152,40 @@ class TestAlertingSettings:
         s = settings_no_env_file()
         assert s.alert_min_severity == 4
         assert s.alert_throttle_max == 3
+
+
+class TestCollectorSettings:
+    def test_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "test")
+        s = settings_no_env_file()
+        assert s.enabled_collectors == ("auth-log", "file-integrity", "process", "network")
+        assert str(s.host_root) == "/"
+        assert s.fim_path_list == ("/etc",)
+
+    def test_csv_lists_are_trimmed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "test")
+        monkeypatch.setenv("SENTINEL_FIM_PATHS", " /etc , /usr/local/bin ,")
+        monkeypatch.setenv("SENTINEL_EMAIL_RECIPIENTS", "a@x.test, b@x.test")
+        monkeypatch.setenv("SENTINEL_API_CORS_ORIGINS", "https://a.test,")
+        s = settings_no_env_file()
+        assert s.fim_path_list == ("/etc", "/usr/local/bin")
+        assert s.email_recipient_list == ("a@x.test", "b@x.test")
+        assert s.cors_origin_list == ("https://a.test",)
+
+    @pytest.mark.parametrize(
+        ("key", "value", "match"),
+        [
+            ("SENTINEL_COLLECTORS", "auth-log,keylogger", "unknown collectors"),
+            ("SENTINEL_COLLECTORS", " , ", "at least one collector"),
+            ("SENTINEL_FIM_PATHS", "/etc,relative/dir", "absolute"),
+            ("SENTINEL_HOST_ROOT", "host", "absolute"),
+            ("SENTINEL_AUTH_LOG_PATH", "auth.log", "absolute"),
+        ],
+    )
+    def test_invalid_values_fail_closed(
+        self, monkeypatch: pytest.MonkeyPatch, key: str, value: str, match: str
+    ) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "test")
+        monkeypatch.setenv(key, value)
+        with pytest.raises(ValidationError, match=match):
+            settings_no_env_file()
