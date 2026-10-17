@@ -39,6 +39,9 @@ dependencies = [
     "asyncpg>=0.29",
 ]
 
+[project.scripts]
+sentinel = "sentinel.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/RichSsa24/Sentinel_Linux2.0"
 Repository = "https://github.com/RichSsa24/Sentinel_Linux2.0"
