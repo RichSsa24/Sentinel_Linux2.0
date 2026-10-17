@@ -60,6 +60,7 @@ class Pipeline:
         self._processed = 0
         self._deduped = 0
         self._consumer_errors = 0
+        self._stop_requested = False
 
     # ------------------------------------------------------------------ wiring
 
@@ -89,6 +90,12 @@ class Pipeline:
         if not self._collectors:
             msg = "at least one collector must be registered before run()"
             raise RuntimeError(msg)
+        if self._stop_requested:
+            # stop() won the race against this task's first step (it is only
+            # *scheduled* by create_task). Starting now would spawn a consumer
+            # that nothing will ever cancel.
+            self._log.info("pipeline.stopped_before_start")
+            return
 
         # Spin up exactly one task per collector and one consumer task.
         # Collector task names are prefixed so stop() can find them.
@@ -122,7 +129,11 @@ class Pipeline:
         2. Wait for collectors to finish their current cycle.
         3. Drain the queue (wait for every queued event to be task_done'd).
         4. Cancel the consumer.
+
+        Safe to call before ``run()`` has started executing: the request is
+        recorded and ``run()`` then returns immediately.
         """
+        self._stop_requested = True
         for collector in self._collectors.values():
             await collector.stop()
 

@@ -275,3 +275,28 @@ async def test_consumer_exception_is_isolated(monkeypatch: pytest.MonkeyPatch) -
     assert stats["processed"] == 0
     # Pipeline survived: queue is empty and we never raised at the top.
     assert stats["queue_size"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_before_run_is_scheduled_does_not_hang(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: stop() racing ahead of run() must not orphan the consumer.
+
+    `create_task(pipeline.run())` only *schedules* run(). If stop() executes
+    first (e.g. SIGTERM during startup), it finds no tasks to stop; run() then
+    starts a consumer that nobody cancels and `await task` hangs forever.
+    """
+    monkeypatch.setenv("SENTINEL_ENV", "test")
+    pipeline = Pipeline(settings_no_env_file())
+
+    async def noop(_event: Event) -> None:
+        return None
+
+    pipeline.set_consumer(noop)
+    pipeline.register(SeedProducer(name="p", seeds=["a"]))
+
+    task = asyncio.create_task(pipeline.run())
+    await pipeline.stop()  # completes before run() has executed a single line
+    await asyncio.wait_for(task, timeout=2.0)
+    assert pipeline.stats["processed"] == 0
