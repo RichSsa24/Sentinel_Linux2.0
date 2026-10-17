@@ -102,8 +102,6 @@ select = [
 ]
 ignore = [
     "ANN401",  # allow `Any` only where consciously chosen (e.g. logging processors)
-    "ANN101",  # deprecated upstream — `self` should not need an annotation
-    "ANN102",  # deprecated upstream — `cls` should not need an annotation
     "PLR0913", # too-many-arguments — judgment call
     "TRY003",  # long messages in `raise` — acceptable for clear errors
     "EM101",   # raw string in exception — paired with TRY003 above
