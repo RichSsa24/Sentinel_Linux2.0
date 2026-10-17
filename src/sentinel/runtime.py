@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import socket
 import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -71,24 +72,46 @@ def _under(root: Path, host_path: Path) -> Path:
     return root / host_path.relative_to(host_path.anchor)
 
 
+def resolve_host_name(settings: Settings) -> str:
+    """The monitored host's name — which, in a container, is not our own hostname."""
+    if settings.host_name:
+        return settings.host_name
+    if settings.host_root != _HOST_ROOT:
+        try:
+            lines = (settings.host_root / "etc" / "hostname").read_text(encoding="utf-8")
+        except OSError:
+            lines = ""
+        name = next((line.strip() for line in lines.splitlines() if line.strip()), "")
+        if name and len(name) <= 253:  # noqa: PLR2004 — DNS name length limit
+            return name
+    return socket.gethostname() or "localhost"
+
+
 def build_collectors(settings: Settings) -> list[AbstractCollector]:
-    """Instantiate the enabled collectors, reading the host via `host_root`."""
+    """Instantiate the enabled collectors, reading the host via `host_root`.
+
+    The auth-log collector keeps the host name each syslog line carries; the
+    others report :func:`resolve_host_name`.
+    """
     root = settings.host_root
+    host = resolve_host_name(settings)
     enabled = set(settings.enabled_collectors)
     collectors: list[AbstractCollector] = []
     if "auth-log" in enabled:
         collectors.append(AuthLogCollector(_under(root, settings.auth_log_path)))
     if "file-integrity" in enabled:
         collectors.append(
-            FileIntegrityCollector(paths=list(settings.fim_path_list), host_root=root)
+            FileIntegrityCollector(paths=list(settings.fim_path_list), host_root=root, host=host)
         )
     if "process" in enabled:
-        collectors.append(ProcessCollector(proc_root=_under(root, _PROC)))
+        collectors.append(ProcessCollector(proc_root=_under(root, _PROC), host=host))
     if "network" in enabled:
         # Behind a host-root mount, /proc/net would resolve to *our* (container)
         # namespace; PID 1's view of the host procfs is the host's.
         netns_pid = None if root == _HOST_ROOT else 1
-        collectors.append(NetworkCollector(proc_root=_under(root, _PROC), netns_pid=netns_pid))
+        collectors.append(
+            NetworkCollector(proc_root=_under(root, _PROC), netns_pid=netns_pid, host=host)
+        )
     return collectors
 
 

@@ -223,6 +223,14 @@ class Settings(BaseSettings):
         "read-only beneath it (the Falco/osquery HOST_ROOT convention). Collectors read "
         "under this root but always report host-native paths.",
     )
+    host_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=253,
+        description="host.name for collected events. Default: the monitored host's "
+        "/etc/hostname under host_root (so a container reports the host, not itself), "
+        "else this machine's hostname.",
+    )
     auth_log_path: Path = Field(
         default=Path("/var/log/auth.log"), description="Host path of the sshd auth log."
     )

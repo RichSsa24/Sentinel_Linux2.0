@@ -10,6 +10,7 @@ visible through `/readyz` and its counters through `/metrics`.
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ from sentinel.runtime import (
     build_alert_manager,
     build_collectors,
     build_sinks,
+    resolve_host_name,
 )
 from sentinel.storage import Database, Repository
 from tests.conftest import auth_header, make_api_settings, make_detection, make_event
@@ -140,6 +142,29 @@ class TestBuildCollectors:
         network = by_name["network"]
         assert isinstance(network, NetworkCollector)
         assert network._net_dir == Path("/proc/net")
+
+
+class TestResolveHostName:
+    def test_explicit_setting_wins(self, tmp_path: Path) -> None:
+        (tmp_path / "etc").mkdir()
+        (tmp_path / "etc" / "hostname").write_text("from-file\n", encoding="utf-8")
+        settings = make_api_settings(host_root=str(tmp_path), host_name="explicit")
+        assert resolve_host_name(settings) == "explicit"
+
+    def test_container_reports_the_monitored_host(self, tmp_path: Path) -> None:
+        (tmp_path / "etc").mkdir()
+        (tmp_path / "etc" / "hostname").write_text("\n  web01  \n", encoding="utf-8")
+        assert resolve_host_name(make_api_settings(host_root=str(tmp_path))) == "web01"
+
+    def test_falls_back_to_local_hostname(self, tmp_path: Path) -> None:
+        # Bare metal, or a host root without a readable /etc/hostname.
+        expected = socket.gethostname() or "localhost"
+        assert resolve_host_name(make_api_settings()) == expected
+        assert resolve_host_name(make_api_settings(host_root=str(tmp_path))) == expected
+
+    def test_collectors_carry_the_resolved_name(self, tmp_path: Path) -> None:
+        settings = make_api_settings(host_name="web01", collectors="process,network")
+        assert {c._host for c in build_collectors(settings)} == {"web01"}  # type: ignore[attr-defined]
 
 
 class TestBuildSinks:
