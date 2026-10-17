@@ -1,30 +1,47 @@
+# Sentinel-Linux 2.0 — full stack: Sentinel + PostgreSQL + Prometheus + Grafana.
+#
+#   cp deploy/.env.example deploy/.env     # then set the three secrets
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Secrets are mandatory: Compose refuses to start (`:?`) rather than falling
+# back to a well-known default key. Published ports bind to 127.0.0.1 only;
+# put a TLS-terminating reverse proxy in front to expose them.
+
+name: sentinel
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  networks: [sentinel-net]
+
 services:
   sentinel:
+    <<: *hardened
     build:
       context: ..
       dockerfile: deploy/docker/Dockerfile
-    image: sentinel:v1.0.0
+    image: sentinel-linux:local
     container_name: sentinel
-    restart: unless-stopped
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    env_file:
-      - .env
+    # Drain the queue and flush buffered events before Docker sends SIGKILL.
+    stop_grace_period: 30s
     environment:
-      SENTINEL_API_KEY: ${SENTINEL_API_KEY:-change_this_to_a_secure_bearer_token}
+      SENTINEL_API_KEY: ${SENTINEL_API_KEY:?set SENTINEL_API_KEY in deploy/.env}
+      SENTINEL_DATABASE_URL: postgresql+asyncpg://sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/sentinel
+      # The host is visible read-only under /host (see volumes); collectors
+      # read beneath it and report host-native paths and the host's name.
+      SENTINEL_HOST_ROOT: /host
+    # Optional tuning (webhook/email sinks, alert gates, FIM paths ...).
+    env_file:
+      - path: sentinel.env
+        required: false
     volumes:
-      # Required for FIM and authlog/audit collectors
-      - /var/log:/var/log:ro
-      - /etc:/etc:ro
-      # Required for process/network collectors
+      - /etc:/host/etc:ro
+      - /var/log:/host/var/log:ro
       - /proc:/host/proc:ro
     ports:
-      - "8000:8000"
-    networks:
-      - sentinel-net
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,67 +50,68 @@ services:
     image: postgres:16-alpine
     container_name: sentinel_db
     restart: unless-stopped
+    # The official entrypoint needs to chown/initdb as root before dropping to
+    # the postgres user, so the capability set is trimmed rather than dropped.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    security_opt: ["no-new-privileges:true"]
     environment:
-      POSTGRES_USER: sentinel_db_user
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_password}
-      POSTGRES_DB: sentinel_db
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      POSTGRES_DB: sentinel
     volumes:
       - sentinel-db-data:/var/lib/postgresql/data
-    networks:
-      - sentinel-net
+    networks: [sentinel-net]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sentinel_db_user -d sentinel_db"]
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   prometheus:
+    <<: *hardened
     image: prom/prometheus:v2.54.1
     container_name: sentinel_prometheus
-    restart: unless-stopped
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+    # One API key, two consumers: Sentinel checks it, Prometheus presents it.
+    # Prometheus can only read a bearer token from a file, and Compose cannot
+    # inject environment-sourced secrets into a read-only container, so the
+    # token is written to a private tmpfs at start-up (0600, never on disk),
+    # dropped from the environment, and the shell is replaced by Prometheus.
     environment:
-      SENTINEL_API_KEY: ${SENTINEL_API_KEY:-change_this_to_a_secure_bearer_token}
+      SENTINEL_API_KEY: ${SENTINEL_API_KEY:?set SENTINEL_API_KEY in deploy/.env}
+    tmpfs:
+      - /run/sentinel:mode=0700,uid=65534,gid=65534
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        umask 077 && printf %s "$$SENTINEL_API_KEY" > /run/sentinel/api_key
+        && unset SENTINEL_API_KEY
+        && exec /bin/prometheus
+        --config.file=/etc/prometheus/prometheus.yml
+        --storage.tsdb.path=/prometheus
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./prometheus/token:/etc/prometheus/token:ro
       - sentinel-prom-data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--enable-feature=envvar-expansion"
-    networks:
-      - sentinel-net
+    depends_on: [sentinel]
 
   grafana:
+    <<: *hardened
     image: grafana/grafana:11.2.0
     container_name: sentinel_grafana
-    restart: unless-stopped
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
     tmpfs:
       - /tmp
       - /var/lib/grafana
       - /var/log/grafana
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/.env}
       GF_AUTH_ANONYMOUS_ENABLED: "false"
-      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     ports:
-      - "3000:3000"
-    networks:
-      - sentinel-net
-    depends_on:
-      - prometheus
+      - "127.0.0.1:3000:3000"
+    depends_on: [prometheus]
 
 networks:
   sentinel-net:

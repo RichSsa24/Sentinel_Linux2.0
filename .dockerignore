@@ -1,0 +1,22 @@
+# Keep the build context small and free of secrets/local state.
+.git
+.github
+.venv
+**/__pycache__
+**/*.py[cod]
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.hypothesis
+.coverage*
+coverage.xml
+htmlcov
+.env
+.env.*
+deploy/.env
+deploy/sentinel.env
+*.db
+*.sqlite*
+docs
+tests
+scripts

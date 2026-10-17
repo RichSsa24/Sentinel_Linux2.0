@@ -1,6 +1,7 @@
 # --- Secrets (never commit) -----------------------------------------------
 .env
 .env.*
+sentinel.env
 !.env.example
 *.pem
 *.key
