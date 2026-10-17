@@ -94,3 +94,20 @@ class TestNoStringSql:
             # The table still exists and the payload round-trips verbatim.
             assert rows[0].message == payload
             assert await repo.count_events() == 1
+
+
+class TestBatchPersistence:
+    @pytest.mark.asyncio
+    async def test_batch_writes_events_and_alerts_in_one_commit(self, database: Database) -> None:
+        events = [make_event(event_id=f"{i:064d}") for i in range(3)]
+        async with database.session() as session:
+            repo = Repository(session)
+            written = await repo.save_batch(events=events, alerts=[make_alert()])
+            assert written == 4
+            assert await repo.count_events() == 3
+            assert await repo.count_alerts() == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_is_a_noop(self, database: Database) -> None:
+        async with database.session() as session:
+            assert await Repository(session).save_batch() == 0

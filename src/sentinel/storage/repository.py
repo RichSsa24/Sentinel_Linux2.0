@@ -10,6 +10,7 @@ scan). Every query is built with SQLAlchemy expressions and bound parameters
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select
@@ -25,6 +26,34 @@ def _as_utc(moment: datetime) -> datetime:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
+def _event_row(event: Event) -> EventRow:
+    return EventRow(
+        event_id=event.event.id,
+        occurred_at=event.timestamp,
+        category=event.event.category.value,
+        action=event.event.action,
+        outcome=event.event.outcome.value,
+        severity=event.event.severity,
+        host=event.host.name,
+        source_ip=event.source.ip,
+        message=event.message,
+    )
+
+
+def _alert_row(alert: Alert) -> AlertRow:
+    return AlertRow(
+        dedup_key=alert.dedup_key,
+        rule_id=alert.rule_id,
+        severity=alert.severity,
+        attack=",".join(alert.attack),
+        nist_csf=",".join(alert.nist_csf),
+        event_id=alert.event_id,
+        host=alert.host,
+        occurred_at=alert.timestamp,
+        summary=alert.summary,
+    )
+
+
 class Repository:
     """Reads and writes for events and alerts over one async session."""
 
@@ -32,38 +61,32 @@ class Repository:
         self._session = session
 
     async def save_event(self, event: Event) -> EventRow:
-        row = EventRow(
-            event_id=event.event.id,
-            occurred_at=event.timestamp,
-            category=event.event.category.value,
-            action=event.event.action,
-            outcome=event.event.outcome.value,
-            severity=event.event.severity,
-            host=event.host.name,
-            source_ip=event.source.ip,
-            message=event.message,
-        )
+        row = _event_row(event)
         self._session.add(row)
         await self._session.commit()
-        await self._session.refresh(row)
         return row
 
     async def save_alert(self, alert: Alert) -> AlertRow:
-        row = AlertRow(
-            dedup_key=alert.dedup_key,
-            rule_id=alert.rule_id,
-            severity=alert.severity,
-            attack=",".join(alert.attack),
-            nist_csf=",".join(alert.nist_csf),
-            event_id=alert.event_id,
-            host=alert.host,
-            occurred_at=alert.timestamp,
-            summary=alert.summary,
-        )
+        row = _alert_row(alert)
         self._session.add(row)
         await self._session.commit()
-        await self._session.refresh(row)
         return row
+
+    async def save_batch(
+        self, *, events: Iterable[Event] = (), alerts: Iterable[Alert] = ()
+    ) -> int:
+        """Persist many events and alerts in a single transaction.
+
+        One commit for the whole batch: either every row lands or none does.
+        Returns the number of rows written.
+        """
+        rows: list[EventRow | AlertRow] = [_event_row(event) for event in events]
+        rows.extend(_alert_row(alert) for alert in alerts)
+        if not rows:
+            return 0
+        self._session.add_all(rows)
+        await self._session.commit()
+        return len(rows)
 
     async def list_events(self, *, limit: int, before_id: int | None = None) -> list[EventRow]:
         stmt = select(EventRow).order_by(EventRow.id.desc()).limit(limit)
