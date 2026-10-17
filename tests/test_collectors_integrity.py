@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -386,3 +388,57 @@ class TestHostRoot:
         (tmp_path / "local" / "f.txt").write_text("x", encoding="utf-8")
         events = await _drain(collector)
         assert [e.file.path for e in events if e.file] == ["local/f.txt"]
+
+
+class TestStatCache:
+    """Unchanged files are not re-hashed — without opening a tampering blind spot."""
+
+    @staticmethod
+    def _clock_ahead(monkeypatch: pytest.MonkeyPatch, seconds: float = 30.0) -> None:
+        # Files written moments ago would be "racy" (re-hashed every poll); move
+        # the scan clock forward so they look settled and become cacheable.
+        real = time.time_ns
+        monkeypatch.setattr(time, "time_ns", lambda: real() + int(seconds * 1e9))
+
+    def test_settled_unchanged_files_reuse_their_digest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for i in range(5):
+            (tmp_path / f"f{i}").write_text(f"content {i}", encoding="utf-8")
+        self._clock_ahead(monkeypatch)
+        collector = _collector(tmp_path)
+        first = collector._scan()
+        second = collector._scan(first)
+        assert collector.stats["hashed"] == 5  # first scan only
+        assert collector.stats["hash_reused"] == 5
+        assert second == first
+
+    def test_racy_entries_are_rehashed(self, tmp_path: Path) -> None:
+        # Written "now": the kernel's coarse clock could hide a same-tick rewrite,
+        # so the cache must not be trusted yet.
+        (tmp_path / "fresh").write_text("v1", encoding="utf-8")
+        collector = _collector(tmp_path)
+        collector._scan(collector._scan())
+        assert collector.stats["hash_reused"] == 0
+        assert collector.stats["hashed"] == 2
+
+    @pytest.mark.security
+    @pytest.mark.asyncio
+    async def test_same_size_edit_with_restored_mtime_is_detected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The classic FIM evasion: same length, then `touch -d` the old mtime back.
+        target = tmp_path / "sudoers"
+        target.write_text("root ALL=(ALL) ALL\n", encoding="utf-8")
+        self._clock_ahead(monkeypatch)
+        collector = _collector(tmp_path)
+        await _drain(collector)  # baseline, cacheable
+        before = target.stat()
+
+        target.write_text("evil ALL=(ALL) ALL\n", encoding="utf-8")  # same length
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert target.stat().st_mtime_ns == before.st_mtime_ns
+        assert target.stat().st_size == before.st_size
+
+        events = await _drain(collector)
+        assert [e.event.action for e in events] == ["file_modified"]

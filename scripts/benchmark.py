@@ -10,7 +10,7 @@ not move the number. Run from the repo root:
 Benchmarks
 ----------
 engine    DetectionEngine.evaluate over a realistic mixed event stream.
-fim       Steady-state FIM poll over a synthetic tree (no file changes).
+fim       Steady-state FIM poll over a synthetic tree (files settled, no changes).
 process   Steady-state process-collector poll over the real /proc.
 persist   Events written to SQLite: one commit per event vs one per batch.
 pipeline  Collector -> bounded queue -> dedup -> consumer, 80% duplicates.
@@ -139,9 +139,10 @@ def bench_fim() -> str:
             sub = root / f"d{i % 20}"
             sub.mkdir(exist_ok=True)
             (sub / f"f{i}.conf").write_bytes(payload)
+        time.sleep(2.5)  # let the files "settle" past the collector's racy-ctime window
         collector = FileIntegrityCollector([root])
-        collector._scan()  # warm the page cache and any stat cache
-        seconds = _median_seconds(collector._scan)
+        previous = collector._scan()  # warm the page cache; this is the last poll's view
+        seconds = _median_seconds(lambda: collector._scan(previous))
     mib = files * size / 2**20
     return f"{seconds * 1e3:,.1f} ms per poll ({files:,} files, {mib:.0f} MiB)"
 

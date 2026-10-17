@@ -25,6 +25,16 @@ Security posture (per the collector contract in
 - **Bounded work.** Hashing is capped at ``max_hash_bytes`` (larger files fall
   back to size+mtime), and a scan visits at most ``max_files`` entries, so a
   watched directory that explodes in size cannot hang or OOM the process.
+- **Hash only what changed (stat cache).** A file whose ``(size, mtime, ctime,
+  inode, device)`` is unchanged since the last poll keeps its previous digest
+  instead of being re-read. ``mtime`` alone would not be safe — an attacker can
+  restore it with ``touch -d`` — but ``ctime`` is updated by the kernel on every
+  write, ``chmod`` and ``utimensat`` and cannot be set from userspace (forging
+  it means changing the system clock, i.e. ``CAP_SYS_TIME``). Because the
+  kernel stamps times from a coarse clock, two writes inside one tick can share
+  a ``ctime``; as in Git's "racy clean" handling, an entry whose ``ctime`` is
+  within ``_RACY_WINDOW_NS`` of the scan is never trusted from cache and is
+  re-hashed on the next poll.
 - **Degrades safely.** A path that cannot be read (permission denied, vanished
   mid-scan) is logged and skipped, never fatal.
 - **Never blocks the event loop.** The whole scan runs in a worker thread via
@@ -43,6 +53,7 @@ import hashlib
 import os
 import socket
 import stat
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
@@ -59,6 +70,10 @@ if TYPE_CHECKING:
 _HASH_CHUNK: Final[int] = 1 << 16  # 64 KiB read window for streaming hashes.
 _DEFAULT_MAX_HASH_BYTES: Final[int] = 50 * 1024 * 1024  # 50 MiB.
 _DEFAULT_MAX_FILES: Final[int] = 50_000
+# Entries changed this recently (relative to the scan start) are re-hashed next
+# poll even if their stat is unchanged: far wider than the kernel's timestamp
+# granularity (one jiffy, 1-10 ms) plus ordinary clock jitter.
+_RACY_WINDOW_NS: Final[int] = 2_000_000_000
 
 _ACTION_CREATED: Final[str] = "file_created"
 _ACTION_MODIFIED: Final[str] = "file_modified"
@@ -80,6 +95,22 @@ class _FileState(NamedTuple):
     mtime_ns: int
     mode: int
     sha256: str | None  # None when the file exceeds the hashing cap.
+    # Stat-cache key beyond size/mtime (see module docstring). `cacheable` is
+    # False for entries too recent to trust, forcing a re-hash next poll.
+    ctime_ns: int = 0
+    inode: int = 0
+    device: int = 0
+    cacheable: bool = False
+
+    def same_stat(self, other: _FileState) -> bool:
+        """True if `other` has the identical stat fingerprint (content assumed same)."""
+        return (
+            self.size == other.size
+            and self.mtime_ns == other.mtime_ns
+            and self.ctime_ns == other.ctime_ns
+            and self.inode == other.inode
+            and self.device == other.device
+        )
 
 
 class FileIntegrityCollector(AbstractCollector):
@@ -119,6 +150,8 @@ class FileIntegrityCollector(AbstractCollector):
         self._baseline: dict[str, _FileState] = {}
         self._seeded = False
         self._emitted = 0
+        self._hashed = 0
+        self._hash_reused = 0
 
     async def run(self, queue: BoundedEventQueue) -> None:
         """Seed a baseline, then emit one event per change until stopped."""
@@ -131,7 +164,7 @@ class FileIntegrityCollector(AbstractCollector):
 
     async def _drain_once(self, queue: BoundedEventQueue) -> None:
         """Scan, diff, normalize each change, and enqueue the resulting events."""
-        snapshot = await asyncio.to_thread(self._scan)
+        snapshot = await asyncio.to_thread(self._scan, self._baseline)
         if not self._seeded:
             self._baseline = snapshot
             self._seeded = True
@@ -147,17 +180,24 @@ class FileIntegrityCollector(AbstractCollector):
 
     # ------------------------------------------------------------------ scanning
 
-    def _scan(self) -> dict[str, _FileState]:
-        """Build a fresh snapshot of every watched regular file (runs in a thread)."""
+    def _scan(self, previous: dict[str, _FileState] | None = None) -> dict[str, _FileState]:
+        """Build a fresh snapshot of every watched regular file (runs in a thread).
+
+        `previous` is the last snapshot; its digests are reused for files whose
+        stat fingerprint is unchanged (the stat cache).
+        """
+        previous = previous or {}
+        racy_after_ns = time.time_ns() - _RACY_WINDOW_NS
         snapshot: dict[str, _FileState] = {}
         for root in self._paths:
             for path in self._iter_files(self._on_disk(root)):
                 if len(snapshot) >= self._max_files:
                     self._log.warning("integrity.max_files_reached", max_files=self._max_files)
                     return snapshot
-                state = self._snapshot_file(path)
+                key = self._host_path(path)
+                state = self._snapshot_file(path, previous.get(key), racy_after_ns)
                 if state is not None:
-                    snapshot[self._host_path(path)] = state
+                    snapshot[key] = state
         return snapshot
 
     def _on_disk(self, host_path: Path) -> Path:
@@ -196,7 +236,9 @@ class FileIntegrityCollector(AbstractCollector):
             if not self._recursive:
                 dirnames.clear()  # prune descent: top level only.
 
-    def _snapshot_file(self, path: Path) -> _FileState | None:
+    def _snapshot_file(
+        self, path: Path, previous: _FileState | None = None, racy_after_ns: int = 0
+    ) -> _FileState | None:
         """Fingerprint one path, or None if it is not a readable regular file."""
         try:
             lst = path.lstat()
@@ -204,15 +246,23 @@ class FileIntegrityCollector(AbstractCollector):
             return None
         if not stat.S_ISREG(lst.st_mode):
             return None  # symlink, dir, socket, device — out of scope.
-        sha256 = None
-        if lst.st_size <= self._max_hash_bytes:
-            sha256 = self._hash_file(path)
-        return _FileState(
+        state = _FileState(
             size=lst.st_size,
             mtime_ns=lst.st_mtime_ns,
             mode=stat.S_IMODE(lst.st_mode),
-            sha256=sha256,
+            sha256=None,
+            ctime_ns=lst.st_ctime_ns,
+            inode=lst.st_ino,
+            device=lst.st_dev,
+            cacheable=lst.st_ctime_ns < racy_after_ns,
         )
+        if previous is not None and previous.cacheable and previous.same_stat(state):
+            self._hash_reused += 1
+            return state._replace(sha256=previous.sha256)
+        if lst.st_size <= self._max_hash_bytes:
+            self._hashed += 1
+            return state._replace(sha256=self._hash_file(path))
+        return state
 
     def _hash_file(self, path: Path) -> str | None:
         """Stream a file's SHA-256, or None on read failure."""
@@ -284,6 +334,8 @@ class FileIntegrityCollector(AbstractCollector):
         return {
             "emitted": self._emitted,
             "watched": len(self._baseline),
+            "hashed": self._hashed,
+            "hash_reused": self._hash_reused,
             "dead_lettered": self._normalizer.stats["dead_letters"],
         }
 
