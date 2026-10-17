@@ -60,6 +60,11 @@ class TestLoadHappyPath:
 
 
 class TestFailClosed:
+    def test_missing_directory_is_rejected(self, tmp_path: Path) -> None:
+        # A typo'd SENTINEL_RULES_DIR must not start a detector with zero rules.
+        with pytest.raises(RuleLoadError, match="does not exist"):
+            load_rules(tmp_path / "no-such-dir")
+
     def test_non_mapping_document_is_rejected(self, tmp_path: Path) -> None:
         _write(tmp_path, "bad.yml", "- just\n- a list\n")
         with pytest.raises(RuleLoadError, match="must contain a YAML mapping"):

@@ -38,8 +38,13 @@ def load_rules(rules_dir: Path) -> list[Rule]:
     """Load every ``*.yml`` / ``*.yaml`` rule under ``rules_dir``, validated.
 
     Raises :class:`RuleLoadError` on the first unreadable, malformed, or
-    duplicate rule — the library loads in full or not at all (fail closed).
+    duplicate rule — the library loads in full or not at all (fail closed). A
+    missing directory is an error too: a typo'd path must not start a detector
+    with zero rules.
     """
+    if not rules_dir.is_dir():
+        msg = f"rules directory {rules_dir} does not exist or is not a directory"
+        raise RuleLoadError(msg)
     paths = sorted({*rules_dir.glob("*.yml"), *rules_dir.glob("*.yaml")})
     rules: list[Rule] = []
     seen: dict[str, Path] = {}
