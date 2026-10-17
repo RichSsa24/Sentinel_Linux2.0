@@ -343,9 +343,16 @@ class FileIntegrityCollector(AbstractCollector):
 def _content_changed(old: _FileState, new: _FileState) -> bool:
     """True if file content changed between snapshots.
 
-    Prefers the hash; for unhashable files (no digest on either side) falls back
-    to size or mtime drift.
+    Prefers the hash. For unhashable files (unreadable — e.g. /etc/shadow for a
+    non-root collector — or over the size cap) it falls back to size or mtime
+    drift, and then to ctime: size+mtime alone can be forged (a same-length edit
+    followed by ``touch -d``), ctime cannot. A ctime move that a mode change
+    explains is left to the attributes check, so ``chmod u+s`` still reads as
+    ``file_attributes_modified``.
     """
     if old.sha256 is not None and new.sha256 is not None:
         return old.sha256 != new.sha256
-    return old.size != new.size or old.mtime_ns != new.mtime_ns
+    if old.size != new.size or old.mtime_ns != new.mtime_ns:
+        return True
+    ctime_known = bool(old.ctime_ns and new.ctime_ns)
+    return ctime_known and old.ctime_ns != new.ctime_ns and old.mode == new.mode

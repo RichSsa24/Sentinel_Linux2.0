@@ -147,6 +147,20 @@ class TestContentChanged:
     def test_unhashable_identical_is_not_change(self) -> None:
         assert _content_changed(_state(None), _state(None)) is False
 
+    @pytest.mark.security
+    def test_unhashable_ctime_move_is_change(self) -> None:
+        # Unreadable file, same size, mtime restored with `touch -d`: only the
+        # kernel-maintained ctime gives the edit away.
+        old = _state(None)._replace(ctime_ns=100)
+        new = _state(None)._replace(ctime_ns=200)
+        assert _content_changed(old, new) is True
+
+    def test_unhashable_ctime_move_explained_by_chmod_is_not_content(self) -> None:
+        # Leave it to the attributes check so `chmod u+s` stays an attrs event.
+        old = _state(None, mode=0o755)._replace(ctime_ns=100)
+        new = _state(None, mode=0o4755)._replace(ctime_ns=200)
+        assert _content_changed(old, new) is False
+
 
 async def _drain(collector: FileIntegrityCollector) -> list[Event]:
     """Run one scan/diff cycle and return the events it would enqueue."""
