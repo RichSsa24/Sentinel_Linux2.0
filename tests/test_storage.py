@@ -111,3 +111,26 @@ class TestBatchPersistence:
     async def test_empty_batch_is_a_noop(self, database: Database) -> None:
         async with database.session() as session:
             assert await Repository(session).save_batch() == 0
+
+    @pytest.mark.asyncio
+    async def test_bulk_rows_get_server_side_defaults(self, database: Database) -> None:
+        async with database.session() as session:
+            repo = Repository(session)
+            await repo.save_batch(events=[make_event()], alerts=[make_alert()])
+            (event_row,) = await repo.list_events(limit=1)
+            (alert_row,) = await repo.list_alerts(limit=1)
+        assert event_row.id >= 1
+        assert event_row.created_at is not None
+        assert alert_row.created_at is not None
+
+
+class TestSqliteTuning:
+    @pytest.mark.asyncio
+    async def test_file_database_uses_wal_and_normal_sync(self, database: Database) -> None:
+        async with database.engine.connect() as conn:
+            journal = (await conn.exec_driver_sql("PRAGMA journal_mode")).scalar()
+            sync = (await conn.exec_driver_sql("PRAGMA synchronous")).scalar()
+            busy = (await conn.exec_driver_sql("PRAGMA busy_timeout")).scalar()
+        assert journal == "wal"
+        assert sync == 1  # NORMAL
+        assert busy == 5000

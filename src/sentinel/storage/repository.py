@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinel.alerting.model import Alert
@@ -26,32 +26,32 @@ def _as_utc(moment: datetime) -> datetime:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
-def _event_row(event: Event) -> EventRow:
-    return EventRow(
-        event_id=event.event.id,
-        occurred_at=event.timestamp,
-        category=event.event.category.value,
-        action=event.event.action,
-        outcome=event.event.outcome.value,
-        severity=event.event.severity,
-        host=event.host.name,
-        source_ip=event.source.ip,
-        message=event.message,
-    )
+def _event_values(event: Event) -> dict[str, object]:
+    return {
+        "event_id": event.event.id,
+        "occurred_at": event.timestamp,
+        "category": event.event.category.value,
+        "action": event.event.action,
+        "outcome": event.event.outcome.value,
+        "severity": event.event.severity,
+        "host": event.host.name,
+        "source_ip": event.source.ip,
+        "message": event.message,
+    }
 
 
-def _alert_row(alert: Alert) -> AlertRow:
-    return AlertRow(
-        dedup_key=alert.dedup_key,
-        rule_id=alert.rule_id,
-        severity=alert.severity,
-        attack=",".join(alert.attack),
-        nist_csf=",".join(alert.nist_csf),
-        event_id=alert.event_id,
-        host=alert.host,
-        occurred_at=alert.timestamp,
-        summary=alert.summary,
-    )
+def _alert_values(alert: Alert) -> dict[str, object]:
+    return {
+        "dedup_key": alert.dedup_key,
+        "rule_id": alert.rule_id,
+        "severity": alert.severity,
+        "attack": ",".join(alert.attack),
+        "nist_csf": ",".join(alert.nist_csf),
+        "event_id": alert.event_id,
+        "host": alert.host,
+        "occurred_at": alert.timestamp,
+        "summary": alert.summary,
+    }
 
 
 class Repository:
@@ -61,13 +61,13 @@ class Repository:
         self._session = session
 
     async def save_event(self, event: Event) -> EventRow:
-        row = _event_row(event)
+        row = EventRow(**_event_values(event))
         self._session.add(row)
         await self._session.commit()
         return row
 
     async def save_alert(self, alert: Alert) -> AlertRow:
-        row = _alert_row(alert)
+        row = AlertRow(**_alert_values(alert))
         self._session.add(row)
         await self._session.commit()
         return row
@@ -78,15 +78,22 @@ class Repository:
         """Persist many events and alerts in a single transaction.
 
         One commit for the whole batch: either every row lands or none does.
+        Rows go in as a bulk ``executemany`` INSERT rather than through the ORM
+        unit of work: these are append-only audit records, so nothing needs the
+        generated primary keys back, and skipping per-row ``RETURNING`` is what
+        makes batching pay off (see ``scripts/benchmark.py persist``).
         Returns the number of rows written.
         """
-        rows: list[EventRow | AlertRow] = [_event_row(event) for event in events]
-        rows.extend(_alert_row(alert) for alert in alerts)
-        if not rows:
+        event_values = [_event_values(event) for event in events]
+        alert_values = [_alert_values(alert) for alert in alerts]
+        if event_values:
+            await self._session.execute(insert(EventRow), event_values)
+        if alert_values:
+            await self._session.execute(insert(AlertRow), alert_values)
+        if not event_values and not alert_values:
             return 0
-        self._session.add_all(rows)
         await self._session.commit()
-        return len(rows)
+        return len(event_values) + len(alert_values)
 
     async def list_events(self, *, limit: int, before_id: int | None = None) -> list[EventRow]:
         stmt = select(EventRow).order_by(EventRow.id.desc()).limit(limit)
