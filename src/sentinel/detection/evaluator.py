@@ -45,14 +45,23 @@ def _compiled(pattern: str) -> regex.Pattern:
     return regex.compile(pattern, flags=regex.IGNORECASE)
 
 
+@lru_cache(maxsize=1024)
+def _field_path(field: str) -> tuple[str, ...]:
+    """Split (and cache) a dotted field path — rules reuse a handful of paths."""
+    return tuple(field.split("."))
+
+
 def resolve_field(field: str, event: Mapping[str, object]) -> object:
     """Walk a dotted field path into the event dict; missing -> ``None``.
 
     Shared with the engine, which uses it to resolve a threshold's ``group_by``.
     """
     current: object = event
-    for part in field.split("."):
-        if not isinstance(current, Mapping):
+    for part in _field_path(field):
+        # `dict` is listed first on purpose: the event view is built from plain
+        # dicts, and an exact-type hit short-circuits before the much slower ABC
+        # check that `Mapping` needs (which still admits any other Mapping).
+        if not isinstance(current, (dict, Mapping)):
             return None
         current = current.get(part)
         if current is None:
