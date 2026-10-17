@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -28,6 +29,7 @@ from sentinel.collectors.integrity import FileIntegrityCollector
 from sentinel.collectors.network import NetworkCollector
 from sentinel.collectors.process import ProcessCollector
 from sentinel.detection.schema import Rule
+from sentinel.events import Event
 from sentinel.logging import redact_sensitive_processor
 from sentinel.metrics import Metrics
 from sentinel.pipeline.queue import BoundedEventQueue
@@ -39,7 +41,7 @@ from sentinel.runtime import (
     build_sinks,
 )
 from sentinel.storage import Database, Repository
-from tests.conftest import auth_header, make_api_settings, make_detection
+from tests.conftest import auth_header, make_api_settings, make_detection, make_event
 
 _FAILED = (
     "Jun 16 12:00:{sec:02d} web01 sshd[{pid}]: "
@@ -74,6 +76,30 @@ class _Recorder(AlertSink):
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _Replay(AbstractCollector):
+    """Emits a fixed list of events once, then idles until stopped."""
+
+    name = "replay"
+
+    def __init__(self, events: list[Event]) -> None:
+        super().__init__()
+        self._events = events
+
+    async def run(self, queue: BoundedEventQueue) -> None:
+        for event in self._events:
+            await queue.put(event)
+        await self.wait_stop()
+
+
+def _events(count: int) -> list[Event]:
+    return [make_event(event_id=f"{i:064d}", message=f"e{i}") for i in range(count)]
+
+
+async def _count_events(database: Database) -> int:
+    async with database.session() as session:
+        return await Repository(session).count_events()
 
 
 class _Crashing(AbstractCollector):
@@ -221,7 +247,13 @@ class TestRuntimeEndToEnd:
             for s in families["sentinel_events_dropped"].samples
             if s.name.endswith("_total")
         }
-        assert dropped == {"queue_full", "duplicate", "consumer_error", "dead_letter"}
+        assert dropped == {
+            "queue_full",
+            "duplicate",
+            "consumer_error",
+            "dead_letter",
+            "persist_error",
+        }
 
     async def test_crashed_collector_is_reported_not_running(
         self, database: Database, rules: tuple[Rule, ...]
@@ -271,6 +303,113 @@ class TestRuntimeEndToEnd:
             runtime.start()
         await runtime.stop()
         assert any(entry["event"] == "runtime.no_enabled_rules" for entry in logs)
+
+
+@pytest.mark.integration
+class TestWriteBehind:
+    async def test_full_batches_are_written_without_waiting(
+        self, database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        metrics = Metrics()
+        runtime = Runtime(
+            make_api_settings(persist_batch_size=4, persist_flush_interval_seconds=60),
+            database=database,
+            metrics=metrics,
+            rules=rules,
+            collectors=[_Replay(_events(10))],
+            sinks=[],
+        )
+        runtime.start()
+        try:
+            assert await _wait_for(lambda: metrics.events_ingested._value.get() == 10)
+            # Two full batches of 4 are on disk; the last 2 wait for the timer.
+            assert await _count_events(database) == 8
+        finally:
+            await runtime.stop()
+        assert await _count_events(database) == 10  # shutdown flushes the remainder
+
+    async def test_flush_interval_bounds_staleness(
+        self, database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        runtime = Runtime(
+            make_api_settings(persist_batch_size=1000, persist_flush_interval_seconds=0.05),
+            database=database,
+            metrics=Metrics(),
+            rules=rules,
+            collectors=[_Replay(_events(3))],
+            sinks=[],
+        )
+        runtime.start()
+        try:
+            written = 0
+            for _ in range(100):
+                written = await _count_events(database)
+                if written == 3:
+                    break
+                await asyncio.sleep(0.02)
+            assert written == 3
+        finally:
+            await runtime.stop()
+
+    async def test_database_outage_does_not_stall_detection(
+        self, tmp_path: Path, rules: tuple[Rule, ...]
+    ) -> None:
+        broken = Database(f"sqlite+aiosqlite:///{tmp_path / 'missing-dir' / 'x.db'}")
+        metrics = Metrics()
+        runtime = Runtime(
+            make_api_settings(persist_batch_size=1),
+            database=broken,
+            metrics=metrics,
+            rules=rules,
+            collectors=[_Replay(_events(3))],
+            sinks=[],
+        )
+        with structlog.testing.capture_logs() as logs:
+            runtime.start()
+            assert await _wait_for(lambda: metrics.events_ingested._value.get() == 3)
+            await runtime.stop()
+        await broken.dispose()
+        assert runtime.snapshot().dropped["persist_error"] == 3
+        failures = [entry for entry in logs if entry["event"] == "runtime.persist_failed"]
+        assert failures
+        assert all(entry["error"] == "OperationalError" for entry in failures)
+
+    async def test_stop_never_cancels_a_flush_in_flight(
+        self,
+        database: Database,
+        rules: tuple[Rule, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Regression: stop() used to cancel the periodic flusher. A batch is
+        # taken out of the buffer before it is written, so cancelling mid-write
+        # silently lost that whole batch.
+        writing = asyncio.Event()
+        saved: list[int] = []
+        original = Repository.save_batch
+
+        async def slow_save(self: Repository, **batch: Any) -> int:
+            writing.set()
+            await asyncio.sleep(0.2)  # stop() lands while this write is in flight
+            written = await original(self, **batch)
+            saved.append(written)
+            return written
+
+        monkeypatch.setattr(Repository, "save_batch", slow_save)
+        metrics = Metrics()
+        runtime = Runtime(
+            make_api_settings(persist_batch_size=1000, persist_flush_interval_seconds=0.01),
+            database=database,
+            metrics=metrics,
+            rules=rules,
+            collectors=[_Replay(_events(5))],
+            sinks=[],
+        )
+        runtime.start()
+        assert await _wait_for(lambda: metrics.events_ingested._value.get() == 5)
+        await asyncio.wait_for(writing.wait(), timeout=2)
+        await runtime.stop()
+        assert saved  # the in-flight write completed instead of being cancelled
+        assert await _count_events(database) == 5
 
 
 @pytest.mark.integration

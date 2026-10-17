@@ -14,6 +14,7 @@ fim       Steady-state FIM poll over a synthetic tree (no file changes).
 process   Steady-state process-collector poll over the real /proc.
 persist   Events written to SQLite: one commit per event vs one per batch.
 pipeline  Collector -> bounded queue -> dedup -> consumer, 80% duplicates.
+runtime   End to end: collector -> dedup -> 17 rules -> alerts -> SQLite.
 
 The numbers in the README come from this script; rerun it rather than trusting
 them on different hardware.
@@ -51,7 +52,9 @@ from sentinel.events import (
     Process,
     Source,
 )
+from sentinel.metrics import Metrics
 from sentinel.pipeline import BoundedEventQueue, Pipeline
+from sentinel.runtime import Runtime
 from sentinel.settings import Settings
 from sentinel.storage import Database, Repository
 
@@ -229,12 +232,47 @@ def bench_pipeline() -> str:
     return f"{len(stream) / seconds:,.0f} events/s ({len(stream):,} in, {len(unique):,} unique)"
 
 
+def bench_runtime() -> str:
+    events = _mixed_events(5_000)
+    rules = load_rules(_ROOT / "rules")
+
+    async def run(batch_size: int) -> float:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(f"sqlite+aiosqlite:///{tmp}/bench.db")
+            await db.create_all()
+            metrics = Metrics()
+            runtime = Runtime(
+                Settings(env="test", persist_batch_size=batch_size),
+                database=db,
+                metrics=metrics,
+                rules=rules,
+                collectors=[_Firehose("firehose", events)],
+                sinks=[],
+            )
+            started = time.perf_counter()
+            runtime.start()
+            while metrics.events_ingested._value.get() < len(events):  # noqa: ASYNC110 — polls a counter; there is no completion hook to await
+                await asyncio.sleep(0.005)
+            await runtime.stop()  # includes the final flush
+            elapsed = time.perf_counter() - started
+            await db.dispose()
+            return elapsed
+
+    single = statistics.median([asyncio.run(run(1)) for _ in range(3)])
+    batched = statistics.median([asyncio.run(run(256)) for _ in range(3)])
+    return (
+        f"{len(events) / batched:,.0f} events/s (batch 256) · "
+        f"{len(events) / single:,.0f} events/s (batch 1)"
+    )
+
+
 BENCHMARKS: dict[str, Callable[[], str]] = {
     "engine": bench_engine,
     "fim": bench_fim,
     "process": bench_process,
     "persist": bench_persist,
     "pipeline": bench_pipeline,
+    "runtime": bench_runtime,
 }
 
 

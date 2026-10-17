@@ -3,7 +3,8 @@
 This is the one place the layers are wired together:
 
     collectors -> Pipeline (bounded queue + dedup) -> DetectionEngine
-               -> AlertManager (gates + sinks) -> Repository (one transaction)
+               -> AlertManager (gates + sinks)       [immediately]
+               -> write-behind buffer -> Repository  [batched]
 
 Everything an operator configures through ``SENTINEL_*`` variables is honoured
 here — which collectors run and where they read the host from, which alert
@@ -15,17 +16,35 @@ end to end by ``tests/test_runtime.py`` without any HTTP in the way.
 Configuration errors fail closed at construction time: a half-configured sink
 (a webhook URL without its HMAC secret, SMTP without recipients) raises
 :class:`ConfigurationError` instead of silently running without that channel.
+
+**Write-behind persistence.** Detection and alert delivery happen as each event
+is consumed; only the database write is deferred. Events and their alerts are
+buffered and written in one transaction when ``persist_batch_size`` events have
+accumulated or ``persist_flush_interval_seconds`` has elapsed, whichever comes
+first, and the buffer is always flushed on shutdown. One commit per event caps
+SQLite at a few hundred events per second; batching is what lets persistence
+keep up with the pipeline. The cost is bounded staleness in the read API (at
+most one flush interval) and, on a hard kill, losing at most one unflushed
+batch — events that were only in memory anyway.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Final
 
-from sentinel.alerting import AlertManager, AlertSink, ConsoleSink, EmailSink, WebhookSink
+from sentinel.alerting import (
+    Alert,
+    AlertManager,
+    AlertSink,
+    ConsoleSink,
+    EmailSink,
+    WebhookSink,
+)
 from sentinel.collectors.authlog import AuthLogCollector
 from sentinel.collectors.base import AbstractCollector
 from sentinel.collectors.integrity import FileIntegrityCollector
@@ -152,6 +171,16 @@ class Runtime:
         self._pipeline.set_consumer(self._consume)
         metrics.observe_runtime(self.snapshot)
         self._task: asyncio.Task[None] | None = None
+        # Write-behind buffer (see module docstring). The lock serialises the
+        # size-triggered and timer-triggered flushes so commits stay ordered.
+        self._batch_size = settings.persist_batch_size
+        self._flush_interval = settings.persist_flush_interval_seconds
+        self._pending_events: list[Event] = []
+        self._pending_alerts: list[Alert] = []
+        self._flush_lock = asyncio.Lock()
+        self._flusher: asyncio.Task[None] | None = None
+        self._stop_flushing = asyncio.Event()
+        self._persist_failed = 0
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -164,6 +193,7 @@ class Runtime:
             self._log.warning("runtime.no_enabled_rules")
         self._task = asyncio.create_task(self._pipeline.run(), name="sentinel.runtime")
         self._task.add_done_callback(self._on_pipeline_exit)
+        self._flusher = asyncio.create_task(self._flush_periodically(), name="sentinel.flusher")
         self._log.info(
             "runtime.started",
             collectors=[collector.name for collector in self._collectors],
@@ -188,6 +218,12 @@ class Runtime:
         if self._task is not None:
             await self._pipeline.stop()
             await asyncio.wait({self._task})
+        if self._flusher is not None:
+            # Ask, never cancel: a batch leaves the buffer before it is written,
+            # so cancelling a flush mid-write would silently drop that batch.
+            self._stop_flushing.set()
+            await self._flusher
+        await self.flush()  # everything the drained pipeline consumed lands
         await self._alerts.aclose()
 
     def _on_pipeline_exit(self, task: asyncio.Task[None]) -> None:
@@ -199,8 +235,7 @@ class Runtime:
     # ------------------------------------------------------------------ per event
 
     async def _consume(self, event: Event) -> None:
-        """Detect, alert, and persist one deduplicated event."""
-        alerts = []
+        """Detect and alert now; buffer the event and its alerts for persistence."""
         for detection in self._engine.evaluate(event):
             self._metrics.detections_fired.labels(
                 rule_id=detection.rule_id, severity=str(detection.severity)
@@ -209,10 +244,41 @@ class Runtime:
             alert = await self._alerts.process(detection)
             if alert is not None:
                 self._metrics.alert_latency.observe(time.perf_counter() - started)
-                alerts.append(alert)
-        async with self._database.session() as session:
-            await Repository(session).save_batch(events=[event], alerts=alerts)
+                self._pending_alerts.append(alert)
+        self._pending_events.append(event)
         self._metrics.events_ingested.inc()
+        if len(self._pending_events) >= self._batch_size:
+            await self.flush()
+
+    async def flush(self) -> None:
+        """Write every buffered event and alert in one transaction.
+
+        A failed write is logged (exception type only) and counted as
+        ``dropped{reason="persist_error"}``; it never propagates into the
+        consumer, so a database outage cannot stall detection and alerting.
+        """
+        async with self._flush_lock:
+            events, self._pending_events = self._pending_events, []
+            alerts, self._pending_alerts = self._pending_alerts, []
+            if not events and not alerts:
+                return
+            try:
+                async with self._database.session() as session:
+                    await Repository(session).save_batch(events=events, alerts=alerts)
+            except Exception as exc:
+                self._persist_failed += len(events)
+                self._log.error(
+                    "runtime.persist_failed",
+                    events=len(events),
+                    alerts=len(alerts),
+                    error=type(exc).__name__,
+                )
+
+    async def _flush_periodically(self) -> None:
+        while not self._stop_flushing.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_flushing.wait(), timeout=self._flush_interval)
+            await self.flush()
 
     # ------------------------------------------------------------------ observability
 
@@ -228,6 +294,7 @@ class Runtime:
                 "duplicate": pipeline["deduped"],
                 "consumer_error": pipeline["consumer_errors"],
                 "dead_letter": dead_letters,
+                "persist_error": self._persist_failed,
             },
             alerts_delivered=self._alerts.delivered_by_sink,
             alerts_suppressed={

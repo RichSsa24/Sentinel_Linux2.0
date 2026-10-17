@@ -182,6 +182,18 @@ class Settings(BaseSettings):
         min_length=1,
         description="Async SQLAlchemy URL. SQLite by default; PostgreSQL via env.",
     )
+    persist_batch_size: int = Field(
+        default=256,
+        ge=1,
+        le=10_000,
+        description="Events buffered before a write. 1 = one transaction per event.",
+    )
+    persist_flush_interval_seconds: float = Field(
+        default=0.5,
+        gt=0.0,
+        le=60.0,
+        description="Upper bound on how long a buffered event waits to be written.",
+    )
 
     # --- Read API ------------------------------------------------------------
     api_key: SecretStr | None = Field(
