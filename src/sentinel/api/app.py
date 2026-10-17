@@ -7,16 +7,21 @@ schema are disabled — this is a machine read-API, not a public dev portal, and
 smaller surface is a safer surface. Errors are generic (no stack traces or
 internal detail leak); all list endpoints are keyset-paginated with a bounded
 page size.
+
+The app's lifespan runs the detection system itself: it starts a
+:class:`~sentinel.runtime.Runtime` (built from the same ``Settings``) on startup
+and drains it on shutdown. ``/readyz`` reports *not ready* if the database is
+unreachable or the pipeline has died, so an orchestrator restarts a detector
+that has silently stopped detecting.
 """
 
 # NOTE: no `from __future__ import annotations` here — FastAPI must evaluate the
 # `Annotated[int, Query(...)]` route-parameter annotations at runtime, which
 # stringified (PEP 563) annotations break.
 
-import asyncio
-from collections.abc import AsyncGenerator, Iterable
-from contextlib import asynccontextmanager
-from pathlib import Path
+from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Query, Request
@@ -26,7 +31,7 @@ from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 
-from sentinel.alerting import AlertManager, ConsoleSink
+from sentinel.alerting import AlertSink
 from sentinel.api.schemas import AlertOut, EventOut, Page, Pagination, RuleOut
 from sentinel.api.security import (
     RateLimitMiddleware,
@@ -34,23 +39,25 @@ from sentinel.api.security import (
     SecurityHeadersMiddleware,
     require_api_key,
 )
-from sentinel.collectors.authlog import AuthLogCollector
-from sentinel.collectors.integrity import FileIntegrityCollector
-from sentinel.collectors.network import NetworkCollector
-from sentinel.collectors.process import ProcessCollector
-from sentinel.detection import DetectionEngine
+from sentinel.collectors.base import AbstractCollector
 from sentinel.detection.loader import load_rules
 from sentinel.detection.schema import Rule
-from sentinel.events import Event
-from sentinel.logging import get_logger
+from sentinel.logging import configure_logging, get_logger
 from sentinel.metrics import Metrics
-from sentinel.pipeline import Pipeline
+from sentinel.runtime import Runtime
 from sentinel.settings import Settings
 from sentinel.storage.database import Database
 from sentinel.storage.repository import Repository
 
 _log = get_logger("sentinel.api")
 _DEFAULT_PAGE_SIZE = 50
+
+
+def _package_version() -> str:
+    try:
+        return version("sentinel-linux")
+    except PackageNotFoundError:  # pragma: no cover - running from a bare checkout
+        return "0+unknown"
 
 
 def _error(
@@ -63,40 +70,36 @@ def _error(
     )
 
 
-@asynccontextmanager
-async def _pipeline_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    pipeline = Pipeline(app.state.settings)
-    engine = DetectionEngine(app.state.rules)
-    alert_mgr = AlertManager([ConsoleSink()])
+def _runtime_lifespan(
+    settings: Settings,
+    *,
+    database: Database,
+    metrics: Metrics,
+    rules: tuple[Rule, ...],
+    collectors: Iterable[AbstractCollector] | None,
+    sinks: Sequence[AlertSink] | None,
+) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
+    """Lifespan that runs the detection system for as long as the app serves."""
 
-    pipeline.register(AuthLogCollector())
-    pipeline.register(FileIntegrityCollector(paths=["/etc", "/tmp"]))  # noqa: S108  # nosec B108
-    pipeline.register(NetworkCollector())
-    pipeline.register(ProcessCollector())
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+        runtime = Runtime(
+            settings,
+            database=database,
+            metrics=metrics,
+            rules=rules,
+            collectors=collectors,
+            sinks=sinks,
+        )
+        app.state.runtime = runtime
+        runtime.start()
+        try:
+            yield
+        finally:
+            await runtime.stop()
+            await database.dispose()
 
-    async def consumer(event: Event) -> None:
-        detections = engine.evaluate(event)
-        for detection in detections:
-            alert = await alert_mgr.process(detection)
-            if alert:
-                async with app.state.database.session() as session:
-                    repo = Repository(session)
-                    await repo.save_alert(alert)
-                app.state.metrics.detections_fired.labels(
-                    rule_id=detection.rule_id, severity=str(detection.severity)
-                ).inc()
-
-        async with app.state.database.session() as session:
-            repo = Repository(session)
-            await repo.save_event(event)
-
-        app.state.metrics.events_ingested.inc()
-
-    pipeline.set_consumer(consumer)
-    pipeline_task = asyncio.create_task(pipeline.run())
-    yield
-    await pipeline.stop()
-    await pipeline_task
+    return lifespan
 
 
 def create_app(
@@ -105,21 +108,35 @@ def create_app(
     database: Database,
     metrics: Metrics,
     rules: Iterable[Rule],
+    collectors: Iterable[AbstractCollector] | None = None,
+    sinks: Sequence[AlertSink] | None = None,
 ) -> FastAPI:
-    """Build the read API around its injected dependencies."""
+    """Build the read API around its injected dependencies.
+
+    ``collectors`` and ``sinks`` default to what ``settings`` describes; tests
+    inject their own to drive the lifespan deterministically.
+    """
+    rule_list = tuple(rules)
     app = FastAPI(
         title="Sentinel-Linux 2.0",
-        version="0.1.0",
+        version=_package_version(),
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
-        lifespan=_pipeline_lifespan,
+        lifespan=_runtime_lifespan(
+            settings,
+            database=database,
+            metrics=metrics,
+            rules=rule_list,
+            collectors=collectors,
+            sinks=sinks,
+        ),
     )
     app.state.settings = settings
     app.state.database = database
     app.state.metrics = metrics
-    app.state.rules = tuple(rules)
-    rule_list: tuple[Rule, ...] = app.state.rules
+    app.state.rules = rule_list
+    app.state.runtime = None
     max_page = settings.api_max_page_size
     page_default = min(_DEFAULT_PAGE_SIZE, max_page)
 
@@ -131,7 +148,7 @@ def create_app(
         window_seconds=settings.api_rate_window_seconds,
     )
     app.add_middleware(RequestContextMiddleware)
-    origins = [origin.strip() for origin in settings.api_cors_origins.split(",") if origin.strip()]
+    origins = list(settings.cors_origin_list)
     if origins:
         app.add_middleware(
             CORSMiddleware,
@@ -162,7 +179,10 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/readyz")
-    async def readyz() -> Response:
+    async def readyz(request: Request) -> Response:
+        runtime: Runtime | None = request.app.state.runtime
+        if runtime is not None and not runtime.running:
+            return _error(503, "NOT_READY", "detection pipeline is not running")
         try:
             async with database.session() as session:
                 await session.execute(text("SELECT 1"))
@@ -226,14 +246,14 @@ _CODES: dict[int, str] = {
 
 
 def get_app() -> FastAPI:
-    """Zero-argument factory for Uvicorn to initialize the app."""
+    """Zero-argument factory for Uvicorn (``--factory``): configure from the environment.
+
+    Logging is configured *first*, so the redaction and control-character
+    stripping processors are active before any other component can log.
+    """
     settings = Settings()
-    database = Database(settings.database_url)
-    metrics = Metrics()
-
-    rules_dir = Path("/app/rules")
-    if not rules_dir.exists():
-        rules_dir = Path(__file__).resolve().parent.parent.parent.parent / "rules"
-    rules = load_rules(rules_dir)
-
-    return create_app(settings, database=database, metrics=metrics, rules=rules)
+    configure_logging(settings)
+    rules = load_rules(settings.rules_dir)
+    return create_app(
+        settings, database=Database(settings.database_url), metrics=Metrics(), rules=rules
+    )
