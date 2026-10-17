@@ -19,6 +19,15 @@ Two safety properties matter here:
 
 Windows key off the *event* timestamp, not wall-clock, so detection is
 deterministic and replayable in tests.
+
+**Action index.** Most rules pin ``event.action`` (``process_started``,
+``ssh_login_failed`` ...). :func:`required_actions` derives, by static analysis
+of a rule's condition tree, the set of actions it could *possibly* match, and
+the engine only evaluates the rules whose set contains the event's action (plus
+the rules no set could be derived for). The derivation is conservative — it
+answers "any action" whenever it cannot prove otherwise — so the index skips
+work, never detections; ``tests/test_detection_engine.py`` checks that property
+against randomly generated conditions.
 """
 
 from __future__ import annotations
@@ -31,13 +40,59 @@ from typing import Final
 from pydantic import BaseModel, ConfigDict, Field
 
 from sentinel.detection.evaluator import evaluate_condition, resolve_field
-from sentinel.detection.schema import Rule, Threshold
+from sentinel.detection.schema import Condition, Operator, Rule, Threshold
 from sentinel.events import Event
 from sentinel.logging import get_logger
 
 _DEFAULT_MAX_THRESHOLD_GROUPS: Final[int] = 100_000
+_ACTION_FIELD: Final[str] = "event.action"
+# Candidate lists are cached per action; actions come from a small, fixed
+# vocabulary, but the cap keeps a misbehaving source from growing it unbounded.
+_MAX_CACHED_ACTIONS: Final[int] = 1_024
 
 _WindowKey = tuple[str, str]  # (rule_id, group value)
+
+
+def required_actions(condition: Condition) -> frozenset[str] | None:
+    """The ``event.action`` values `condition` can match, or ``None`` for "any".
+
+    Sound by construction: whenever a subtree cannot *prove* a restriction it
+    reports ``None``, so a rule is never excluded for an action it could match.
+
+    - ``event.action equals X`` -> ``{X}``; ``event.action in [...]`` -> that set
+    - ``all`` -> intersection of the children that restrict (all must hold)
+    - ``any`` -> union, but only if *every* child restricts
+    - ``threshold`` -> its per-event ``match`` (non-matching events never count)
+    - ``not``, negative operators and any other field -> ``None``
+    """
+    if condition.field is not None:
+        return _field_actions(condition)
+    if condition.all_ is not None:
+        restricting = [r for r in map(required_actions, condition.all_) if r is not None]
+        return frozenset.intersection(*restricting) if restricting else None
+    if condition.any_ is not None:
+        branches: list[frozenset[str]] = []
+        for child in condition.any_:
+            actions = required_actions(child)
+            if actions is None:
+                return None  # one unrestricted branch makes the whole `any` unrestricted
+            branches.append(actions)
+        return frozenset[str]().union(*branches) if branches else None
+    if condition.threshold is not None:
+        return required_actions(condition.threshold.match)
+    return None  # `not`: the complement of a set is not a finite set
+
+
+def _field_actions(condition: Condition) -> frozenset[str] | None:
+    if condition.field != _ACTION_FIELD:
+        return None
+    if condition.op is Operator.EQUALS and isinstance(condition.value, str):
+        return frozenset({condition.value})
+    if condition.op is Operator.IN and isinstance(condition.value, list):
+        values = condition.value
+        if all(isinstance(value, str) for value in values):
+            return frozenset(str(value) for value in values)
+    return None
 
 
 class Detection(BaseModel):
@@ -67,6 +122,8 @@ class DetectionEngine:
         max_threshold_groups: int = _DEFAULT_MAX_THRESHOLD_GROUPS,
     ) -> None:
         self._rules: tuple[Rule, ...] = tuple(rule for rule in rules if rule.enabled)
+        self._rule_actions = [(rule, required_actions(rule.condition)) for rule in self._rules]
+        self._candidates: dict[str, tuple[Rule, ...]] = {}
         self._max_groups = max_threshold_groups
         self._windows: dict[_WindowKey, deque[float]] = {}
         self._log = get_logger("sentinel.detection.engine")
@@ -81,13 +138,28 @@ class DetectionEngine:
     def evaluate(self, event: Event) -> list[Detection]:
         """Return every rule that fires for this event (possibly none)."""
         self._evaluations += 1
+        candidates = self._candidates_for(event.event.action)
+        if not candidates:
+            return []  # skip even building the dict view
         view = event.model_dump(mode="json")
         detections: list[Detection] = []
-        for rule in self._rules:
+        for rule in candidates:
             if self._fires(rule, event, view):
                 self._fired += 1
                 detections.append(self._build(rule, event))
         return detections
+
+    def _candidates_for(self, action: str) -> tuple[Rule, ...]:
+        """Rules that could match `action`, in library order (cached per action)."""
+        cached = self._candidates.get(action)
+        if cached is not None:
+            return cached
+        candidates = tuple(
+            rule for rule, actions in self._rule_actions if actions is None or action in actions
+        )
+        if len(self._candidates) < _MAX_CACHED_ACTIONS:
+            self._candidates[action] = candidates
+        return candidates
 
     def _fires(self, rule: Rule, event: Event, view: Mapping[str, object]) -> bool:
         threshold = rule.condition.threshold
