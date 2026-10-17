@@ -9,7 +9,10 @@ flood (a notification-channel DoS):
 2. **Dedup** — the exact same rule firing on the exact same event (identical
    ``dedup_key``) within a TTL window collapses to a single alert.
 3. **Throttle** — a per-rule sliding-window rate limit caps how many alerts one
-   rule can emit per window, regardless of distinct events.
+   rule can emit per window, regardless of distinct events. A rule's own
+   ``throttle:`` block (from its YAML) overrides the global default, so a
+   brute-force rule can say "one alert per five minutes" while the rest of the
+   library keeps the global budget.
 
 Delivery is firewalled: a sink that raises is counted and logged (by type, never
 the payload or any secret) and the other sinks still receive the alert.
@@ -19,12 +22,13 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Final
 
 from sentinel.alerting.model import Alert
 from sentinel.alerting.sinks.base import AlertSink
 from sentinel.detection.engine import Detection
+from sentinel.detection.schema import Throttle
 from sentinel.logging import get_logger
 from sentinel.pipeline.dedup import DedupWindow
 
@@ -46,6 +50,7 @@ class AlertManager:
         dedup_max_entries: int = _DEFAULT_DEDUP_MAX_ENTRIES,
         throttle_max: int = _DEFAULT_THROTTLE_MAX,
         throttle_window_seconds: float = _DEFAULT_THROTTLE_WINDOW_S,
+        rule_throttles: Mapping[str, Throttle] | None = None,
         time_source: Callable[[], float] = time.monotonic,
     ) -> None:
         self._sinks: tuple[AlertSink, ...] = tuple(sinks)
@@ -53,6 +58,7 @@ class AlertManager:
         self._dedup = DedupWindow(dedup_window_seconds, dedup_max_entries, time_source=time_source)
         self._throttle_max = throttle_max
         self._throttle_window = throttle_window_seconds
+        self._rule_throttles: dict[str, Throttle] = dict(rule_throttles or {})
         self._now = time_source
         # Keyed on rule id (a finite, trusted set), so this cannot grow unbounded.
         self._rule_hits: dict[str, deque[float]] = {}
@@ -62,6 +68,7 @@ class AlertManager:
         self._deduped = 0
         self._throttled = 0
         self._sink_errors = 0
+        self._delivered: dict[str, int] = {sink.name: 0 for sink in self._sinks}
 
     async def process(self, detection: Detection) -> Alert | None:
         """Run a detection through the gates and deliver it, or return None."""
@@ -80,15 +87,23 @@ class AlertManager:
         return alert
 
     def _is_throttled(self, rule_id: str) -> bool:
+        limit, window_seconds = self._throttle_for(rule_id)
         now = self._now()
         window = self._rule_hits.setdefault(rule_id, deque())
-        cutoff = now - self._throttle_window
+        cutoff = now - window_seconds
         while window and window[0] < cutoff:
             window.popleft()
-        if len(window) >= self._throttle_max:
+        if len(window) >= limit:
             return True
         window.append(now)
         return False
+
+    def _throttle_for(self, rule_id: str) -> tuple[int, float]:
+        """The (max alerts, window seconds) budget for a rule."""
+        override = self._rule_throttles.get(rule_id)
+        if override is not None:
+            return override.max_alerts, float(override.window_seconds)
+        return self._throttle_max, self._throttle_window
 
     async def _dispatch(self, alert: Alert) -> None:
         for sink in self._sinks:
@@ -106,11 +121,28 @@ class AlertManager:
                     rule_id=alert.rule_id,
                     error=type(exc).__name__,
                 )
+            else:
+                self._delivered[sink.name] = self._delivered.get(sink.name, 0) + 1
+
+    async def aclose(self) -> None:
+        """Release every sink's resources (e.g. pooled HTTP connections)."""
+        for sink in self._sinks:
+            try:
+                await sink.aclose()
+            except Exception as exc:
+                self._log.warning(
+                    "alert.sink.close_error", sink=sink.name, error=type(exc).__name__
+                )
 
     @property
     def sinks(self) -> Sequence[AlertSink]:
         """The configured sinks."""
         return self._sinks
+
+    @property
+    def delivered_by_sink(self) -> Mapping[str, int]:
+        """Successful deliveries per sink name (a snapshot)."""
+        return dict(self._delivered)
 
     @property
     def stats(self) -> dict[str, int]:

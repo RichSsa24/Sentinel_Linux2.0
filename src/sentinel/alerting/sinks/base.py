@@ -43,3 +43,6 @@ class AlertSink(abc.ABC):
     @abc.abstractmethod
     async def emit(self, alert: Alert) -> None:
         """Deliver one alert. May raise; the manager isolates failures."""
+
+    async def aclose(self) -> None:  # noqa: B027 — optional hook; most sinks hold no resources
+        """Release any resources held by the sink. The default is a no-op."""

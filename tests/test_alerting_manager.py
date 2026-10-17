@@ -8,6 +8,7 @@ from structlog.testing import capture_logs
 from sentinel.alerting.manager import AlertManager
 from sentinel.alerting.model import Alert
 from sentinel.alerting.sinks.base import AlertSink
+from sentinel.detection.schema import Throttle
 from tests.conftest import make_detection
 
 
@@ -155,3 +156,42 @@ class TestRoutingAndFirewall:
         blob = repr(logs)
         assert secret not in blob  # the exception message must not be logged
         assert any(entry.get("error") == "RuntimeError" for entry in logs)
+
+
+class _CloseBoom(_Recorder):
+    async def aclose(self) -> None:
+        raise OSError("socket already closed")
+
+
+class TestDeliveryAccounting:
+    @pytest.mark.asyncio
+    async def test_counts_successful_deliveries_per_sink(self) -> None:
+        good, bad = _Recorder(name="good"), _Boom()
+        manager = AlertManager([good, bad])
+        await manager.process(make_detection(event_id="1" * 64))
+        await manager.process(make_detection(event_id="2" * 64))
+        assert manager.delivered_by_sink == {"good": 2, "boom": 0}
+
+    @pytest.mark.asyncio
+    async def test_rule_throttle_override(self) -> None:
+        sink = _Recorder()
+        manager = AlertManager(
+            [sink],
+            throttle_max=100,
+            rule_throttles={"noisy": Throttle(window_seconds=60, max_alerts=1)},
+            time_source=_clock,
+        )
+        for i in range(3):
+            await manager.process(make_detection(rule_id="noisy", event_id=f"{i:064d}"))
+        await manager.process(make_detection(rule_id="quiet", event_id="9" * 64))
+        assert [a.rule_id for a in sink.received] == ["noisy", "quiet"]
+
+
+class TestClose:
+    @pytest.mark.asyncio
+    async def test_aclose_closes_every_sink_despite_failures(self) -> None:
+        first, second = _CloseBoom(name="first"), _Recorder(name="second")
+        manager = AlertManager([first, second])
+        with capture_logs() as logs:
+            await manager.aclose()  # must not raise
+        assert any(entry["event"] == "alert.sink.close_error" for entry in logs)
