@@ -29,13 +29,18 @@ Security posture (per the collector contract in
   vanished entries are skipped, not coerced.
 - **Tolerates the inherent TOCTOU of /proc.** A process can exit mid-read; every
   per-pid read is guarded and a disappearing process is simply omitted.
-- **Bounded work.** At most ``max_procs`` entries are fingerprinted per scan.
+- **Bounded work.** At most ``max_procs`` entries are fingerprinted per scan,
+  and only ``/proc/<pid>/stat`` is read for a process already seen: its
+  ``comm``, ``cmdline`` and ``exe`` were captured when it started and are
+  reused, so a steady-state poll costs one read per process instead of four.
 - **Never blocks the event loop.** The scan runs in a worker thread via
   :func:`asyncio.to_thread`.
 
-Known limitation: polling cannot observe a process that starts and exits within
-one poll interval. Catching every exec needs a kernel facility (eBPF, the
-netlink proc connector) — explicitly out of scope for this poll-based collector.
+Known limitations: polling cannot observe a process that starts and exits
+within one poll interval, nor an ``exec`` that replaces a process image in place
+(same pid *and* starttime, so no start/stop transition). Catching every exec
+needs a kernel facility (eBPF, the netlink proc connector) — explicitly out of
+scope for this poll-based collector.
 """
 
 from __future__ import annotations
@@ -150,7 +155,7 @@ class ProcessCollector(AbstractCollector):
 
     async def _drain_once(self, queue: BoundedEventQueue) -> None:
         """Scan /proc, diff, normalize each change, and enqueue the events."""
-        snapshot = await asyncio.to_thread(self._scan)
+        snapshot = await asyncio.to_thread(self._scan, self._baseline)
         if not self._seeded:
             self._baseline = snapshot
             self._seeded = True
@@ -166,14 +171,19 @@ class ProcessCollector(AbstractCollector):
 
     # ------------------------------------------------------------------ scanning
 
-    def _scan(self) -> dict[int, _ProcState]:
-        """Fingerprint every current process (runs in a worker thread)."""
+    def _scan(self, previous: dict[int, _ProcState] | None = None) -> dict[int, _ProcState]:
+        """Fingerprint every current process (runs in a worker thread).
+
+        `previous` is the last snapshot: a process with the same (pid,
+        starttime) keeps its recorded comm/cmdline/exe, so only its stat is read.
+        """
+        previous = previous or {}
         snapshot: dict[int, _ProcState] = {}
         for pid in self._iter_pids():
             if len(snapshot) >= self._max_procs:
                 self._log.warning("process.max_procs_reached", max_procs=self._max_procs)
                 break
-            state = self._read_proc(pid)
+            state = self._read_proc(pid, previous.get(pid))
             if state is not None:
                 snapshot[pid] = state
         return snapshot
@@ -189,7 +199,7 @@ class ProcessCollector(AbstractCollector):
             if entry.name.isdigit():
                 yield int(entry.name)
 
-    def _read_proc(self, pid: int) -> _ProcState | None:
+    def _read_proc(self, pid: int, known: _ProcState | None = None) -> _ProcState | None:
         """Read one process's fingerprint, or None if it vanished/is malformed."""
         base = self._proc_root / str(pid)
         try:
@@ -200,6 +210,10 @@ class ProcessCollector(AbstractCollector):
         if parsed is None:
             return None
         ppid, starttime = parsed
+        if known is not None and known.starttime == starttime:
+            # Same process instance as last poll. ppid comes fresh from stat
+            # (orphans are re-parented); the rest was captured at start.
+            return known if known.ppid == ppid else known._replace(ppid=ppid)
         return _ProcState(
             pid=pid,
             ppid=ppid,

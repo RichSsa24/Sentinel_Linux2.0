@@ -149,9 +149,8 @@ def bench_fim() -> str:
 
 def bench_process() -> str:
     collector = ProcessCollector()
-    snapshot = collector._scan()
-    collector._baseline = snapshot  # steady state: the previous poll's view
-    seconds = _median_seconds(collector._scan, repeats=21)
+    snapshot = collector._scan()  # steady state: this is the previous poll's view
+    seconds = _median_seconds(lambda: collector._scan(snapshot), repeats=21)
     per_proc = seconds / max(len(snapshot), 1) * 1e6
     return f"{seconds * 1e3:,.2f} ms per poll ({len(snapshot)} procs, {per_proc:.1f} µs/proc)"
 

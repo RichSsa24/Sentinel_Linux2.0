@@ -321,3 +321,40 @@ class TestExactlyOnceUnderRebaseline:
         assert len(received) == 1
         assert pipeline.stats["processed"] == 1
         assert pipeline.stats["deduped"] == 1
+
+
+class TestKnownProcessCache:
+    """A process seen last poll costs one stat read; its details are reused."""
+
+    def test_known_process_details_are_not_reread(self, tmp_path: Path) -> None:
+        _mkproc(tmp_path, 42, cmdline="nginx -g daemon off;")
+        collector = _collector(tmp_path)
+        first = collector._scan()
+        # The process rewrites its argv (setproctitle-style). Same instance, so
+        # the start-time capture stands and cmdline is not read again.
+        (tmp_path / "42" / "cmdline").write_bytes(b"nginx: worker process\x00")
+        second = collector._scan(first)
+        assert second[42] is first[42]
+
+    def test_recycled_pid_is_read_afresh(self, tmp_path: Path) -> None:
+        _mkproc(tmp_path, 42, starttime=1_000, cmdline="sleep 1")
+        collector = _collector(tmp_path)
+        first = collector._scan()
+        (tmp_path / "42" / "stat").write_text(
+            _stat_line(42, comm="nc", ppid=1, starttime=9_999), encoding="utf-8"
+        )
+        (tmp_path / "42" / "cmdline").write_bytes(b"nc\x00-e\x00/bin/sh\x00")
+        second = collector._scan(first)
+        assert second[42].starttime == 9_999
+        assert second[42].cmdline == "nc -e /bin/sh"
+
+    def test_reparented_process_gets_fresh_ppid(self, tmp_path: Path) -> None:
+        _mkproc(tmp_path, 42, ppid=7)
+        collector = _collector(tmp_path)
+        first = collector._scan()
+        (tmp_path / "42" / "stat").write_text(
+            _stat_line(42, comm="bash", ppid=1, starttime=1_000), encoding="utf-8"
+        )
+        second = collector._scan(first)
+        assert second[42].ppid == 1
+        assert second[42].cmdline == first[42].cmdline
