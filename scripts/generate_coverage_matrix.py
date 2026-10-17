@@ -15,6 +15,12 @@ from sentinel.detection.loader import load_rules
 _ROOT = Path(__file__).resolve().parent.parent
 
 
+def _attack_link(technique: str) -> str:
+    """Link an ATT&CK id (T1059 or sub-technique T1059.004) to its MITRE page."""
+    path = technique.replace(".", "/")
+    return f"[{technique}](https://attack.mitre.org/techniques/{path}/)"
+
+
 def render() -> str:
     """Render the coverage matrix as Markdown."""
     rules = sorted(load_rules(_ROOT / "rules"), key=lambda rule: rule.id)
@@ -27,22 +33,25 @@ def render() -> str:
         "and carries a positive and a negative test enforced by "
         "`tests/test_detection_rules.py` (the library cannot grow an untested rule).",
         "",
-        "| Rule | Sev | MITRE ATT&CK | NIST CSF 2.0 | D3FEND | Tests |",
-        "| ---- | --- | ------------ | ------------ | ------ | ----- |",
+        "| Rule | Title | Sev | MITRE ATT&CK | NIST CSF 2.0 | D3FEND |",
+        "| ---- | ----- | --- | ------------ | ------------ | ------ |",
     ]
     for rule in rules:
-        attack = ", ".join(rule.attack)
+        attack = ", ".join(_attack_link(t) for t in rule.attack)
         nist = ", ".join(rule.nist_csf)
         d3fend = ", ".join(rule.d3fend) or "—"
-        lines.append(f"| `{rule.id}` | {rule.severity} | {attack} | {nist} | {d3fend} | ✅ |")
+        lines.append(
+            f"| `{rule.id}` | {rule.title} | {rule.severity} | {attack} | {nist} | {d3fend} |"
+        )
     lines.append("")
     return "\n".join(lines)
 
 
 def main() -> None:
     output = _ROOT / "docs" / "COVERAGE.md"
-    output.write_text(render(), encoding="utf-8")
-    print(f"wrote {output.relative_to(_ROOT)} with {render().count('| `')} rules")
+    content = render()
+    output.write_text(content, encoding="utf-8")
+    print(f"wrote {output.relative_to(_ROOT)} with {content.count('| `')} rules")
 
 
 if __name__ == "__main__":
