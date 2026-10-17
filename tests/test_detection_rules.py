@@ -190,3 +190,27 @@ def test_rule_fires_on_positive(rule_id: str) -> None:
 def test_rule_silent_on_negative(rule_id: str) -> None:
     fired = _fired_ids(DetectionEngine(RULES), [CASES[rule_id].negative])
     assert rule_id not in fired
+
+
+def _with_action(event: Event, action: str) -> Event:
+    return event.model_copy(update={"event": event.event.model_copy(update={"action": action})})
+
+
+@pytest.mark.parametrize("rule_id", RULE_IDS)
+def test_process_rules_fire_once_per_process(rule_id: str) -> None:
+    """A process rule fires on the start, never again on the stop.
+
+    The process collector emits both lifecycle events with the same command line
+    and executable but different `event.id`s, so a rule without an action guard
+    alerted twice for every malicious process — a duplicate the alert dedup
+    (keyed on rule + event id) cannot collapse.
+    """
+    starts = [e for e in CASES[rule_id].positive if e.event.action == "process_started"]
+    stops = [_with_action(e, "process_stopped") for e in starts]
+    assert rule_id not in _fired_ids(DetectionEngine(RULES), stops)
+
+
+def test_world_writable_ignores_deleted_files() -> None:
+    # The exposure ends when the file is gone; the deletion is not the finding.
+    deleted = ev("file_deleted", _FILE, fpath="/etc/app.conf", fmode="0666")
+    assert "world-writable-sensitive" not in _fired_ids(DetectionEngine(RULES), [deleted])

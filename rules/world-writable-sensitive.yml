@@ -11,5 +11,7 @@ references:
   - https://attack.mitre.org/techniques/T1222/002/
 condition:
   all:
+    # A deleted file is no longer exposed; only live files are findings.
+    - {field: event.action, op: not_equals, value: file_deleted}
     - {field: file.path, op: regex, value: '^/(?:etc|bin|sbin|usr)/'}
     - {field: file.mode, op: regex, value: '[2367]$'}

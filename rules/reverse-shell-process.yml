@@ -11,6 +11,10 @@ d3fend: [D3-PSA]
 references:
   - https://attack.mitre.org/techniques/T1059/004/
 condition:
-  field: process.command_line
-  op: regex
-  value: '(?:\bnc\b|\bncat\b|\bnetcat\b).*\s-e|/dev/(?:tcp|udp)/|(?:bash|sh|zsh|dash)\s+-i|python[0-9]?\b.*(?:pty\.spawn|socket\.socket)'
+  # Guard on the start event: the stop event carries the same command line
+  # and would otherwise alert a second time for the same process.
+  all:
+    - {field: event.action, op: equals, value: process_started}
+    - field: process.command_line
+      op: regex
+      value: '(?:\bnc\b|\bncat\b|\bnetcat\b).*\s-e|/dev/(?:tcp|udp)/|(?:bash|sh|zsh|dash)\s+-i|python[0-9]?\b.*(?:pty\.spawn|socket\.socket)'

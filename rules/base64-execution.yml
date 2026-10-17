@@ -10,6 +10,10 @@ d3fend: [D3-PSA]
 references:
   - https://attack.mitre.org/techniques/T1027/
 condition:
-  field: process.command_line
-  op: regex
-  value: 'base64\s+(?:-d|--decode|-{1,2}d)\b|\|\s*base64\b'
+  # Guard on the start event: the stop event carries the same command line
+  # and would otherwise alert a second time for the same process.
+  all:
+    - {field: event.action, op: equals, value: process_started}
+    - field: process.command_line
+      op: regex
+      value: 'base64\s+(?:-d|--decode|-{1,2}d)\b|\|\s*base64\b'
