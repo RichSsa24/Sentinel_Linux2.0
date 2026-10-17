@@ -43,6 +43,22 @@ _SECURITY_HEADERS: Final[Mapping[str, str]] = {
 _MAX_TRACKED_CLIENTS: Final[int] = 100_000
 
 
+def _log_auth_failure(request: Request, *, reason: str) -> None:
+    """Record a failed authentication without any credential material (CWE-532).
+
+    Only the reason and the client address are logged — never the presented
+    token, the Authorization header, or the configured key. The values are
+    passed as structured fields (not interpolated into the message) so the
+    logging pipeline's control-char stripping still applies to them.
+    """
+    _log.warning(
+        "api.auth_failed",
+        reason=reason,
+        client=request.client.host if request.client else "unknown",
+        path=request.url.path,
+    )
+
+
 def require_api_key(request: Request) -> None:
     """FastAPI dependency: enforce a valid bearer token; fail closed.
 
@@ -58,16 +74,14 @@ def require_api_key(request: Request) -> None:
         )
     scheme, _, token = request.headers.get("Authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not token:
-        _log.error(f"Missing bearer token. Header: {request.headers.get('Authorization', '')!r}")
+        _log_auth_failure(request, reason="missing_bearer_token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not hmac.compare_digest(token, configured.get_secret_value()):
-        _log.error(
-            f"Token mismatch! Received: {token!r} Expected: {configured.get_secret_value()!r}"
-        )
+    if not hmac.compare_digest(token.encode(), configured.get_secret_value().encode()):
+        _log_auth_failure(request, reason="invalid_token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid token",

@@ -9,7 +9,7 @@ from sentinel.api import create_app
 from sentinel.detection.schema import Rule
 from sentinel.metrics import Metrics
 from sentinel.storage import Database
-from tests.conftest import auth_header, make_api_settings
+from tests.conftest import TEST_API_KEY, auth_header, make_api_settings
 
 
 def _client(
@@ -51,6 +51,34 @@ class TestAuthentication:
         self, api_client: httpx.AsyncClient, path: str
     ) -> None:
         assert (await api_client.get(path)).status_code == 401
+
+    @pytest.mark.security
+    async def test_non_ascii_token_is_401_not_500(self, api_client: httpx.AsyncClient) -> None:
+        # hmac.compare_digest raises TypeError on non-ASCII *str* operands; the
+        # comparison must run on bytes so a hostile header is a clean 401.
+        resp = await api_client.get(
+            "/events", headers={"Authorization": "Bearer caf\xe9".encode("latin-1")}
+        )
+        assert resp.status_code == 401
+
+    @pytest.mark.security
+    @pytest.mark.parametrize("presented", ["wrong-key-value", None])
+    async def test_auth_failure_never_logs_credentials(
+        self,
+        api_client: httpx.AsyncClient,
+        capsys: pytest.CaptureFixture[str],
+        presented: str | None,
+    ) -> None:
+        # Regression (CWE-532): a failed auth must log *that* it failed, never
+        # the presented token or the configured key.
+        headers = auth_header(presented) if presented else {"Authorization": "Bearer"}
+        resp = await api_client.get("/events", headers=headers)
+        assert resp.status_code == 401
+        output = capsys.readouterr().out
+        assert "api.auth_failed" in output
+        assert TEST_API_KEY not in output
+        if presented:
+            assert presented not in output
 
     @pytest.mark.security
     async def test_unconfigured_key_fails_closed(
