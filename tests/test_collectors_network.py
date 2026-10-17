@@ -422,3 +422,19 @@ class TestExactlyOnceUnderRebaseline:
         assert len(received) == 1
         assert pipeline.stats["processed"] == 1
         assert pipeline.stats["deduped"] == 1
+
+
+class TestHostNamespace:
+    @pytest.mark.asyncio
+    async def test_netns_pid_reads_that_process_net_dir(self, tmp_path: Path) -> None:
+        # /proc/net is the reader's namespace; /proc/1/net is the host's when the
+        # host procfs is mounted into a container.
+        _mk_net(tmp_path, tcp=[_row(local="0.0.0.0", lport=22, inode=1)])  # "ours"
+        _mk_net(tmp_path / "1", tcp=[])  # host baseline: nothing listening
+        collector = _collector(tmp_path, netns_pid=1)
+        await _drain(collector)
+
+        _mk_net(tmp_path / "1", tcp=[_row(local="0.0.0.0", lport=4444, inode=7)])
+        events = await _drain(collector)
+
+        assert [e.source.port for e in events] == [4444]

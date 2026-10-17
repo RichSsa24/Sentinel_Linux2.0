@@ -21,6 +21,12 @@ The proc filesystem root is injectable (``proc_root``) so the collector is
 unit-testable against synthetic ``/proc/net`` fixtures on any OS; on a host
 without ``/proc`` it simply observes no sockets and never crashes.
 
+``/proc/net`` is a symlink to ``self/net`` — the *reader's* network namespace.
+A containerized collector reading the host's procfs (mounted at e.g.
+``/host/proc``) would therefore see its own container's sockets. Passing
+``netns_pid=1`` reads ``<proc_root>/1/net`` instead: the namespace of that
+procfs's init process, i.e. the host's.
+
 Security posture (per the collector contract in
 :mod:`sentinel.collectors.base`):
 
@@ -98,6 +104,7 @@ class NetworkCollector(AbstractCollector):
         host: str | None = None,
         max_sockets: int = _DEFAULT_MAX_SOCKETS,
         track_connections: bool = True,
+        netns_pid: int | None = None,
         normalizer: Normalizer | None = None,
         name: str | None = None,
     ) -> None:
@@ -106,6 +113,11 @@ class NetworkCollector(AbstractCollector):
             msg = f"poll_interval must be > 0; got {poll_interval}"
             raise ValueError(msg)
         self._proc_root = Path(proc_root)
+        self._net_dir = (
+            self._proc_root / str(netns_pid) / "net"
+            if netns_pid is not None
+            else self._proc_root / "net"
+        )
         self._poll = poll_interval
         self._host = host or socket.gethostname() or "localhost"
         self._max_sockets = max_sockets
@@ -160,7 +172,7 @@ class NetworkCollector(AbstractCollector):
 
     def _read_proc_net(self, filename: str) -> str:
         """Read /proc/net/<filename>, returning '' if it is absent/unreadable."""
-        path = self._proc_root / "net" / filename
+        path = self._net_dir / filename
         try:
             return path.read_text(encoding="utf-8", errors="replace")
         except OSError:

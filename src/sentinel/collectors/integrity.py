@@ -29,6 +29,11 @@ Security posture (per the collector contract in
   mid-scan) is logged and skipped, never fatal.
 - **Never blocks the event loop.** The whole scan runs in a worker thread via
   :func:`asyncio.to_thread`.
+
+Containerized deployments mount the host's filesystem read-only under a
+``host_root`` (e.g. ``/host``). The collector then scans ``/host/etc`` but keys
+and reports every file by its host-native path (``/etc/passwd``), so rules and
+investigators never see the mount prefix.
 """
 
 from __future__ import annotations
@@ -91,6 +96,7 @@ class FileIntegrityCollector(AbstractCollector):
         host: str | None = None,
         max_hash_bytes: int = _DEFAULT_MAX_HASH_BYTES,
         max_files: int = _DEFAULT_MAX_FILES,
+        host_root: Path | str = "/",
         normalizer: Normalizer | None = None,
         name: str | None = None,
     ) -> None:
@@ -101,6 +107,7 @@ class FileIntegrityCollector(AbstractCollector):
         if not paths:
             msg = "at least one watch path is required"
             raise ValueError(msg)
+        self._host_root = Path(host_root)
         self._paths = [Path(p) for p in paths]
         self._recursive = recursive
         self._poll = poll_interval
@@ -144,14 +151,29 @@ class FileIntegrityCollector(AbstractCollector):
         """Build a fresh snapshot of every watched regular file (runs in a thread)."""
         snapshot: dict[str, _FileState] = {}
         for root in self._paths:
-            for path in self._iter_files(root):
+            for path in self._iter_files(self._on_disk(root)):
                 if len(snapshot) >= self._max_files:
                     self._log.warning("integrity.max_files_reached", max_files=self._max_files)
                     return snapshot
                 state = self._snapshot_file(path)
                 if state is not None:
-                    snapshot[str(path)] = state
+                    snapshot[self._host_path(path)] = state
         return snapshot
+
+    def _on_disk(self, host_path: Path) -> Path:
+        """Where a host-native watch path is visible to this process."""
+        if self._host_root == Path("/") or not host_path.is_absolute():
+            return host_path
+        return self._host_root / host_path.relative_to(host_path.anchor)
+
+    def _host_path(self, on_disk: Path) -> str:
+        """The host-native path reported for a file found under the host root."""
+        if self._host_root == Path("/"):
+            return str(on_disk)
+        try:
+            return str(Path("/") / on_disk.relative_to(self._host_root))
+        except ValueError:  # a relative watch path that is not under the root
+            return str(on_disk)
 
     def _iter_files(self, root: Path) -> Iterator[Path]:
         """Yield regular-file paths under `root` (a file yields itself)."""

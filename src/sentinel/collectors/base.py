@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -65,6 +66,11 @@ class AbstractCollector(abc.ABC):
         propagate `asyncio.CancelledError` after releasing any resources
         held — the orchestrator uses cancellation for hard shutdown.
         """
+
+    @property
+    def stats(self) -> Mapping[str, int]:
+        """Snapshot counters for observability (subclasses extend this)."""
+        return {}
 
     async def stop(self) -> None:
         """Signal a graceful stop. Idempotent."""

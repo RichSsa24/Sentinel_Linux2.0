@@ -355,3 +355,34 @@ class TestExactlyOnceUnderRebaseline:
         assert received == received[:1]  # exactly one id
         assert pipeline.stats["processed"] == 1
         assert pipeline.stats["deduped"] == 1
+
+
+class TestHostRoot:
+    """Containerized FIM: scan beneath a host-root mount, report host-native paths."""
+
+    @pytest.mark.asyncio
+    async def test_reports_host_native_paths(self, tmp_path: Path) -> None:
+        etc = tmp_path / "etc"
+        etc.mkdir()
+        collector = FileIntegrityCollector(["/etc"], host="testhost", host_root=tmp_path)
+        await _drain(collector)  # seed empty baseline
+
+        (etc / "passwd").write_text("root:x:0:0::/root:/bin/sh\n", encoding="utf-8")
+        events = await _drain(collector)
+
+        assert len(events) == 1
+        assert events[0].file is not None
+        # Rules match `^/etc/...`; the mount prefix must never leak into events.
+        assert events[0].file.path == "/etc/passwd"
+
+    @pytest.mark.asyncio
+    async def test_relative_watch_path_is_left_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "local").mkdir()
+        collector = FileIntegrityCollector(["local"], host="testhost", host_root="/host")
+        await _drain(collector)
+        (tmp_path / "local" / "f.txt").write_text("x", encoding="utf-8")
+        events = await _drain(collector)
+        assert [e.file.path for e in events if e.file] == ["local/f.txt"]
