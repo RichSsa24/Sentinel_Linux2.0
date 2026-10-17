@@ -76,7 +76,8 @@ class TestSettingsImmutability:
         monkeypatch.setenv("SENTINEL_ENV", "development")
         settings = settings_no_env_file()
         with pytest.raises(ValidationError):
-            settings.env = Environment.PRODUCTION
+            # Deliberate write to a frozen field: proves the runtime guard.
+            settings.env = Environment.PRODUCTION  # type: ignore[misc]
 
 
 class TestPipelineSettings:

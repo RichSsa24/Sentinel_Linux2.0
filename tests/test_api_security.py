@@ -57,7 +57,7 @@ class TestAuthentication:
         # hmac.compare_digest raises TypeError on non-ASCII *str* operands; the
         # comparison must run on bytes so a hostile header is a clean 401.
         resp = await api_client.get(
-            "/events", headers={"Authorization": "Bearer caf\xe9".encode("latin-1")}
+            "/events", headers={b"Authorization": "Bearer caf\xe9".encode("latin-1")}
         )
         assert resp.status_code == 401
 

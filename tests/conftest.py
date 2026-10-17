@@ -120,12 +120,8 @@ def _isolate_sentinel_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 def settings_no_env_file() -> Settings:
-    """Construct `Settings` while ignoring any local `.env` file.
-
-    `_env_file` is an undocumented underscore kwarg in pydantic-settings v2 —
-    real but not in the public stubs, hence the single targeted ignore.
-    """
-    return Settings(_env_file=None)  # type: ignore[call-arg]
+    """Construct `Settings` while ignoring any local `.env` file."""
+    return Settings(_env_file=None)
 
 
 def make_api_settings(**overrides: object) -> Settings:
