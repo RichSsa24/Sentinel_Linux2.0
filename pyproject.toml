@@ -199,6 +199,9 @@ branch = true
 parallel = false
 
 [tool.coverage.report]
+# CI fails below this floor. Measured at 98.8% when it was introduced; the
+# slack is for honest refactors, not for untested features.
+fail_under = 95
 show_missing = true
 skip_covered = false
 precision = 1

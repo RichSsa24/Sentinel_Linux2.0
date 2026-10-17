@@ -1,15 +1,19 @@
 # Sentinel-Linux 2.0 — CI pipeline.
 #
-# Gates (must all pass): ruff lint, ruff format-check, mypy --strict, bandit,
-# pip-audit, pytest with coverage, pre-commit. Runs on a Python matrix to
-# prove forward compatibility.
+# Gates (all must pass):
+#   quality    ruff lint + format, mypy --strict, bandit, pip-audit, pytest with
+#              a coverage floor — on Python 3.12 and 3.13. Publishes coverage
+#              and a CycloneDX SBOM of the runtime dependencies.
+#   precommit  every pre-commit hook (hygiene, ruff, bandit, detect-secrets).
+#   container  builds the production image, smoke-tests it under the same
+#              hardening as the Compose stack, and scans it with Trivy.
 #
-# Hardening:
-# - `permissions: read-all` at the workflow level, narrowed per-job below.
-# - `concurrency` cancels stale runs on the same ref.
-# - Pinned tool versions where possible. Third-party actions are referenced by
-#   major-version tag with a comment noting SHA-pinning is recommended for
-#   production org-wide policies (see CIS Supply Chain guidance).
+# Supply chain:
+# - `permissions: contents: read` everywhere; no job can write to the repo.
+# - Every third-party action is pinned to a full commit SHA (version in the
+#   trailing comment; Dependabot keeps them current). Tags are mutable — in
+#   March 2026 the trivy-action tags were force-pushed to malicious commits.
+# - Dependencies install from the hash-verified lockfile (`uv sync --frozen`).
 
 name: CI
 
@@ -34,14 +38,12 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
-    permissions:
-      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4   # SHA-pin in org policy for production
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -73,7 +75,7 @@ jobs:
             --no-hashes -o requirements-audit.txt
           uv run pip-audit -r requirements-audit.txt --strict
 
-      - name: Pytest — coverage
+      - name: Pytest — coverage (floor in pyproject.toml)
         run: |
           uv run pytest \
             --cov=src/sentinel \
@@ -81,26 +83,34 @@ jobs:
             --cov-report=term-missing \
             --cov-report=xml
 
-      - name: Upload coverage XML
+      - name: SBOM — runtime dependencies (CycloneDX)
+        if: matrix.python-version == '3.12'
+        run: |
+          uv export --quiet --format requirements-txt --no-emit-project --no-dev \
+            --no-hashes -o requirements-runtime.txt
+          uv run pip-audit -r requirements-runtime.txt --strict \
+            --format cyclonedx-json -o sbom.cdx.json
+
+      - name: Upload coverage and SBOM
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: coverage-py${{ matrix.python-version }}
-          path: coverage.xml
+          name: reports-py${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            sbom.cdx.json
           if-no-files-found: ignore
           retention-days: 14
 
   precommit:
     name: pre-commit
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -113,3 +123,26 @@ jobs:
 
       - name: Run pre-commit (all files)
         run: uv run pre-commit run --all-files --show-diff-on-failure
+
+  container:
+    name: container image
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Build
+        run: docker build -f deploy/docker/Dockerfile -t sentinel-linux:ci .
+
+      - name: Smoke test (read-only, no capabilities, host under /host)
+        run: scripts/smoke_test_image.sh sentinel-linux:ci
+
+      - name: Trivy — fixable HIGH/CRITICAL vulnerabilities fail the build
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: sentinel-linux:ci
+          scanners: vuln
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: table
