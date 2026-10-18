@@ -1,0 +1,75 @@
+# Sentinel-Linux 2.0 — systemd unit for a bare-metal install.
+#
+# Install and operate: docs/OPERATIONS.md#bare-metal-systemd. In short: the
+# checkout lives in /opt/sentinel (with its .venv from `uv sync --frozen
+# --no-dev --no-editable`), secrets in /etc/sentinel/sentinel.env (0600), data
+# in /var/lib/sentinel (created by systemd, 0700).
+#
+# Least privilege: an unprivileged user with no capabilities and a read-only
+# view of the system. It reads what group adm may read (the Debian/Ubuntu auth
+# log) and tracks root-only files by metadata. For content hashes of root-only
+# files, user crontabs and RHEL's /var/log/secure, grant CAP_DAC_READ_SEARCH in
+# a drop-in (see the docs) — it lets the service read every file on the host.
+
+[Unit]
+Description=Sentinel-Linux host intrusion detection
+Documentation=https://github.com/RichSsa24/Sentinel_Linux2.0/blob/main/docs/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+# A crash loop must stay visible: after 5 failed starts in 5 minutes the unit
+# is left failed instead of restarting forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=sentinel
+Group=sentinel
+SupplementaryGroups=adm
+WorkingDirectory=/opt/sentinel
+# Defaults; /etc/sentinel/sentinel.env overrides them (SENTINEL_ENV and
+# SENTINEL_API_KEY are required there).
+Environment=SENTINEL_RULES_DIR=/opt/sentinel/rules
+Environment=SENTINEL_DATABASE_URL=sqlite+aiosqlite:////var/lib/sentinel/sentinel.db
+EnvironmentFile=/etc/sentinel/sentinel.env
+StateDirectory=sentinel
+StateDirectoryMode=0700
+UMask=0077
+ExecStartPre=/opt/sentinel/.venv/bin/python -m alembic upgrade head
+ExecStart=/opt/sentinel/.venv/bin/sentinel serve --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+# SIGTERM drains the queue and writes what is buffered; each database write is
+# bounded by SENTINEL_PERSIST_WRITE_TIMEOUT_SECONDS (10 s) and alert delivery
+# by 10 s, so this is the worst case with margin, not a typical stop.
+TimeoutStopSec=45
+
+# Sandbox (systemd.exec(5)): a read-only system, writes only to the state
+# directory, no capabilities, no new privileges, the usual service syscalls.
+# Deliberately absent: ProtectProc=invisible and ProcSubset=pid — the process
+# collector must see every process and the network collector reads /proc/net.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
