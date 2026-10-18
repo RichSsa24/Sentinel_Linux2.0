@@ -226,6 +226,12 @@ class TestResolveHostName:
 
 
 class TestBuildSinks:
+    @pytest.mark.parametrize(("log_format", "json_lines"), [("json", True), ("console", False)])
+    def test_console_alerts_follow_the_log_format(self, log_format: str, json_lines: bool) -> None:
+        (console,) = build_sinks(make_api_settings(log_format=log_format))
+        assert isinstance(console, ConsoleSink)
+        assert console._json is json_lines
+
     def test_console_only_by_default(self) -> None:
         assert [type(s) for s in build_sinks(make_api_settings())] == [ConsoleSink]
 

@@ -79,7 +79,7 @@ from sentinel.events import Event
 from sentinel.logging import get_logger
 from sentinel.metrics import Metrics, RuntimeSnapshot
 from sentinel.pipeline import Pipeline
-from sentinel.settings import Settings
+from sentinel.settings import LogFormat, Settings
 from sentinel.storage import Database, Repository
 
 _HOST_ROOT: Final[Path] = Path("/")
@@ -232,7 +232,8 @@ def build_collectors(settings: Settings) -> list[AbstractCollector]:
 
 def build_sinks(settings: Settings) -> list[AlertSink]:
     """Console always; webhook and email when (fully) configured."""
-    sinks: list[AlertSink] = [ConsoleSink()]
+    # JSON alerts alongside JSON logs: a log shipper must not meet plain text.
+    sinks: list[AlertSink] = [ConsoleSink(json_lines=settings.log_format is LogFormat.JSON)]
     if settings.webhook_url is not None:
         if settings.webhook_hmac_secret is None:
             msg = "SENTINEL_WEBHOOK_URL is set but SENTINEL_WEBHOOK_HMAC_SECRET is not"
