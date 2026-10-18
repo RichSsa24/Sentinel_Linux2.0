@@ -146,6 +146,8 @@ class NetworkCollector(AbstractCollector):
         if not self._seeded:
             self._baseline = snapshot
             self._seeded = True
+            # Everything up to now is the baseline: sockets already open are not reported.
+            self._log.info("network.baseline_seeded", sockets=len(snapshot))
             return
         records = self._diff(self._baseline, snapshot)
         self._baseline = snapshot

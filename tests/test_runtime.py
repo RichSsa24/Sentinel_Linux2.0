@@ -165,6 +165,15 @@ class TestBuildCollectors:
         collectors = build_collectors(make_api_settings())
         assert [c.name for c in collectors] == ["auth-log", "file-integrity", "process", "network"]
 
+    @pytest.mark.parametrize(("backfill", "skips_history"), [(False, True), (True, False)])
+    def test_the_service_tails_the_auth_log_from_its_end_unless_backfilling(
+        self, backfill: bool, skips_history: bool
+    ) -> None:
+        settings = make_api_settings(collectors="auth-log", auth_log_backfill=backfill)
+        (auth,) = build_collectors(settings)
+        assert isinstance(auth, AuthLogCollector)
+        assert auth._skip_history is skips_history
+
     def test_subset_is_honoured(self) -> None:
         collectors = build_collectors(make_api_settings(collectors="auth-log, network"))
         assert [c.name for c in collectors] == ["auth-log", "network"]

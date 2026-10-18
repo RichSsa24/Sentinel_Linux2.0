@@ -518,3 +518,73 @@ def _event_id(raw: RawAuthEvent) -> str:
     event = Normalizer().normalize(raw)
     assert event is not None
     return event.event.id
+
+
+class TestStartAtEnd:
+    """Regression: every restart re-read the whole file and re-sent its alerts."""
+
+    async def test_history_present_at_start_up_is_skipped(self, tmp_path: Path) -> None:
+        log = tmp_path / "auth.log"
+        log.write_text("".join(_line(host=f"h{p}") + "\n" for p in range(5)), encoding="utf-8")
+        collector = AuthLogCollector(log, year=YEAR, start_at_end=True)
+        assert await _drain_events(collector) == []
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(_line(host="h99") + "\n")
+        events = await _drain_events(collector)
+        collector._close()
+        assert [e.host.name for e in events] == ["h99"]
+
+    async def test_a_line_being_written_at_start_up_is_not_read_as_a_fragment(
+        self, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "auth.log"
+        log.write_text(_line(host="h1") + "\n" + _line(host="h2")[:30], encoding="utf-8")
+        collector = AuthLogCollector(log, year=YEAR, start_at_end=True)
+        assert await _drain_events(collector) == []
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(_line(host="h2")[30:] + "\n" + _line(host="h3") + "\n")
+        events = await _drain_events(collector)
+        collector._close()
+        assert [e.host.name for e in events] == ["h3"]
+        assert collector.stats["skipped"] == 0  # the tail of line 2 was not parsed
+
+    async def test_a_file_created_after_start_up_is_read_from_its_start(
+        self, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "auth.log"
+        collector = AuthLogCollector(log, year=YEAR, start_at_end=True)
+        assert await _drain_events(collector) == []  # not there yet
+        log.write_text(_line(host="h7") + "\n", encoding="utf-8")
+        events = await _drain_events(collector)
+        collector._close()
+        assert len(events) == 1
+
+    async def test_a_file_rotated_in_after_start_up_is_read_from_its_start(
+        self, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "auth.log"
+        log.write_text(_line(host="h1") + "\n", encoding="utf-8")
+        collector = AuthLogCollector(log, year=YEAR, start_at_end=True)
+        assert await _drain_events(collector) == []
+        log.rename(tmp_path / "auth.log.1")
+        log.write_text(_line(host="h2") + "\n" + _line(host="h3") + "\n", encoding="utf-8")
+        events = await _drain_events(collector)
+        collector._close()
+        assert [e.host.name for e in events] == ["h2", "h3"]
+
+    async def test_a_restarted_collector_resumes_where_it_stopped(self, tmp_path: Path) -> None:
+        # The supervisor restarts a crashed collector's run(): the instance
+        # keeps its offset, so neither history nor the lines it read reappear.
+        log = tmp_path / "auth.log"
+        log.write_text(_line(host="h1") + "\n", encoding="utf-8")
+        collector = AuthLogCollector(log, year=YEAR, start_at_end=True)
+        assert await _drain_events(collector) == []
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(_line(host="h2") + "\n")
+        assert len(await _drain_events(collector)) == 1
+        collector._close()  # what run()'s finally does when it crashes
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(_line(host="h3") + "\n")
+        events = await _drain_events(collector)
+        collector._close()
+        assert [e.host.name for e in events] == ["h3"]

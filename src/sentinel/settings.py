@@ -271,6 +271,12 @@ class Settings(BaseSettings):
     auth_log_path: Path = Field(
         default=Path("/var/log/auth.log"), description="Host path of the sshd auth log."
     )
+    auth_log_backfill: bool = Field(
+        default=False,
+        description="Read the auth log from its beginning at start-up. Default: from its "
+        "current end, so a restart does not re-alert the history already in the file "
+        "(lines written while the service was down are then not analyzed).",
+    )
     fim_paths: str = Field(
         default="/etc,/var/spool/cron",
         description="Comma-separated absolute host paths watched for file integrity. "

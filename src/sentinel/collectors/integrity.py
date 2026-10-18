@@ -173,6 +173,8 @@ class FileIntegrityCollector(AbstractCollector):
         if not self._seeded:
             self._baseline = snapshot
             self._seeded = True
+            # Everything up to now is the baseline: a change made before it is not reported.
+            self._log.info("integrity.baseline_seeded", files=len(snapshot))
             return
         records = self._diff(self._baseline, snapshot)
         self._baseline = snapshot

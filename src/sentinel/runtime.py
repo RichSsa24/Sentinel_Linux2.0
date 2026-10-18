@@ -208,7 +208,12 @@ def build_collectors(settings: Settings) -> list[AbstractCollector]:
     enabled = set(settings.enabled_collectors)
     collectors: list[AbstractCollector] = []
     if "auth-log" in enabled:
-        collectors.append(AuthLogCollector(under_host_root(root, settings.auth_log_path)))
+        collectors.append(
+            AuthLogCollector(
+                under_host_root(root, settings.auth_log_path),
+                start_at_end=not settings.auth_log_backfill,
+            )
+        )
     if "file-integrity" in enabled:
         collectors.append(
             FileIntegrityCollector(paths=list(settings.fim_path_list), host_root=root, host=host)

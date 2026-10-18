@@ -285,6 +285,16 @@ async def _drain(collector: FileIntegrityCollector) -> list[Event]:
 
 class TestScanning:
     @pytest.mark.asyncio
+    async def test_the_baseline_is_announced(self, tmp_path: Path) -> None:
+        # A restart re-seeds the baseline: changes made while the service was
+        # down are invisible, so the moment it happens must be on record.
+        (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+        (tmp_path / "b.txt").write_text("b", encoding="utf-8")
+        with capture_logs() as logs:
+            await _drain(_collector(tmp_path))
+        assert [(e["event"], e["files"]) for e in logs] == [("integrity.baseline_seeded", 2)]
+
+    @pytest.mark.asyncio
     async def test_first_scan_is_silent_baseline(self, tmp_path: Path) -> None:
         (tmp_path / "pre-existing.txt").write_text("seed", encoding="utf-8")
         collector = _collector(tmp_path)

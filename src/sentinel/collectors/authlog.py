@@ -31,6 +31,10 @@ Security posture (per the collector contract in
   rename (logrotate) is detected by inode and the old file is drained to its
   end before the new one is opened, and an in-place truncation is detected by
   size. No line is skipped or cut in half by a rotation.
+- **Starts where it is told.** With ``start_at_end`` (how the service runs
+  it), the file present at start-up is read from its current end, so a
+  restart does not re-analyze and re-alert the history already in it; a file
+  that appears later, or a rotated-in one, is read from its start.
 - **Never blocks the event loop.** File reads run in a worker thread via
   :func:`asyncio.to_thread`, honouring the async-throughout invariant.
 """
@@ -269,6 +273,7 @@ class AuthLogCollector(AbstractCollector):
         host_override: str | None = None,
         normalizer: Normalizer | None = None,
         name: str | None = None,
+        start_at_end: bool = False,
     ) -> None:
         super().__init__(name=name)
         if poll_interval <= 0:
@@ -288,6 +293,7 @@ class AuthLogCollector(AbstractCollector):
         self._pos = 0
         self._buf = b""
         self._discarding = False  # inside an over-long line: drop to its newline
+        self._skip_history = start_at_end  # applies to the first open only
         # Occurrences of identical records within the current timestamp, so
         # sshd's repeated identical failures stay distinct events while a
         # re-read of the same lines (after a truncation) reproduces their ids.
@@ -367,8 +373,18 @@ class AuthLogCollector(AbstractCollector):
         try:
             self._handle = self._path.open("rb")
         except FileNotFoundError:
+            self._skip_history = False  # a file that appears later is all new
             return False
-        self._handle.seek(self._pos)
+        if not self._skip_history:
+            self._handle.seek(self._pos)
+            return True
+        self._skip_history = False
+        self._pos = self._handle.seek(0, os.SEEK_END)
+        if self._pos:
+            self._handle.seek(self._pos - 1)
+            # Ending mid-line: the rest of that line is history too.
+            self._discarding = self._handle.read(1) != b"\n"
+        self._log.info("authlog.started_at_end", path=str(self._path), skipped_bytes=self._pos)
         return True
 
     def _follow_rotation(self) -> list[str]:

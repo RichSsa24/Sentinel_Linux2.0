@@ -167,6 +167,9 @@ class ProcessCollector(AbstractCollector):
         if not self._seeded:
             self._baseline = snapshot
             self._seeded = True
+            # Everything up to now is the baseline: processes already running
+            # are not reported as started.
+            self._log.info("process.baseline_seeded", processes=len(snapshot))
             return
         records = self._diff(self._baseline, snapshot)
         self._baseline = snapshot
