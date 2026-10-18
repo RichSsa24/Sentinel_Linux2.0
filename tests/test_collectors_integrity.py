@@ -161,6 +161,47 @@ class TestContentChanged:
         new = _state(None, mode=0o4755)._replace(ctime_ns=200)
         assert _content_changed(old, new) is False
 
+    @pytest.mark.parametrize(
+        "after",
+        [
+            _state(None)._replace(ctime_ns=200, nlink=1, uid=1000),
+            _state(None)._replace(ctime_ns=200, nlink=1, gid=42),
+            _state(None)._replace(ctime_ns=200, nlink=2),
+        ],
+        ids=["chown-user", "chown-group", "hard-link"],
+    )
+    def test_unhashable_ctime_move_explained_by_metadata_is_not_content(
+        self, after: _FileState
+    ) -> None:
+        # `chown root:shadow /etc/shadow` or `ln /etc/shadow x` moves ctime but is
+        # not an edit; reporting it as file_modified would fire a high-severity
+        # rule on routine administration.
+        before = _state(None)._replace(ctime_ns=100, nlink=1)
+        assert _content_changed(before, after) is False
+
+
+class TestFingerprint:
+    @pytest.mark.security
+    def test_repeated_forged_edits_of_an_unhashable_file_get_distinct_ids(
+        self, tmp_path: Path
+    ) -> None:
+        # Two same-length edits with the mtime restored each time: only ctime
+        # differs. If it were not in the fingerprint, the second edit would hash
+        # to the first one's event.id and the dedup window would swallow it.
+        collector = _collector(tmp_path)
+        base = _state(None)._replace(ctime_ns=100)
+        first = collector._diff({"/etc/shadow": base}, {"/etc/shadow": base._replace(ctime_ns=200)})
+        second = collector._diff(
+            {"/etc/shadow": base._replace(ctime_ns=200)},
+            {"/etc/shadow": base._replace(ctime_ns=300)},
+        )
+        assert [r.action for r in first + second] == ["file_modified", "file_modified"]
+        assert first[0].id_seed != second[0].id_seed
+
+    def test_hashable_fingerprint_is_the_digest(self, tmp_path: Path) -> None:
+        records = _collector(tmp_path)._diff({}, {"/etc/x": _state(H1)._replace(ctime_ns=5)})
+        assert records[0].id_seed == H1
+
 
 async def _drain(collector: FileIntegrityCollector) -> list[Event]:
     """Run one scan/diff cycle and return the events it would enqueue."""

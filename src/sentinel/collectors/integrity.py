@@ -101,6 +101,11 @@ class _FileState(NamedTuple):
     inode: int = 0
     device: int = 0
     cacheable: bool = False
+    # Metadata that also moves ctime; used to tell a metadata-only change from a
+    # content edit when the file cannot be hashed.
+    uid: int = 0
+    gid: int = 0
+    nlink: int = 0
 
     def same_stat(self, other: _FileState) -> bool:
         """True if `other` has the identical stat fingerprint (content assumed same)."""
@@ -255,6 +260,9 @@ class FileIntegrityCollector(AbstractCollector):
             inode=lst.st_ino,
             device=lst.st_dev,
             cacheable=lst.st_ctime_ns < racy_after_ns,
+            uid=lst.st_uid,
+            gid=lst.st_gid,
+            nlink=lst.st_nlink,
         )
         if previous is not None and previous.cacheable and previous.same_stat(state):
             self._hash_reused += 1
@@ -296,21 +304,16 @@ class FileIntegrityCollector(AbstractCollector):
     # ------------------------------------------------------------------ builders
 
     def _created(self, path: str, state: _FileState) -> RawFileEvent:
-        seed = state.sha256 or f"{state.size}:{state.mtime_ns}"
-        return self._raw(path, state, _ACTION_CREATED, _SEV_CREATED, seed)
+        return self._raw(path, state, _ACTION_CREATED, _SEV_CREATED, _fingerprint(state))
 
     def _modified(self, path: str, state: _FileState) -> RawFileEvent:
-        # Fall back to size+mtime as the fingerprint when the file is unhashable,
-        # so a later edit (new mtime) still reads as a distinct modification.
-        seed = state.sha256 or f"{state.size}:{state.mtime_ns}"
-        return self._raw(path, state, _ACTION_MODIFIED, _SEV_MODIFIED, seed)
+        return self._raw(path, state, _ACTION_MODIFIED, _SEV_MODIFIED, _fingerprint(state))
 
     def _attrs_modified(self, path: str, state: _FileState) -> RawFileEvent:
         return self._raw(path, state, _ACTION_ATTRS, _SEV_ATTRS, f"{state.mode:04o}")
 
     def _deleted(self, path: str, state: _FileState) -> RawFileEvent:
-        seed = state.sha256 or f"{state.size}:{state.mtime_ns}"
-        return self._raw(path, state, _ACTION_DELETED, _SEV_DELETED, seed)
+        return self._raw(path, state, _ACTION_DELETED, _SEV_DELETED, _fingerprint(state))
 
     def _raw(
         self, path: str, state: _FileState, action: str, severity: int, seed: str
@@ -340,19 +343,35 @@ class FileIntegrityCollector(AbstractCollector):
         }
 
 
+def _fingerprint(state: _FileState) -> str:
+    """The content fingerprint an event id derives from.
+
+    The digest when there is one. For an unhashable file it is size, mtime *and*
+    ctime: two forged edits that restore the same size and mtime still differ in
+    ctime, so the second is not mistaken for a re-observation of the first and
+    dropped by the dedup window. Re-observing one transition yields one value.
+    """
+    return state.sha256 or f"{state.size}:{state.mtime_ns}:{state.ctime_ns}"
+
+
 def _content_changed(old: _FileState, new: _FileState) -> bool:
     """True if file content changed between snapshots.
 
     Prefers the hash. For unhashable files (unreadable — e.g. /etc/shadow for a
     non-root collector — or over the size cap) it falls back to size or mtime
     drift, and then to ctime: size+mtime alone can be forged (a same-length edit
-    followed by ``touch -d``), ctime cannot. A ctime move that a mode change
-    explains is left to the attributes check, so ``chmod u+s`` still reads as
-    ``file_attributes_modified``.
+    followed by ``touch -d``), ctime cannot. A ctime move that visible metadata
+    explains — a mode change (left to the attributes check, so ``chmod u+s``
+    still reads as ``file_attributes_modified``), a ``chown``, or a hard link
+    added or removed — is not reported as a content change.
     """
     if old.sha256 is not None and new.sha256 is not None:
         return old.sha256 != new.sha256
     if old.size != new.size or old.mtime_ns != new.mtime_ns:
         return True
-    ctime_known = bool(old.ctime_ns and new.ctime_ns)
-    return ctime_known and old.ctime_ns != new.ctime_ns and old.mode == new.mode
+    if not (old.ctime_ns and new.ctime_ns) or old.ctime_ns == new.ctime_ns:
+        return False
+    metadata_explains = (
+        old.mode != new.mode or old.uid != new.uid or old.gid != new.gid or old.nlink != new.nlink
+    )
+    return not metadata_explains
