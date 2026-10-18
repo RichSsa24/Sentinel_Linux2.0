@@ -26,12 +26,27 @@ from __future__ import annotations
 import abc
 import asyncio
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     # Imported only for type hints — runtime would cycle through
     # sentinel.pipeline.runner -> AbstractCollector.
     from sentinel.pipeline.queue import BoundedEventQueue
+
+
+def under_host_root(host_root: Path, host_path: Path) -> Path:
+    """Where a host-native path is visible to this process.
+
+    With ``host_root`` ``/`` (bare metal) paths are returned unchanged; in a
+    container the host is mounted beneath e.g. ``/host``, so ``/etc/passwd``
+    maps to ``/host/etc/passwd``. Relative paths are not host paths and pass
+    through untouched. Every collector resolves host paths through this one
+    function.
+    """
+    if host_root == Path("/") or not host_path.is_absolute():
+        return host_path
+    return host_root / host_path.relative_to(host_path.anchor)
 
 
 class AbstractCollector(abc.ABC):

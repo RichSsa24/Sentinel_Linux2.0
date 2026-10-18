@@ -14,10 +14,11 @@ test:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
-from sentinel.collectors.base import AbstractCollector
+from sentinel.collectors.base import AbstractCollector, under_host_root
 from sentinel.pipeline.queue import BoundedEventQueue
 
 
@@ -114,3 +115,14 @@ class TestWaitStop:
 
         await collector.stop()
         assert await asyncio.wait_for(waiter, timeout=5.0) is True
+
+
+class TestUnderHostRoot:
+    def test_bare_metal_is_identity(self) -> None:
+        assert under_host_root(Path("/"), Path("/etc/passwd")) == Path("/etc/passwd")
+
+    def test_container_maps_beneath_the_mount(self) -> None:
+        assert under_host_root(Path("/host"), Path("/etc/passwd")) == Path("/host/etc/passwd")
+
+    def test_relative_paths_pass_through(self) -> None:
+        assert under_host_root(Path("/host"), Path("local/dir")) == Path("local/dir")

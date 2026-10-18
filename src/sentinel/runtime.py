@@ -53,7 +53,7 @@ from sentinel.alerting import (
     WebhookSink,
 )
 from sentinel.collectors.authlog import AuthLogCollector
-from sentinel.collectors.base import AbstractCollector
+from sentinel.collectors.base import AbstractCollector, under_host_root
 from sentinel.collectors.integrity import FileIntegrityCollector
 from sentinel.collectors.network import NetworkCollector
 from sentinel.collectors.process import ProcessCollector
@@ -75,11 +75,6 @@ _MAX_RETRY_BACKOFF_S: Final[float] = 30.0
 
 class ConfigurationError(ValueError):
     """The settings describe a system that cannot run safely."""
-
-
-def _under(root: Path, host_path: Path) -> Path:
-    """Where a host-native absolute path is visible beneath `root`."""
-    return root / host_path.relative_to(host_path.anchor)
 
 
 def resolve_host_name(settings: Settings) -> str:
@@ -108,19 +103,19 @@ def build_collectors(settings: Settings) -> list[AbstractCollector]:
     enabled = set(settings.enabled_collectors)
     collectors: list[AbstractCollector] = []
     if "auth-log" in enabled:
-        collectors.append(AuthLogCollector(_under(root, settings.auth_log_path)))
+        collectors.append(AuthLogCollector(under_host_root(root, settings.auth_log_path)))
     if "file-integrity" in enabled:
         collectors.append(
             FileIntegrityCollector(paths=list(settings.fim_path_list), host_root=root, host=host)
         )
     if "process" in enabled:
-        collectors.append(ProcessCollector(proc_root=_under(root, _PROC), host=host))
+        collectors.append(ProcessCollector(proc_root=under_host_root(root, _PROC), host=host))
     if "network" in enabled:
         # Behind a host-root mount, /proc/net would resolve to *our* (container)
         # namespace; PID 1's view of the host procfs is the host's.
         netns_pid = None if root == _HOST_ROOT else 1
         collectors.append(
-            NetworkCollector(proc_root=_under(root, _PROC), netns_pid=netns_pid, host=host)
+            NetworkCollector(proc_root=under_host_root(root, _PROC), netns_pid=netns_pid, host=host)
         )
     return collectors
 

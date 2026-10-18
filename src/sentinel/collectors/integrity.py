@@ -58,7 +58,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
-from sentinel.collectors.base import AbstractCollector
+from sentinel.collectors.base import AbstractCollector, under_host_root
 from sentinel.logging import get_logger
 from sentinel.normalizer import Normalizer, RawFileEvent
 
@@ -195,7 +195,7 @@ class FileIntegrityCollector(AbstractCollector):
         racy_after_ns = time.time_ns() - _RACY_WINDOW_NS
         snapshot: dict[str, _FileState] = {}
         for root in self._paths:
-            for path in self._iter_files(self._on_disk(root)):
+            for path in self._iter_files(under_host_root(self._host_root, root)):
                 if len(snapshot) >= self._max_files:
                     self._log.warning("integrity.max_files_reached", max_files=self._max_files)
                     return snapshot
@@ -204,12 +204,6 @@ class FileIntegrityCollector(AbstractCollector):
                 if state is not None:
                     snapshot[key] = state
         return snapshot
-
-    def _on_disk(self, host_path: Path) -> Path:
-        """Where a host-native watch path is visible to this process."""
-        if self._host_root == Path("/") or not host_path.is_absolute():
-            return host_path
-        return self._host_root / host_path.relative_to(host_path.anchor)
 
     def _host_path(self, on_disk: Path) -> str:
         """The host-native path reported for a file found under the host root."""
