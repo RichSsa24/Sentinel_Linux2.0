@@ -27,7 +27,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import select, text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 
@@ -47,6 +47,7 @@ from sentinel.metrics import Metrics
 from sentinel.runtime import Runtime
 from sentinel.settings import Settings
 from sentinel.storage.database import Database
+from sentinel.storage.models import AlertRow, EventRow
 from sentinel.storage.repository import Repository
 
 _log = get_logger("sentinel.api")
@@ -104,6 +105,25 @@ def _runtime_lifespan(
             await database.dispose()
 
     return lifespan
+
+
+async def _not_ready_reason(runtime: Runtime | None, database: Database) -> str | None:
+    """Why the service cannot do its job right now, or None if it can."""
+    if runtime is not None and not runtime.running:
+        return "detection pipeline is not running"
+    try:
+        async with database.session() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception:
+        return "database not reachable"
+    try:
+        # Reachable is not enough: without the schema every write fails.
+        async with database.session() as session:
+            await session.execute(select(EventRow.id).limit(1))
+            await session.execute(select(AlertRow.id).limit(1))
+    except Exception:
+        return "database schema missing; run `alembic upgrade head`"
+    return None
 
 
 def create_app(
@@ -184,14 +204,9 @@ def create_app(
 
     @app.get("/readyz")
     async def readyz(request: Request) -> Response:
-        runtime: Runtime | None = request.app.state.runtime
-        if runtime is not None and not runtime.running:
-            return _error(503, "NOT_READY", "detection pipeline is not running")
-        try:
-            async with database.session() as session:
-                await session.execute(text("SELECT 1"))
-        except Exception:
-            return _error(503, "NOT_READY", "database not reachable")
+        reason = await _not_ready_reason(request.app.state.runtime, database)
+        if reason is not None:
+            return _error(503, "NOT_READY", reason)
         return JSONResponse({"success": True, "data": {"status": "ready"}})
 
     @app.get("/metrics", dependencies=[Depends(require_api_key)])

@@ -217,8 +217,12 @@ sudo scripts/demo.sh                    # harmless host activity -> alerts (clea
 
 ```bash
 export SENTINEL_ENV=production SENTINEL_API_KEY="$(openssl rand -base64 32)"
+uv run alembic upgrade head        # create/upgrade the schema (SQLite by default)
 uv run sentinel serve --host 127.0.0.1 --port 8000
 ```
+
+`/readyz` stays at 503 until the schema exists, so a missed migration is
+visible rather than silent.
 
 Every setting is documented in [`.env.example`](.env.example) (kept in sync with
 the code by a test).

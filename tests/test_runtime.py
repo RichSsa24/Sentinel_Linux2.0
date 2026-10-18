@@ -652,6 +652,20 @@ class TestAppLifespan:
                 pass
         assert disposed == [True]
 
+    async def test_readyz_reports_a_missing_schema(
+        self, tmp_path: Path, rules: tuple[Rule, ...]
+    ) -> None:
+        # Regression: a reachable but never-migrated database read as ready while
+        # every write failed. (No create_all here: the schema does not exist.)
+        bare = Database(f"sqlite+aiosqlite:///{tmp_path / 'unmigrated.db'}")
+        app = create_app(make_api_settings(), database=bare, metrics=Metrics(), rules=rules)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            resp = await client.get("/readyz")
+        await bare.dispose()
+        assert resp.status_code == 503
+        assert "schema missing" in resp.json()["error"]["message"]
+
 
 class TestGetApp:
     def test_configures_logging_and_loads_rules_from_settings(
