@@ -170,6 +170,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     present the API key get a budget separate from unauthenticated traffic
     from the same address, so a scanner — or any local user on a loopback
     deployment — cannot throttle Prometheus or the API's consumers.
+
+    ``exempt_paths`` are never limited and never charged: a health probe that
+    could be throttled would let any client mark a healthy service down. An
+    exempt endpoint must therefore be cheap to call (see ``/readyz``).
     """
 
     def __init__(
@@ -179,9 +183,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         limit: int,
         window_seconds: float,
         api_key: SecretStr | None = None,
+        exempt_paths: frozenset[str] = frozenset(),
         time_source: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(app)
+        self._exempt = exempt_paths
         self._limit = limit
         self._window = window_seconds
         self._api_key = api_key
@@ -189,6 +195,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._hits: dict[str, deque[float]] = {}
 
     async def dispatch(self, request: Request, call_next: _Dispatch) -> Response:
+        if request.url.path in self._exempt:
+            return await call_next(request)
         client = request.client.host if request.client else "unknown"
         token = _bearer_token(request)
         authenticated = (

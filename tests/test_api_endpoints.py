@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+
 import httpx
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from sentinel.api import create_app
+from sentinel.api import app as app_module, create_app
 from sentinel.detection.schema import Rule
 from sentinel.metrics import Metrics
 from sentinel.storage import Database, Repository
@@ -151,6 +156,34 @@ class TestErrorHandling:
             resp = await client.get("/readyz")
         assert resp.status_code == 503
         assert resp.json()["error"]["code"] == "NOT_READY"
+
+    @pytest.mark.security
+    async def test_readiness_probes_share_one_database_check(
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # /readyz is exempt from the rate limit, so a flood of probes must not
+        # become a flood of database round trips.
+        sessions = 0
+        original = database.session
+
+        @contextlib.asynccontextmanager
+        async def counting_session() -> AsyncIterator[AsyncSession]:
+            nonlocal sessions
+            sessions += 1
+            async with original() as session:
+                yield session
+
+        monkeypatch.setattr(database, "session", counting_session)
+        app = create_app(make_api_settings(), database=database, metrics=Metrics(), rules=rules)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            responses = await asyncio.gather(*(client.get("/readyz") for _ in range(20)))
+            assert {resp.status_code for resp in responses} == {200}
+            assert sessions == 2  # one check: reachability, then the schema
+
+            monkeypatch.setattr(app_module, "_READY_CACHE_S", 0.0)
+            await client.get("/readyz")
+            assert sessions == 4  # an expired result is checked again
 
     @pytest.mark.security
     async def test_unhandled_error_is_generic_500(

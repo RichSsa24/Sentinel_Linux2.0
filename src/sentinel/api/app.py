@@ -25,6 +25,7 @@ a fresh one — neither restarts a process merely for failing a health check.
 import asyncio
 import os
 import signal
+import time
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
@@ -64,6 +65,11 @@ _MAX_CURSOR = 2**63 - 1
 # A readiness probe must answer before its caller gives up (the image's
 # HEALTHCHECK waits 4 s); a database slower than this is not ready.
 _READY_TIMEOUT_S = 2.0
+# Probes are exempt from the rate limit, so the database round trip behind
+# /readyz is shared: at most one per this many seconds, however many callers.
+_READY_CACHE_S = 1.0
+# Never rate limited (see RateLimitMiddleware); both are cheap to answer.
+_PROBE_PATHS = frozenset({"/healthz", "/readyz"})
 
 
 def _package_version() -> str:
@@ -117,15 +123,38 @@ def _runtime_lifespan(
     return lifespan
 
 
-async def _not_ready_reason(runtime: Runtime | None, database: Database) -> str | None:
+class _DatabaseProbe:
+    """The database half of readiness, checked at most once per ``_READY_CACHE_S``.
+
+    Concurrent callers wait for the check in progress instead of starting
+    their own, so a flood of probes costs the database one round trip a second.
+    """
+
+    def __init__(self, database: Database, clock: Callable[[], float] = time.monotonic) -> None:
+        self._database = database
+        self._clock = clock
+        self._lock = asyncio.Lock()
+        self._checked_at: float | None = None
+        self._problem: str | None = None
+
+    async def problem(self) -> str | None:
+        async with self._lock:
+            now = self._clock()
+            if self._checked_at is None or now - self._checked_at >= _READY_CACHE_S:
+                try:
+                    async with asyncio.timeout(_READY_TIMEOUT_S):
+                        self._problem = await _database_problem(self._database)
+                except TimeoutError:
+                    self._problem = "database not responding"
+                self._checked_at = self._clock()
+            return self._problem
+
+
+async def _not_ready_reason(runtime: Runtime | None, database: _DatabaseProbe) -> str | None:
     """Why the service cannot do its job right now, or None if it can."""
     if runtime is not None and not runtime.running:
         return "detection pipeline is not running"
-    try:
-        async with asyncio.timeout(_READY_TIMEOUT_S):
-            reason = await _database_problem(database)
-    except TimeoutError:
-        return "database not responding"
+    reason = await database.problem()
     if reason is not None:
         return reason
     if runtime is not None and not runtime.persisting:
@@ -202,6 +231,7 @@ def create_app(
         limit=settings.api_rate_limit,
         window_seconds=settings.api_rate_window_seconds,
         api_key=settings.api_key,
+        exempt_paths=_PROBE_PATHS,
     )
     app.add_middleware(RequestContextMiddleware)
     origins = list(settings.cors_origin_list)
@@ -235,9 +265,11 @@ def create_app(
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    database_probe = _DatabaseProbe(database)
+
     @app.get("/readyz")
     async def readyz(request: Request) -> Response:
-        reason = await _not_ready_reason(request.app.state.runtime, database)
+        reason = await _not_ready_reason(request.app.state.runtime, database_probe)
         if reason is not None:
             return _error(503, "NOT_READY", reason)
         return JSONResponse({"success": True, "data": {"status": "ready"}})

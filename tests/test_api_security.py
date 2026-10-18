@@ -153,8 +153,8 @@ class TestEveryResponseIsHardened:
         self, database: Database, rules: tuple[Rule, ...]
     ) -> None:
         async with _client(database, rules, api_rate_limit=1) as client:
-            await client.get("/healthz")
-            limited = await client.get("/healthz")
+            await client.get("/events")
+            limited = await client.get("/events")
         assert limited.status_code == 429
         self._assert_hardened(limited)
         assert limited.headers["X-Request-ID"]

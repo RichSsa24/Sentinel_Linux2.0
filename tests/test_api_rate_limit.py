@@ -36,11 +36,20 @@ async def _ok(_request: Request) -> PlainTextResponse:
 
 
 def _middleware_client(
-    limit: int, window: float, clock: _FakeClock, api_key: SecretStr | None = None
+    limit: int,
+    window: float,
+    clock: _FakeClock,
+    api_key: SecretStr | None = None,
+    exempt_paths: frozenset[str] = frozenset(),
 ) -> httpx.AsyncClient:
-    app = Starlette(routes=[Route("/", _ok)])
+    app = Starlette(routes=[Route("/", _ok), Route("/healthz", _ok)])
     app.add_middleware(
-        RateLimitMiddleware, limit=limit, window_seconds=window, api_key=api_key, time_source=clock
+        RateLimitMiddleware,
+        limit=limit,
+        window_seconds=window,
+        api_key=api_key,
+        exempt_paths=exempt_paths,
+        time_source=clock,
     )
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver")
 
@@ -85,6 +94,14 @@ class TestRateLimitMiddleware:
             clock.advance(11.0)  # the earlier hit ages out of the window
             assert (await client.get("/")).status_code == 200
 
+    async def test_exempt_paths_are_neither_limited_nor_charged(self) -> None:
+        clock = _FakeClock()
+        async with _middleware_client(1, 60, clock, exempt_paths=frozenset({"/healthz"})) as c:
+            probes = [(await c.get("/healthz")).status_code for _ in range(5)]
+            first, second = (await c.get("/")).status_code, (await c.get("/")).status_code
+        assert probes == [200] * 5
+        assert (first, second) == (200, 429)  # the probes did not use the budget
+
 
 class TestRateLimitIntegration:
     async def test_api_enforces_configured_limit(
@@ -94,5 +111,25 @@ class TestRateLimitIntegration:
         app = create_app(settings, database=database, metrics=Metrics(), rules=rules)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            codes = [(await client.get("/healthz")).status_code for _ in range(3)]
+            codes = [
+                (await client.get("/rules", headers=auth_header())).status_code for _ in range(3)
+            ]
         assert codes.count(429) == 1
+
+    async def test_health_probes_are_never_throttled(
+        self, database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        # Regression: probes shared the anonymous budget, so any local client
+        # could exhaust it and turn the container's healthcheck unhealthy.
+        settings = make_api_settings(api_rate_limit=2)
+        app = create_app(settings, database=database, metrics=Metrics(), rules=rules)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            for _ in range(5):
+                await client.get("/events")  # anonymous flood: 401, then 429
+            codes = {
+                (await client.get(path)).status_code
+                for path in ("/healthz", "/readyz")
+                for _ in range(5)
+            }
+        assert codes == {200}
