@@ -63,7 +63,8 @@ services:
       # unprivileged container cannot watch them; /etc/crontab and /etc/cron.*
       # are covered. Add a path here only together with its mount.
       SENTINEL_FIM_PATHS: ${SENTINEL_FIM_PATHS:-/etc}
-    # Optional tuning (webhook/email sinks, alert gates, FIM paths ...).
+    # Optional tuning (webhook/email sinks, alert gates, retention ...). FIM
+    # paths go in deploy/.env (with their mounts): `environment:` above wins.
     env_file:
       - path: sentinel.env
         required: false
