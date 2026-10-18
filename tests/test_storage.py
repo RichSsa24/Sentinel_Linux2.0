@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import os
+import stat
+from collections.abc import Iterator
+from pathlib import Path
+
 import pytest
 from sqlalchemy import event
+from structlog.testing import capture_logs
 
 from sentinel.storage import Database, Repository
+from sentinel.storage.database import create_private_sqlite_file
 from tests.conftest import make_alert, make_event
 
 
@@ -168,3 +175,64 @@ class TestReadsDoNotWrite:
         assert set(statements) == {"SELECT"}
         assert events[0].occurred_at.tzinfo is not None  # still UTC-aware on SQLite
         assert alerts[0].occurred_at.tzinfo is not None
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _modes(directory: Path) -> dict[str, int]:
+    return {file.name: _mode(file) for file in directory.iterdir()}
+
+
+@pytest.fixture
+def permissive_umask() -> Iterator[None]:
+    """The common default umask (022), under which new files are world-readable."""
+    previous = os.umask(0o022)
+    yield
+    os.umask(previous)
+
+
+@pytest.mark.security
+@pytest.mark.usefixtures("permissive_umask")
+class TestDatabaseFilePermissions:
+    async def test_a_new_database_and_its_wal_files_are_private(self, tmp_path: Path) -> None:
+        # Regression: under umask 022 the database, -wal and -shm were 0644,
+        # so any local user could read the auth events and command lines.
+        path = tmp_path / "sentinel.db"
+        database = Database(f"sqlite+aiosqlite:///{path}")
+        await database.create_all()
+        async with database.session() as session:
+            await Repository(session).save_batch(events=[make_event()])
+            modes = _modes(tmp_path)  # while open: -wal and -shm still exist
+        await database.dispose()
+        assert modes == {"sentinel.db": 0o600, "sentinel.db-shm": 0o600, "sentinel.db-wal": 0o600}
+
+    def test_an_existing_readable_database_is_reported_not_changed(self, tmp_path: Path) -> None:
+        path = tmp_path / "sentinel.db"
+        path.touch(mode=0o640)
+        with capture_logs() as logs:
+            create_private_sqlite_file(f"sqlite+aiosqlite:///{path}")
+        assert _mode(path) == 0o640  # the operator's choice stands
+        assert [(e["event"], e["mode"]) for e in logs] == [
+            ("storage.database_readable_by_others", "0640")
+        ]
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "sqlite+aiosqlite://",
+            "sqlite+aiosqlite:///:memory:",
+            "postgresql+asyncpg://user:pw@db.invalid/sentinel",  # pragma: allowlist secret
+        ],
+    )
+    def test_urls_without_a_database_file_are_left_alone(
+        self, url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        create_private_sqlite_file(url)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_an_uncreatable_path_is_left_for_sqlite_to_report(self, tmp_path: Path) -> None:
+        create_private_sqlite_file(f"sqlite+aiosqlite:///{tmp_path / 'missing' / 'x.db'}")
+        assert not (tmp_path / "missing").exists()

@@ -13,6 +13,7 @@ from alembic import context
 from sqlalchemy import create_engine, pool
 
 from sentinel.settings import Settings
+from sentinel.storage.database import create_private_sqlite_file
 from sentinel.storage.models import Base
 
 target_metadata = Base.metadata
@@ -36,7 +37,9 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    engine = create_engine(_sync_url(), poolclass=pool.NullPool)
+    url = _sync_url()
+    create_private_sqlite_file(url)  # on bare metal, migrating creates the database
+    engine = create_engine(url, poolclass=pool.NullPool)
     with engine.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():

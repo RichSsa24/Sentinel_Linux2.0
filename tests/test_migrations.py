@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,16 @@ def _config(db_url: str) -> Config:
 
 
 class TestMigrations:
+    def test_migrating_creates_a_private_database(self, tmp_path: Path) -> None:
+        # On bare metal `alembic upgrade head` is what creates the database file.
+        path = tmp_path / "m.db"
+        previous = os.umask(0o022)
+        try:
+            command.upgrade(_config(f"sqlite:///{path}"), "head")
+        finally:
+            os.umask(previous)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
     def test_upgrade_creates_tables(self, tmp_path: Path) -> None:
         url = f"sqlite:///{tmp_path / 'm.db'}"
         command.upgrade(_config(url), "head")
