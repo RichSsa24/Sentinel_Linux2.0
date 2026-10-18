@@ -8,6 +8,9 @@ timestamps and fires when ``count`` matches fall inside ``window_seconds``.
 
 Two safety properties matter here:
 
+- **No address rotation.** An IPv6 ``group_by`` value is bucketed by its /64
+  (and an IPv4-mapped one by its IPv4 address), so cycling through the
+  addresses of one assignment cannot dodge a threshold.
 - **Bounded memory.** Each window holds at most ``count`` timestamps (it is
   cleared when it fires, so there is no per-event alert storm), and the number
   of tracked groups is capped — the oldest group is evicted when the cap is hit,
@@ -32,6 +35,7 @@ against randomly generated conditions.
 
 from __future__ import annotations
 
+import ipaddress
 from collections import deque
 from collections.abc import Iterable, Mapping
 from datetime import datetime
@@ -51,6 +55,26 @@ _ACTION_FIELD: Final[str] = "event.action"
 _MAX_CACHED_ACTIONS: Final[int] = 1_024
 
 _WindowKey = tuple[str, str]  # (rule_id, group value)
+
+
+# The smallest IPv6 block a single subscriber is assigned (RFC 6177): one host
+# can rotate through 2**64 addresses, so per-address counting would never fire.
+_IPV6_SUBSCRIBER_PREFIX: Final[int] = 64
+
+
+def _group_key(value: object) -> str:
+    """The threshold bucket for a ``group_by`` value: IPv6 addresses by their /64."""
+    text = str(value)
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return text
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        network = ipaddress.ip_network(f"{address}/{_IPV6_SUBSCRIBER_PREFIX}", strict=False)
+        return str(network)
+    return text
 
 
 def required_actions(condition: Condition) -> frozenset[str] | None:
@@ -184,7 +208,7 @@ class DetectionEngine:
         group = resolve_field(threshold.group_by, view)
         if group is None:
             return False  # cannot bucket an event missing the group field
-        key: _WindowKey = (rule_id, str(group))
+        key: _WindowKey = (rule_id, _group_key(group))
         moment = event.timestamp.timestamp()
         window = self._window_for(key)
         window.append(moment)

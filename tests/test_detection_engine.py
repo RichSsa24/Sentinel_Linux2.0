@@ -209,3 +209,30 @@ class TestSafetyAndStats:
         elapsed = time.perf_counter() - start
         assert elapsed < 2.0, f"5k events took {elapsed:.2f}s"
         assert engine.stats["evaluations"] == 5000
+
+
+@pytest.mark.security
+class TestAddressRotation:
+    def test_ipv6_attempts_from_one_slash_64_count_together(self) -> None:
+        # Regression: grouped per address, 10 failures over 5 addresses of one
+        # /64 never reached the threshold (count 3 here, 5 in the library).
+        engine = DetectionEngine([_brute_rule()])
+        fired = []
+        for i in range(3):
+            event = _event("ssh_login_failed", ip=f"2001:db8:1:2::{i + 1:x}")
+            fired += engine.evaluate(event)
+        assert [d.rule_id for d in fired] == ["ssh-brute-force"]
+
+    def test_different_slash_64s_are_counted_apart(self) -> None:
+        engine = DetectionEngine([_brute_rule()])
+        fired = []
+        for i in range(3):
+            fired += engine.evaluate(_event("ssh_login_failed", ip=f"2001:db8:{i}::1"))
+        assert fired == []
+
+    def test_ipv4_mapped_addresses_count_as_their_ipv4_address(self) -> None:
+        engine = DetectionEngine([_brute_rule()])
+        fired = []
+        for ip in ("203.0.113.9", "::ffff:203.0.113.9", "203.0.113.9"):
+            fired += engine.evaluate(_event("ssh_login_failed", ip=ip))
+        assert [d.rule_id for d in fired] == ["ssh-brute-force"]
