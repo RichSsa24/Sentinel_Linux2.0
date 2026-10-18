@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, true
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -62,6 +62,8 @@ class AlertRow(Base):
     host: Mapped[str] = mapped_column(String(253))
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     summary: Mapped[str] = mapped_column(Text)
+    # False when the throttle withheld the notification (the alert is kept).
+    notified: Mapped[bool] = mapped_column(Boolean, server_default=true())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     __table_args__ = (Index("ix_alerts_occurred_at_id", "occurred_at", "id"),)

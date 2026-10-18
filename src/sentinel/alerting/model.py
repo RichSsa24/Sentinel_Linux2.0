@@ -54,6 +54,11 @@ class Alert(BaseModel):
     host: str
     timestamp: datetime
     summary: str
+    notified: bool = Field(
+        default=True,
+        description="False when the alert throttle withheld the notification. Such "
+        "alerts are still stored, so the throttle never hides evidence.",
+    )
 
     @classmethod
     def from_detection(cls, detection: Detection) -> Alert:

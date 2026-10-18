@@ -115,6 +115,28 @@ class TestGates:
         await manager.process(make_detection(event_id="f" * 64))
         assert len(sink.received) == 3
 
+    @pytest.mark.security
+    @pytest.mark.asyncio
+    async def test_throttled_alerts_are_kept_for_storage_and_announced(self) -> None:
+        # Regression: decoys that exhaust a rule's budget made the real attack's
+        # alert vanish: neither notified nor stored, with no trace but a counter.
+        sink = _Recorder()
+        clock = _Clock()
+        manager = AlertManager(
+            [sink], throttle_max=1, throttle_window_seconds=60, time_source=clock
+        )
+        await manager.process(make_detection(event_id="1" * 64))  # the decoy
+        with capture_logs() as logs:
+            withheld = [await manager.process(make_detection(event_id=f"{i:064d}")) for i in (2, 3)]
+        assert [alert.notified for alert in withheld if alert] == [False, False]
+        assert [e["event"] for e in logs] == ["alert.throttled"]  # once per window
+
+        clock.advance(61)
+        delivered = await manager.process(make_detection(event_id="4" * 64))
+        assert delivered is not None
+        assert delivered.notified
+        assert "+2 more alert(s) from this rule withheld" in sink.received[-1].summary
+
     def test_sinks_property_exposes_configured_sinks(self) -> None:
         sink = _Recorder()
         manager = AlertManager([sink])

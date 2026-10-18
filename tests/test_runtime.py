@@ -625,7 +625,9 @@ class TestWriteBehind:
         snapshot = runtime.snapshot()
         # Everything is accounted for: dropped by the cap, or unwritten at shutdown.
         assert snapshot.dropped["persist_error"] == 40
-        assert snapshot.alerts_unpersisted == runtime._alerts.stats["emitted"] > 0
+        alerts = runtime._alerts.stats
+        # Throttled alerts are stored too, so they are lost (and counted) as well.
+        assert snapshot.alerts_unpersisted == alerts["emitted"] + alerts["throttled"] > 0
 
     async def test_flush_interval_bounds_staleness(
         self, database: Database, rules: tuple[Rule, ...]

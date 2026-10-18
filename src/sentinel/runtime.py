@@ -313,8 +313,9 @@ class Runtime:
             ).inc()
             started = time.perf_counter()
             alert = await self._alerts.process(detection)
-            if alert is not None:
-                self._metrics.alert_latency.observe(time.perf_counter() - started)
+            if alert is not None:  # notified or throttled: stored either way
+                if alert.notified:
+                    self._metrics.alert_latency.observe(time.perf_counter() - started)
                 self._pending_alerts.append(alert)
         self._pending_events.append(event)
         self._metrics.events_ingested.inc()

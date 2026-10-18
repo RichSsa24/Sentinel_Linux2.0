@@ -101,6 +101,16 @@ class TestAlertsEndpoint:
         body = (await api_client.get("/alerts", headers=auth_header())).json()
         assert body["data"][0]["attack"] == ["T1059.004"]
         assert isinstance(body["data"][0]["nist_csf"], list)
+        assert body["data"][0]["notified"] is True
+
+    async def test_a_throttled_alert_is_listed_as_not_notified(
+        self, database: Database, api_client: httpx.AsyncClient
+    ) -> None:
+        withheld = make_alert().model_copy(update={"notified": False})
+        async with database.session() as session:
+            await Repository(session).save_alert(withheld)
+        body = (await api_client.get("/alerts", headers=auth_header())).json()
+        assert body["data"][0]["notified"] is False
 
 
 class TestRulesEndpoint:

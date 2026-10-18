@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 from alembic import command
+from alembic.autogenerate import compare_metadata
 from alembic.config import Config
+from alembic.migration import MigrationContext
 from sqlalchemy import create_engine, inspect
 
 from sentinel.storage.models import Base
@@ -43,13 +45,15 @@ class TestMigrations:
         assert "events" not in tables
         assert "alerts" not in tables
 
-    def test_migration_columns_match_orm(self, tmp_path: Path) -> None:
+    def test_migrations_match_the_orm_exactly(self, tmp_path: Path) -> None:
+        # Column names alone missed type, nullability, default and index drift.
         url = f"sqlite:///{tmp_path / 'm.db'}"
         command.upgrade(_config(url), "head")
         engine = create_engine(url)
-        inspector = inspect(engine)
-        for table in ("events", "alerts"):
-            migrated = {col["name"] for col in inspector.get_columns(table)}
-            modelled = {col.name for col in Base.metadata.tables[table].columns}
-            assert migrated == modelled, f"schema drift in {table}"
+        with engine.connect() as connection:
+            context = MigrationContext.configure(
+                connection, opts={"compare_type": True, "compare_server_default": True}
+            )
+            drift = compare_metadata(context, Base.metadata)
         engine.dispose()
+        assert drift == []

@@ -8,11 +8,15 @@ flood (a notification-channel DoS):
 1. **Severity floor** — alerts below ``min_severity`` are dropped.
 2. **Dedup** — the exact same rule firing on the exact same event (identical
    ``dedup_key``) within a TTL window collapses to a single alert.
-3. **Throttle** — a per-rule sliding-window rate limit caps how many alerts one
-   rule can emit per window, regardless of distinct events. A rule's own
-   ``throttle:`` block (from its YAML) overrides the global default, so a
-   brute-force rule can say "one alert per five minutes" while the rest of the
-   library keeps the global budget.
+3. **Throttle** — a per-rule sliding-window rate limit caps how many
+   *notifications* one rule can send per window, regardless of distinct
+   events. A rule's own ``throttle:`` block (from its YAML) overrides the global
+   default, so a brute-force rule can say "one alert per five minutes" while
+   the rest of the library keeps the global budget. A throttled alert is still
+   returned (``notified=False``) so it is stored: an attacker who exhausts a
+   rule's budget with decoys cannot hide the real attack from the record. The
+   first throttled alert of a window is logged, and the rule's next
+   notification states how many were withheld.
 
 Delivery is firewalled: a sink that raises is counted and logged (by type, never
 the payload or any secret) and the other sinks still receive the alert.
@@ -62,6 +66,8 @@ class AlertManager:
         self._now = time_source
         # Keyed on rule id (a finite, trusted set), so this cannot grow unbounded.
         self._rule_hits: dict[str, deque[float]] = {}
+        # Alerts withheld per rule since its last notification (same finite key set).
+        self._withheld: dict[str, int] = {}
         self._log = get_logger("sentinel.alerting.manager")
         self._emitted = 0
         self._suppressed_severity = 0
@@ -71,7 +77,12 @@ class AlertManager:
         self._delivered: dict[str, int] = {sink.name: 0 for sink in self._sinks}
 
     async def process(self, detection: Detection) -> Alert | None:
-        """Run a detection through the gates and deliver it, or return None."""
+        """Run a detection through the gates; return the alert to store, or None.
+
+        None means the alert was discarded (below the severity floor, or a
+        duplicate). A throttled alert is returned with ``notified=False``: it
+        was not sent, but it is evidence and must be stored.
+        """
         alert = Alert.from_detection(detection)
         if alert.severity < self._min_severity:
             self._suppressed_severity += 1
@@ -81,7 +92,18 @@ class AlertManager:
             return None
         if self._is_throttled(alert.rule_id):
             self._throttled += 1
-            return None
+            withheld = self._withheld.get(alert.rule_id, 0) + 1
+            self._withheld[alert.rule_id] = withheld
+            if withheld == 1:
+                limit, window = self._throttle_for(alert.rule_id)
+                self._log.warning(
+                    "alert.throttled", rule_id=alert.rule_id, limit=limit, window_seconds=window
+                )
+            return alert.model_copy(update={"notified": False})
+        withheld = self._withheld.pop(alert.rule_id, 0)
+        if withheld:
+            note = f" [+{withheld} more alert(s) from this rule withheld by the throttle]"
+            alert = alert.model_copy(update={"summary": alert.summary + note})
         await self._dispatch(alert)
         self._emitted += 1
         return alert

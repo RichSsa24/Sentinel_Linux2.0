@@ -51,6 +51,7 @@ def _alert_values(alert: Alert) -> dict[str, object]:
         "host": alert.host,
         "occurred_at": alert.timestamp,
         "summary": alert.summary,
+        "notified": alert.notified,
     }
 
 

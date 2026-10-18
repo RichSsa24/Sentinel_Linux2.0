@@ -54,6 +54,7 @@ class AlertOut(BaseModel):
     host: str
     occurred_at: datetime
     summary: str
+    notified: bool
 
     @classmethod
     def from_row(cls, row: AlertRow) -> AlertOut:
@@ -68,6 +69,7 @@ class AlertOut(BaseModel):
             host=row.host,
             occurred_at=row.occurred_at,
             summary=row.summary,
+            notified=row.notified,
         )
 
 
