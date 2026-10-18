@@ -15,6 +15,7 @@ import os
 import signal
 import socket
 from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from pydantic import SecretStr
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
+from sentinel import runtime as runtime_module
 from sentinel.alerting import Alert, AlertSink, ConsoleSink, EmailSink, WebhookSink
 from sentinel.api import app as app_module, create_app
 from sentinel.api.app import get_app
@@ -953,6 +955,126 @@ class TestAppLifespan:
         await bare.dispose()
         assert resp.status_code == 503
         assert "schema missing" in resp.json()["error"]["message"]
+
+
+async def _count_alerts(database: Database) -> int:
+    async with database.session() as session:
+        return await Repository(session).count_alerts()
+
+
+async def _store(database: Database, events: int, alerts: int) -> None:
+    async with database.session() as session:
+        await Repository(session).save_batch(
+            events=_events(events),
+            alerts=[
+                Alert.from_detection(make_detection(event_id=f"{i:064d}")) for i in range(alerts)
+            ],
+        )
+
+
+class TestRetention:
+    async def test_deletes_only_what_outlived_the_retention_period(
+        self, database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        await _store(database, events=5, alerts=3)
+        stored = datetime.now(tz=UTC)
+        runtime = Runtime(
+            make_api_settings(retention_days=1), database=database, metrics=Metrics(), rules=rules
+        )
+        assert await runtime.prune(now=stored + timedelta(hours=23)) is True
+        assert (await _count_events(database), await _count_alerts(database)) == (5, 3)
+
+        assert await runtime.prune(now=stored + timedelta(days=1, minutes=1)) is True
+        assert (await _count_events(database), await _count_alerts(database)) == (0, 0)
+        assert runtime.snapshot().retention_deleted == {"events": 5, "alerts": 3}
+
+    @pytest.mark.security
+    async def test_a_forged_old_timestamp_does_not_expire_evidence(
+        self, database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        # Retention counts from when Sentinel stored a record. The event's own
+        # timestamp comes from the host (a syslog line an attacker can write),
+        # so measuring from it would let a forged date delete the evidence.
+        forged = make_event(timestamp=datetime(2001, 1, 1, tzinfo=UTC))
+        async with database.session() as session:
+            await Repository(session).save_batch(events=[forged])
+        runtime = Runtime(
+            make_api_settings(retention_days=1), database=database, metrics=Metrics(), rules=rules
+        )
+        assert await runtime.prune() is True
+        assert await _count_events(database) == 1
+
+    async def test_large_backlogs_are_deleted_in_bounded_batches(
+        self,
+        database: Database,
+        rules: tuple[Rule, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(runtime_module, "_PRUNE_BATCH", 2)
+        batches: list[tuple[int, int]] = []
+        original = Repository.delete_stored_before
+
+        async def spy(self: Repository, cutoff: datetime, *, limit: int) -> tuple[int, int]:
+            deleted = await original(self, cutoff, limit=limit)
+            batches.append(deleted)
+            return deleted
+
+        monkeypatch.setattr(Repository, "delete_stored_before", spy)
+        await _store(database, events=5, alerts=3)
+        runtime = Runtime(
+            make_api_settings(retention_days=1), database=database, metrics=Metrics(), rules=rules
+        )
+        assert await runtime.prune(now=datetime.now(tz=UTC) + timedelta(days=2)) is True
+        assert batches == [(2, 2), (2, 1), (1, 0)]  # one short transaction each
+        assert await _count_events(database) == 0
+
+    async def test_a_failed_prune_is_reported_and_retried_later(
+        self, unreachable_database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        runtime = Runtime(
+            make_api_settings(retention_days=1),
+            database=unreachable_database,
+            metrics=Metrics(),
+            rules=rules,
+        )
+        with structlog.testing.capture_logs() as logs:
+            assert await runtime.prune() is False
+        assert [entry["error"] for entry in logs if entry["event"] == "runtime.prune_failed"] == [
+            "OperationalError"
+        ]
+
+    async def test_runs_at_start_up_and_never_delays_shutdown(
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await _store(database, events=3, alerts=0)
+        # Everything stored so far is already past a one-day retention.
+        later = datetime.now(tz=UTC) + timedelta(days=2)
+        original = Runtime.prune
+
+        async def prune_later(self: Runtime, *, now: datetime | None = None) -> bool:
+            return await original(self, now=now or later)
+
+        monkeypatch.setattr(Runtime, "prune", prune_later)
+        metrics = Metrics()
+        runtime = Runtime(
+            make_api_settings(retention_days=1),
+            database=database,
+            metrics=metrics,
+            rules=rules,
+            collectors=[_Replay([])],
+            sinks=[],
+        )
+        runtime.start()
+        assert await _wait_for(lambda: runtime.snapshot().retention_deleted["events"] == 3)
+        await asyncio.wait_for(runtime.stop(), timeout=2)  # not after the hourly sleep
+        body = metrics.render().decode()
+        assert 'sentinel_retention_deleted_total{kind="events"} 3.0' in body
+
+    async def test_disabled_by_default(self, database: Database, rules: tuple[Rule, ...]) -> None:
+        await _store(database, events=2, alerts=0)
+        runtime = Runtime(make_api_settings(), database=database, metrics=Metrics(), rules=rules)
+        assert await runtime.prune(now=datetime.now(tz=UTC) + timedelta(days=36_500)) is True
+        assert await _count_events(database) == 2
 
 
 class TestGetApp:

@@ -214,6 +214,14 @@ class Settings(BaseSettings):
         description="Records held for retry while the database is unavailable; beyond "
         "this the oldest are dropped and counted. Must be >= persist_batch_size.",
     )
+    retention_days: int | None = Field(
+        default=None,
+        ge=1,
+        le=36_500,
+        description="Delete stored events and alerts this many days after they were "
+        "written (checked hourly). Unset = keep everything. Auth events carry user names "
+        "and source addresses: keep them no longer than investigations need.",
+    )
     persist_write_timeout_seconds: float = Field(
         default=10.0,
         gt=0.0,

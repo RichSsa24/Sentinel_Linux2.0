@@ -39,6 +39,11 @@ that the oldest are dropped and counted, as is anything unwritten at shutdown.
 The costs are bounded staleness in the read API (about one flush interval) and,
 on a hard kill, losing what was buffered — events that were only in memory
 anyway.
+
+**Retention.** With ``retention_days`` set, a background task deletes events
+and alerts stored longer than that, at start-up and then hourly, in batches
+of ``_PRUNE_BATCH`` rows per transaction so the writer is never locked out
+for long.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ import asyncio
 import contextlib
 import socket
 from collections.abc import Callable, Iterable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 
@@ -81,6 +87,9 @@ _PROC: Final[Path] = Path("/proc")
 _SMTPS_PORT: Final[int] = 465
 # Cap on the retry backoff while the database is failing.
 _MAX_RETRY_BACKOFF_S: Final[float] = 30.0
+# Retention: how often expired rows are deleted, and how many per transaction.
+_PRUNE_INTERVAL_S: Final[float] = 3600.0
+_PRUNE_BATCH: Final[int] = 5000
 # SQLSTATE classes meaning "the database rejects this data", not "the database
 # is unavailable": 22 data exception, 23 integrity constraint violation.
 _REJECTED_SQLSTATE_CLASSES: Final[frozenset[str]] = frozenset({"22", "23"})
@@ -332,6 +341,12 @@ class Runtime:
         self._alerts_unpersisted = 0
         self._persist_failures = 0
         self._persist_failing = False
+        self._retention = (
+            timedelta(days=settings.retention_days) if settings.retention_days else None
+        )
+        self._pruner: asyncio.Task[None] | None = None
+        self._stop_pruning = asyncio.Event()
+        self._pruned = {"events": 0, "alerts": 0}
         # Last: a registry may call snapshot() during registration.
         metrics.observe_runtime(self.snapshot)
 
@@ -355,11 +370,14 @@ class Runtime:
         self._task = asyncio.create_task(self._pipeline.run(), name="sentinel.runtime")
         self._task.add_done_callback(self._on_pipeline_exit)
         self._flusher = asyncio.create_task(self._flush_periodically(), name="sentinel.flusher")
+        if self._retention is not None:
+            self._pruner = asyncio.create_task(self._prune_periodically(), name="sentinel.pruner")
         self._log.info(
             "runtime.started",
             collectors=[collector.name for collector in self._collectors],
             rules=len(self._engine.rules),
             sinks=[sink.name for sink in self._alerts.sinks],
+            retention_days=self._retention.days if self._retention else None,
         )
 
     @property
@@ -384,6 +402,9 @@ class Runtime:
         Shutdown is bounded even if the database hangs: the write in flight
         and the final one each end at ``persist_write_timeout_seconds``.
         """
+        if self._pruner is not None:
+            self._stop_pruning.set()  # a running prune stops after its current batch
+            await self._pruner
         if self._task is not None:
             await self._pipeline.stop()
             await asyncio.wait({self._task})
@@ -541,6 +562,49 @@ class Runtime:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stop_flushing.wait(), timeout=delay)
 
+    async def prune(self, *, now: datetime | None = None) -> bool:
+        """Delete events and alerts stored longer than the retention period.
+
+        Works in batches of ``_PRUNE_BATCH`` rows, yielding in between, until
+        nothing expired is left or shutdown begins. Returns False if a batch
+        failed; that is logged by exception type and the next run retries.
+        """
+        if self._retention is None:
+            return True
+        cutoff = (now or datetime.now(tz=UTC)) - self._retention
+        deleted = {"events": 0, "alerts": 0}
+        complete = True
+        while not self._stop_pruning.is_set():
+            try:
+                async with (
+                    asyncio.timeout(self._write_timeout),
+                    self._database.session() as session,
+                ):
+                    events, alerts = await Repository(session).delete_stored_before(
+                        cutoff, limit=_PRUNE_BATCH
+                    )
+            except Exception as exc:
+                self._log.error("runtime.prune_failed", error=type(exc).__name__)
+                complete = False
+                break
+            deleted["events"] += events
+            deleted["alerts"] += alerts
+            if events < _PRUNE_BATCH and alerts < _PRUNE_BATCH:
+                break
+            await asyncio.sleep(0)  # let the flusher and the API in between batches
+        for kind, count in deleted.items():
+            self._pruned[kind] += count
+        if deleted["events"] or deleted["alerts"]:
+            self._log.info("runtime.pruned", cutoff=cutoff.isoformat(), **deleted)
+        return complete
+
+    async def _prune_periodically(self) -> None:
+        """Prune at start-up, then every ``_PRUNE_INTERVAL_S`` until stopped."""
+        while not self._stop_pruning.is_set():
+            await self.prune()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_pruning.wait(), timeout=_PRUNE_INTERVAL_S)
+
     def _trim_pending(self) -> None:
         """Enforce the buffer cap by dropping (and counting) the oldest records."""
         excess_events = len(self._pending_events) - self._max_pending
@@ -592,6 +656,7 @@ class Runtime:
                 "alerts": len(self._pending_alerts),
             },
             persist_failures=self._persist_failures,
+            retention_deleted=dict(self._pruned),
             pipeline_up=self.running,
             collector_restarts=self._pipeline.collector_restarts,
         )

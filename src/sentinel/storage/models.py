@@ -61,7 +61,8 @@ class EventRow(Base):
     host: Mapped[str] = mapped_column(String(253))
     source_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     message: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow)
+    # Insertion time, which retention is measured against (indexed for it).
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, index=True)
 
     __table_args__ = (Index("ix_events_occurred_at_id", "occurred_at", "id"),)
 
@@ -83,6 +84,6 @@ class AlertRow(Base):
     summary: Mapped[str] = mapped_column(Text)
     # False when the throttle withheld the notification (the alert is kept).
     notified: Mapped[bool] = mapped_column(Boolean, server_default=true())
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, index=True)
 
     __table_args__ = (Index("ix_alerts_occurred_at_id", "occurred_at", "id"),)

@@ -11,8 +11,10 @@ scan). Every query is built with SQLAlchemy expressions and bound parameters
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import datetime
+from typing import Any, cast
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import CursorResult, delete, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinel.alerting.model import Alert
@@ -89,6 +91,26 @@ class Repository:
             return 0
         await self._session.commit()
         return len(event_values) + len(alert_values)
+
+    async def delete_stored_before(self, cutoff: datetime, *, limit: int) -> tuple[int, int]:
+        """Delete up to ``limit`` events and ``limit`` alerts stored before ``cutoff``.
+
+        Returns how many events and alerts were deleted. The bound keeps each
+        transaction, and SQLite's write lock, short; callers repeat until a
+        batch comes back short. Insertion time, not ``occurred_at``, decides:
+        an event's own timestamp comes from the host and can be forged.
+        """
+        deleted: list[int] = []
+        for model in (EventRow, AlertRow):
+            expired = select(model.id).where(model.created_at < cutoff).limit(limit)
+            result = await self._session.execute(
+                delete(model)
+                .where(model.id.in_(expired))
+                .execution_options(synchronize_session=False)
+            )
+            deleted.append(cast("CursorResult[Any]", result).rowcount)
+        await self._session.commit()
+        return deleted[0], deleted[1]
 
     async def list_events(self, *, limit: int, before_id: int | None = None) -> list[EventRow]:
         stmt = select(EventRow).order_by(EventRow.id.desc()).limit(limit)
