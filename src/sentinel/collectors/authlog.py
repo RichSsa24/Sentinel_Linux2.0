@@ -369,50 +369,51 @@ class AuthLogCollector(AbstractCollector):
         has just been drained, so the new one is opened from its start. A size
         below the read offset on the same inode means it was truncated in place.
         """
-        if self._handle is None and not self._open():
+        handle = self._handle if self._handle is not None else self._open()
+        if handle is None:
             return []
-        assert self._handle is not None  # noqa: S101 — narrowed for the type checker
-        chunk = self._handle.read(_MAX_READ)
-        self._pos = self._handle.tell()
+        chunk = handle.read(_MAX_READ)
+        self._pos = handle.tell()
         lines = self._split(chunk)
         if len(chunk) < _MAX_READ:
-            lines += self._follow_rotation()
+            lines += self._follow_rotation(handle)
         return lines
 
-    def _open(self) -> bool:
+    def _open(self) -> IO[bytes] | None:
+        """Open the log at the current offset (or its end, the first time); None if absent."""
         try:
-            self._handle = self._path.open("rb")
+            handle = self._path.open("rb")
         except FileNotFoundError:
             self._skip_history = False  # a file that appears later is all new
             self._mark_source(False, path=str(self._path), hint=_MISSING_HINT)
-            return False
+            return None
+        self._handle = handle
         if not self._skip_history:
-            self._handle.seek(self._pos)
-            return True
+            handle.seek(self._pos)
+            return handle
         self._skip_history = False
-        self._pos = self._handle.seek(0, os.SEEK_END)
+        self._pos = handle.seek(0, os.SEEK_END)
         if self._pos:
-            self._handle.seek(self._pos - 1)
+            handle.seek(self._pos - 1)
             # Ending mid-line: the rest of that line is history too.
-            self._discarding = self._handle.read(1) != b"\n"
+            self._discarding = handle.read(1) != b"\n"
         self._log.info("authlog.started_at_end", path=str(self._path), skipped_bytes=self._pos)
-        return True
+        return handle
 
-    def _follow_rotation(self) -> list[str]:
-        """At end of file: switch to a rotated-in file or rewind a truncated one."""
-        assert self._handle is not None  # noqa: S101 — only called with an open file
+    def _follow_rotation(self, handle: IO[bytes]) -> list[str]:
+        """At the end of ``handle``: switch to a rotated-in file or rewind a truncated one."""
         try:
             current = self._path.stat()
         except FileNotFoundError:
             return []  # renamed away, successor not created yet: keep the old one
-        opened = os.fstat(self._handle.fileno())
+        opened = os.fstat(handle.fileno())
         if (current.st_ino, current.st_dev) != (opened.st_ino, opened.st_dev):
             tail = self._flush_partial()
             self._close()
             self._pos = 0
-            return tail + (self._read_new_lines() if self._open() else [])
+            return tail + self._read_new_lines()  # the new file, from its start
         if current.st_size < self._pos:
-            self._handle.seek(0)
+            handle.seek(0)
             self._pos = 0
             self._buf = b""
             self._discarding = False

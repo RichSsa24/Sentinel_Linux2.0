@@ -92,7 +92,7 @@ class TestSettingsValidation:
     @pytest.mark.parametrize(
         ("url", "reason"),
         [
-            ("postgresql://sentinel:dbsecret@db/sentinel", "postgresql://"),
+            ("postgresql://u:dbsecret@db/x", "postgresql://"),  # pragma: allowlist secret
             ("sqlite:///./sentinel.db", "sqlite://"),
             ("not a url ://dbsecret", "not a valid SQLAlchemy URL"),
         ],
