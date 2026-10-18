@@ -58,7 +58,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
-from sentinel.collectors.base import AbstractCollector
+from sentinel.collectors.base import AbstractCollector, os_text
 from sentinel.logging import get_logger
 from sentinel.normalizer import Normalizer, RawProcessEvent
 
@@ -258,7 +258,7 @@ class ProcessCollector(AbstractCollector):
     def _read_exe(self, base: Path) -> str | None:
         """Resolve the /proc/<pid>/exe symlink target, or None if unavailable."""
         with contextlib.suppress(OSError):
-            return str((base / "exe").readlink())
+            return os_text(str((base / "exe").readlink()))
         return None
 
     # ------------------------------------------------------------------ diffing

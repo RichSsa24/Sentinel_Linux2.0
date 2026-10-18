@@ -28,7 +28,7 @@ the way. Residual risks are listed explicitly at the end.
 
 | Boundary | Treated as | Control |
 | --- | --- | --- |
-| Host → collectors | hostile bytes | length caps, strict parsers that reject rather than coerce, dead-lettering (`collectors/`, `normalizer/`) |
+| Host → collectors | hostile bytes | length caps, strict parsers that reject rather than coerce, file and executable names that are not valid UTF-8 escaped as `\xNN` (not a crash), dead-lettering (`collectors/`, `normalizer/`) |
 | Rule files → engine | untrusted configuration | `yaml.safe_load`, strict schema, closed operator set, regex timeout, fail-closed loader (`detection/`) |
 | Network → API | untrusted clients | default-deny bearer auth, rate limit, generic errors, no OpenAPI/docs surface (`api/`) |
 | Sentinel → webhook/SMTP | hostile network | HTTPS/TLS only, HMAC signing, SSRF guard (`alerting/sinks/`) |

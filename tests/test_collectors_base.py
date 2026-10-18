@@ -14,11 +14,12 @@ test:
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
 
-from sentinel.collectors.base import AbstractCollector, under_host_root
+from sentinel.collectors.base import AbstractCollector, os_text, under_host_root
 from sentinel.pipeline.queue import BoundedEventQueue
 
 
@@ -126,3 +127,17 @@ class TestUnderHostRoot:
 
     def test_relative_paths_pass_through(self) -> None:
         assert under_host_root(Path("/host"), Path("local/dir")) == Path("local/dir")
+
+
+class TestOsText:
+    @pytest.mark.parametrize("name", ["/etc/passwd", "/srv/año/café", "/tmp/emoji-\U0001f600"])
+    def test_valid_names_are_unchanged(self, name: str) -> None:
+        assert os_text(name) == name
+
+    def test_undecodable_bytes_become_escapes(self) -> None:
+        name = os.fsdecode(b"/tmp/evil\xff\xfe")  # how Python hands such a name over
+        assert os_text(name) == "/tmp/evil\\xff\\xfe"
+
+    @pytest.mark.parametrize("name", [os.fsdecode(b"/x/\xff"), "/x/\ud800", "/x/\udfff\ud83d"])
+    def test_result_is_always_valid_utf8(self, name: str) -> None:
+        os_text(name).encode("utf-8")  # strict: raises on any lone surrogate

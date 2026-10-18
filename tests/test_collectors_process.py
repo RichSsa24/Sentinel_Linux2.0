@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -263,6 +264,22 @@ class TestScanning:
 
         assert len(events) == 1
         assert events[0].process.executable == "/usr/bin/python3"
+
+    @pytest.mark.security
+    @pytest.mark.asyncio
+    async def test_a_binary_with_an_undecodable_name_cannot_crash_the_collector(
+        self, tmp_path: Path
+    ) -> None:
+        # Regression: any local user could run a binary named with non-UTF-8
+        # bytes; its exe path failed event validation, the collector raised and
+        # the pipeline (every collector) stopped.
+        collector = _collector(tmp_path)
+        await _drain(collector)
+        _mkproc(tmp_path, 71, comm="x")
+        (tmp_path / "71" / "exe").symlink_to(os.fsdecode(b"/tmp/evil\xff"))
+        events = await _drain(collector)
+
+        assert [e.process.executable for e in events] == ["/tmp/evil\\xff"]
 
 
 class TestDeadLetter:

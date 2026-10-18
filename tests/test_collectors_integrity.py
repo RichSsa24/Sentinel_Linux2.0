@@ -324,6 +324,22 @@ class TestScanning:
         events = await _drain(collector)
         assert [e.event.action for e in events] == ["file_modified"]
 
+    @pytest.mark.security
+    @pytest.mark.asyncio
+    async def test_a_file_with_an_undecodable_name_cannot_crash_the_collector(
+        self, tmp_path: Path
+    ) -> None:
+        # Regression: a file named with non-UTF-8 bytes in a watched path failed
+        # event validation; the collector raised and the pipeline stopped.
+        collector = _collector(tmp_path)
+        await _drain(collector)
+        (tmp_path / os.fsdecode(b"evil\xff")).write_bytes(b"x")
+        events = await _drain(collector)
+
+        assert [e.event.action for e in events] == ["file_created"]
+        assert events[0].file is not None
+        assert events[0].file.path.endswith("/evil\\xff")
+
     @pytest.mark.asyncio
     async def test_subdirectories_are_not_tracked_as_files(self, tmp_path: Path) -> None:
         (tmp_path / "sub").mkdir()

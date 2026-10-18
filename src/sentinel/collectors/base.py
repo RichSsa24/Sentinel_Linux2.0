@@ -49,6 +49,21 @@ def under_host_root(host_root: Path, host_path: Path) -> Path:
     return host_root / host_path.relative_to(host_path.anchor)
 
 
+def os_text(value: str) -> str:
+    """Make a string that came from the OS (a file name, a symlink target) valid UTF-8.
+
+    Linux names are bytes. Python decodes bytes that are not UTF-8 to lone
+    surrogates, which strict consumers (event validation, JSON, the database)
+    reject, so a file or binary named with such bytes would crash a collector,
+    and with it the pipeline. They are rewritten as ``\\xNN`` escapes instead.
+    """
+    try:
+        raw = value.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:  # a lone surrogate the OS layer did not produce
+        raw = value.encode("utf-8", "surrogatepass")
+    return raw.decode("utf-8", "backslashreplace")
+
+
 class AbstractCollector(abc.ABC):
     """Base class for every event source.
 

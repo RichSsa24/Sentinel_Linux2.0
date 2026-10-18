@@ -58,7 +58,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
-from sentinel.collectors.base import AbstractCollector, under_host_root
+from sentinel.collectors.base import AbstractCollector, os_text, under_host_root
 from sentinel.logging import get_logger
 from sentinel.normalizer import Normalizer, RawFileEvent
 
@@ -322,7 +322,7 @@ class FileIntegrityCollector(AbstractCollector):
             host=self._host,
             action=action,
             severity=severity,
-            path=path,
+            path=os_text(path),
             size=state.size,
             mode=f"{state.mode:04o}",
             sha256=state.sha256,
