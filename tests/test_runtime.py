@@ -122,16 +122,19 @@ async def _count_events(database: Database) -> int:
         return await Repository(session).count_events()
 
 
-class _HungDatabase:
-    """A database that accepts a connection and then never answers (a partition)."""
+@contextlib.asynccontextmanager
+async def _partitioned_session() -> AsyncIterator[Any]:
+    """A database session on a partitioned network, as SQLAlchemy's asyncpg adapter has it.
 
-    @contextlib.asynccontextmanager
-    async def session(self) -> AsyncIterator[Any]:
+    The query never answers, and when it is cancelled the adapter closes the
+    connection inside asyncio.shield — which never answers either, so
+    asyncio.timeout around the call cannot end it.
+    """
+    try:
         await asyncio.Event().wait()
         yield None  # pragma: no cover - never reached
-
-    async def dispose(self) -> None:
-        return None
+    finally:
+        await asyncio.shield(asyncio.Event().wait())
 
 
 class _Crashing(AbstractCollector):
@@ -777,6 +780,31 @@ class TestWriteBehind:
         failures = [entry for entry in logs if entry["event"] == "runtime.persist_failed"]
         assert {entry["error"] for entry in failures} == {"TimeoutError"}
 
+    async def test_a_partitioned_database_cannot_hold_writes_or_shutdown(
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: the write deadline only held when cancelling the write was
+        # clean. Against a partitioned PostgreSQL the driver's shielded cleanup
+        # never ended: a 1 s deadline still hung after 60 s, and stop() with it.
+        monkeypatch.setattr(database, "session", _partitioned_session)
+        runtime = Runtime(
+            make_api_settings(
+                persist_batch_size=1,
+                persist_flush_interval_seconds=0.01,
+                persist_write_timeout_seconds=0.05,
+            ),
+            database=database,
+            metrics=Metrics(),
+            rules=rules,
+            collectors=[_Replay(_events(2))],
+            sinks=[],
+        )
+        runtime.start()
+        assert await _wait_for(lambda: not runtime.persisting)
+        assert runtime.snapshot().persist_failures >= 1
+        await asyncio.wait_for(runtime.stop(), timeout=2)
+        assert runtime.snapshot().dropped["persist_error"] == 2  # lost, and counted
+
     async def test_persistence_health_recovers_with_the_database(
         self,
         database: Database,
@@ -960,13 +988,13 @@ class TestAppLifespan:
             assert (await client.get("/readyz")).status_code == 200
 
     async def test_readyz_answers_while_the_database_hangs(
-        self, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Regression: the probe waited on a hung database for as long as the
         # driver did (asyncpg: 60 s), far past the healthcheck's own timeout.
         monkeypatch.setattr(app_module, "_READY_TIMEOUT_S", 0.05)
-        hung: Any = _HungDatabase()
-        app = create_app(make_api_settings(), database=hung, metrics=Metrics(), rules=rules)
+        monkeypatch.setattr(database, "session", _partitioned_session)
+        app = create_app(make_api_settings(), database=database, metrics=Metrics(), rules=rules)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
             resp = await asyncio.wait_for(client.get("/readyz"), timeout=2)
@@ -1100,6 +1128,18 @@ class TestRetention:
         await asyncio.wait_for(runtime.stop(), timeout=2)  # not after the hourly sleep
         body = metrics.render().decode()
         assert 'sentinel_retention_deleted_total{kind="events"} 3.0' in body
+
+    async def test_a_partitioned_database_cannot_hold_a_prune(
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(database, "session", _partitioned_session)
+        runtime = Runtime(
+            make_api_settings(retention_days=1, persist_write_timeout_seconds=0.05),
+            database=database,
+            metrics=Metrics(),
+            rules=rules,
+        )
+        assert await asyncio.wait_for(runtime.prune(), timeout=2) is False
 
     async def test_disabled_by_default(self, database: Database, rules: tuple[Rule, ...]) -> None:
         await _store(database, events=2, alerts=0)

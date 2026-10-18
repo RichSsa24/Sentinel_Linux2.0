@@ -217,11 +217,11 @@ class TestErrorHandling:
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             responses = await asyncio.gather(*(client.get("/readyz") for _ in range(20)))
             assert {resp.status_code for resp in responses} == {200}
-            assert sessions == 2  # one check: reachability, then the schema
+            assert sessions == 1  # one check: reachability, then the schema, one session
 
             monkeypatch.setattr(app_module, "_READY_CACHE_S", 0.0)
             await client.get("/readyz")
-            assert sessions == 4  # an expired result is checked again
+            assert sessions == 2  # an expired result is checked again
 
     @pytest.mark.security
     async def test_unhandled_error_is_generic_500(

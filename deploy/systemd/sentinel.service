@@ -40,8 +40,8 @@ ExecStart=/opt/sentinel/.venv/bin/sentinel serve --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
 # SIGTERM drains the queue and writes what is buffered; each database write is
-# bounded by SENTINEL_PERSIST_WRITE_TIMEOUT_SECONDS (10 s) and alert delivery
-# by 10 s, so this is the worst case with margin, not a typical stop.
+# bounded by SENTINEL_PERSIST_WRITE_TIMEOUT_SECONDS (10 s), alert delivery by
+# 10 s and closing the pool by 5 s, so this is the worst case with margin.
 TimeoutStopSec=45
 
 # Sandbox (systemd.exec(5)): a read-only system, writes only to the state

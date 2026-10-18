@@ -17,6 +17,7 @@ from pathlib import Path
 import yaml
 
 from sentinel.alerting.manager import AlertManager
+from sentinel.storage import Database
 from tests.conftest import make_api_settings
 
 _DEPLOY = Path(__file__).resolve().parent.parent / "deploy"
@@ -36,9 +37,11 @@ def _seconds(value: str) -> float:
 
 
 def _worst_case_shutdown_s() -> float:
-    """The write in flight and the final write, then the alert drain."""
+    """The write in flight and the final write, the alert drain, then closing the pool."""
     drain = inspect.signature(AlertManager.aclose).parameters["drain_timeout"].default
-    return 2 * make_api_settings().persist_write_timeout_seconds + float(drain)
+    dispose = inspect.signature(Database.dispose).parameters["max_wait"].default
+    writes = 2 * make_api_settings().persist_write_timeout_seconds
+    return writes + float(drain) + float(dispose)
 
 
 def test_supervisors_wait_out_a_worst_case_shutdown() -> None:

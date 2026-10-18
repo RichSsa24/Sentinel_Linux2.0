@@ -486,12 +486,15 @@ class Runtime:
     ) -> Exception | None:
         """Write records in one transaction; return the failure instead of raising.
 
-        The deadline turns a database that stops answering into an ordinary
-        failure (TimeoutError), retried like any outage.
+        The deadline (see :meth:`Database.run`) turns a database that stops
+        answering into an ordinary failure (TimeoutError), retried like any
+        outage — even when the driver's own cleanup of the call never ends.
         """
         try:
-            async with asyncio.timeout(self._write_timeout), self._database.session() as session:
-                await Repository(session).save_batch(events=events, alerts=alerts)
+            await self._database.run(
+                lambda session: Repository(session).save_batch(events=events, alerts=alerts),
+                max_wait=self._write_timeout,
+            )
         except Exception as exc:
             return exc
         return None
@@ -582,13 +585,12 @@ class Runtime:
         complete = True
         while not self._stop_pruning.is_set():
             try:
-                async with (
-                    asyncio.timeout(self._write_timeout),
-                    self._database.session() as session,
-                ):
-                    events, alerts = await Repository(session).delete_stored_before(
+                events, alerts = await self._database.run(
+                    lambda session: Repository(session).delete_stored_before(
                         cutoff, limit=_PRUNE_BATCH
-                    )
+                    ),
+                    max_wait=self._write_timeout,
+                )
             except Exception as exc:
                 self._log.error("runtime.prune_failed", error=type(exc).__name__)
                 complete = False

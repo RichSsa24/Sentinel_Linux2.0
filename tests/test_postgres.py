@@ -11,6 +11,8 @@ by the migrations (the production path) and removed afterwards.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
@@ -22,7 +24,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, make_url
 from structlog.testing import capture_logs
 
 from sentinel.api import create_app
@@ -127,3 +129,88 @@ async def test_the_api_is_ready_on_a_migrated_database(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         assert (await client.get("/readyz")).status_code == 200
+
+
+class _FreezableProxy:
+    """A TCP proxy in front of PostgreSQL that can stop forwarding.
+
+    Frozen, it holds every byte without resetting a connection — what a
+    network partition (a dropped route, a firewall that drops) looks like to
+    the client, as opposed to a refused or reset connection.
+    """
+
+    def __init__(self, host: str, port: int) -> None:
+        self._upstream = (host, port)
+        self._flowing = asyncio.Event()
+        self._flowing.set()
+        self._server: asyncio.Server | None = None
+        self._writers: list[asyncio.StreamWriter] = []
+
+    def freeze(self) -> None:
+        self._flowing.clear()
+
+    def thaw(self) -> None:
+        self._flowing.set()
+
+    async def start(self) -> int:
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        return int(self._server.sockets[0].getsockname()[1])
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+        for writer in self._writers:
+            writer.close()
+
+    async def _handle(self, client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter) -> None:
+        server_r, server_w = await asyncio.open_connection(*self._upstream)
+        self._writers += [client_w, server_w]
+        await asyncio.gather(self._pipe(client_r, server_w), self._pipe(server_r, client_w))
+
+    async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(Exception):
+            while data := await reader.read(65536):
+                await self._flowing.wait()
+                writer.write(data)
+                await writer.drain()
+
+
+async def test_a_network_partition_cannot_hold_writes_readiness_or_shutdown(
+    migrated: None, rules: tuple[Rule, ...]
+) -> None:
+    # Regression: on cancellation SQLAlchemy's asyncpg adapter closes the
+    # connection inside asyncio.shield. Over a partition that never ended, so
+    # a write with a 1 s deadline was still running after 60 s and stop()
+    # with it, and readiness kept reporting writes as healthy.
+    target = make_url(_URL)
+    proxy = _FreezableProxy(target.host or "127.0.0.1", target.port or 5432)
+    port = await proxy.start()
+    proxied = target.set(host="127.0.0.1", port=port).render_as_string(hide_password=False)
+    database = Database(proxied)
+    runtime = Runtime(
+        make_api_settings(database_url=proxied, persist_write_timeout_seconds=1.0),
+        database=database,
+        metrics=Metrics(),
+        rules=rules,
+        sinks=[],
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        await runtime._consume(make_event(event_id="1" * 64))
+        assert await runtime.flush() is True  # the connection is pooled and healthy
+
+        proxy.freeze()
+        await runtime._consume(make_event(event_id="2" * 64))
+        started = loop.time()
+        assert await runtime.flush() is False
+        assert loop.time() - started < 3  # the 1 s deadline, not the driver's cleanup
+        assert not runtime.persisting
+        assert runtime.snapshot().persist_buffered["events"] == 1  # kept for the retry
+
+        started = loop.time()
+        await runtime.stop()
+        await database.dispose(max_wait=1)
+        assert loop.time() - started < 5
+    finally:
+        proxy.thaw()
+        await proxy.close()

@@ -48,8 +48,8 @@ services:
     pids_limit: 128
     # Drain the queue and flush buffered events before Docker sends SIGKILL.
     # Worst case (database hung): the write in flight and a final write, each
-    # bounded by SENTINEL_PERSIST_WRITE_TIMEOUT_SECONDS (10 s), plus up to
-    # 10 s draining alert notifications.
+    # bounded by SENTINEL_PERSIST_WRITE_TIMEOUT_SECONDS (10 s), up to 10 s
+    # draining alert notifications and 5 s closing the connection pool.
     stop_grace_period: 45s
     environment:
       SENTINEL_API_KEY: ${SENTINEL_API_KEY:?set SENTINEL_API_KEY in deploy/.env}

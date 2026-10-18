@@ -37,6 +37,7 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 
@@ -144,8 +145,9 @@ class _DatabaseProbe:
             now = self._clock()
             if self._checked_at is None or now - self._checked_at >= _READY_CACHE_S:
                 try:
-                    async with asyncio.timeout(_READY_TIMEOUT_S):
-                        self._problem = await _database_problem(self._database)
+                    self._problem = await self._database.run(
+                        _database_problem, max_wait=_READY_TIMEOUT_S
+                    )
                 except TimeoutError:
                     self._problem = "database not responding"
                 self._checked_at = self._clock()
@@ -166,18 +168,16 @@ async def _not_ready_reason(runtime: Runtime | None, database: _DatabaseProbe) -
     return None
 
 
-async def _database_problem(database: Database) -> str | None:
+async def _database_problem(session: AsyncSession) -> str | None:
     """Why the database cannot serve the runtime, or None if it can."""
     try:
-        async with database.session() as session:
-            await session.execute(text("SELECT 1"))
+        await session.execute(text("SELECT 1"))
     except Exception:
         return "database not reachable"
     try:
         # Reachable is not enough: without the schema every write fails.
-        async with database.session() as session:
-            await session.execute(select(EventRow.id).limit(1))
-            await session.execute(select(AlertRow.id).limit(1))
+        await session.execute(select(EventRow.id).limit(1))
+        await session.execute(select(AlertRow.id).limit(1))
     except Exception:
         return "database schema missing; run `alembic upgrade head`"
     return None

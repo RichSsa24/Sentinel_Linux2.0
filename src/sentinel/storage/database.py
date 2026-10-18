@@ -22,12 +22,13 @@ holds — and its ``-wal`` and ``-shm`` files copy the database file's mode.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeVar
 
 from sqlalchemy import event, make_url
 from sqlalchemy.engine.interfaces import DBAPIConnection
@@ -43,6 +44,9 @@ from sentinel.storage.models import Base
 
 _log = get_logger("sentinel.storage")
 _PRIVATE_MODE: Final[int] = 0o600
+_DISPOSE_TIMEOUT_S: Final[float] = 5.0
+
+_T = TypeVar("_T")
 
 _SQLITE_PRAGMAS: Final[tuple[str, ...]] = (
     "PRAGMA journal_mode=WAL",
@@ -105,6 +109,8 @@ class Database:
         self._sessionmaker: async_sessionmaker[AsyncSession] = async_sessionmaker(
             self._engine, expire_on_commit=False
         )
+        # Calls given up on by run(), kept referenced until their cleanup ends.
+        self._abandoned: set[asyncio.Task[object]] = set()
 
     @property
     def engine(self) -> AsyncEngine:
@@ -122,6 +128,52 @@ class Database:
         async with self._sessionmaker() as session:
             yield session
 
-    async def dispose(self) -> None:
-        """Release the engine's connection pool."""
-        await self._engine.dispose()
+    async def run(self, work: Callable[[AsyncSession], Awaitable[_T]], *, max_wait: float) -> _T:
+        """Run ``work`` in its own session; raise TimeoutError after ``max_wait`` seconds.
+
+        ``asyncio.timeout`` alone cannot bound a database call. Cancelling one
+        makes SQLAlchemy's asyncpg adapter close the connection inside
+        ``asyncio.shield`` (a graceful close and a cancel request), and on a
+        partitioned network that cleanup never ends: measured, a write with a
+        1 s deadline was still running after 60 s and held shutdown with it.
+        Here the call runs in a task of its own; past the deadline it is
+        cancelled and left to finish its cleanup in the background, and the
+        caller gets TimeoutError on time.
+        """
+
+        async def call() -> _T:
+            async with self.session() as session:
+                return await work(session)
+
+        task: asyncio.Task[_T] = asyncio.create_task(call())
+        try:
+            done, _ = await asyncio.wait({task}, timeout=max_wait)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if done:
+            return task.result()
+        self._abandon(task)
+        raise TimeoutError
+
+    def _abandon(self, task: asyncio.Task[_T]) -> None:
+        task.cancel()
+        self._abandoned.add(task)  # kept referenced (asyncio holds tasks weakly)
+        task.add_done_callback(self._forget)
+
+    def _forget(self, task: asyncio.Task[object]) -> None:
+        self._abandoned.discard(task)
+        if not task.cancelled():
+            task.exception()  # the caller already failed; nothing more to report
+
+    async def dispose(self, max_wait: float = _DISPOSE_TIMEOUT_S) -> None:
+        """Release the engine's connection pool, giving up after ``max_wait`` seconds.
+
+        Closing a connection waits for the server to acknowledge it; at
+        shutdown an unreachable database must not keep the process alive.
+        """
+        task = asyncio.create_task(self._engine.dispose())
+        done, _ = await asyncio.wait({task}, timeout=max_wait)
+        if not done:
+            self._abandon(task)
+            _log.warning("storage.dispose_timed_out", max_wait_s=max_wait)

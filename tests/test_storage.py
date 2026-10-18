@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 from collections.abc import Iterator
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
 from sentinel.storage import Database, Repository
@@ -236,3 +238,50 @@ class TestDatabaseFilePermissions:
     def test_an_uncreatable_path_is_left_for_sqlite_to_report(self, tmp_path: Path) -> None:
         create_private_sqlite_file(f"sqlite+aiosqlite:///{tmp_path / 'missing' / 'x.db'}")
         assert not (tmp_path / "missing").exists()
+
+
+class TestBoundedCalls:
+    """Database.run and dispose end on time even when the database never answers."""
+
+    async def test_run_gives_up_on_a_call_whose_cleanup_never_ends(self, tmp_path: Path) -> None:
+        database = Database(f"sqlite+aiosqlite:///{tmp_path / 'x.db'}")
+
+        async def partitioned(_session: object) -> None:
+            try:
+                await asyncio.Event().wait()  # the query never answers
+            finally:
+                await asyncio.shield(asyncio.Event().wait())  # nor does the shielded close
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(TimeoutError):
+            await database.run(partitioned, max_wait=0.05)
+        assert loop.time() - started < 1
+        await database.dispose()
+
+    async def test_run_returns_the_result_and_its_errors(self, database: Database) -> None:
+        async def count(session: AsyncSession) -> int:
+            return await Repository(session).count_events()
+
+        async def failing(_session: object) -> None:
+            raise ValueError("bad row")
+
+        assert await database.run(count, max_wait=5) == 0
+        with pytest.raises(ValueError, match="bad row"):
+            await database.run(failing, max_wait=5)
+
+    async def test_dispose_gives_up_on_a_database_that_never_answers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        database = Database(f"sqlite+aiosqlite:///{tmp_path / 'x.db'}")
+        real_engine = database.engine
+
+        class _Unreachable:
+            async def dispose(self) -> None:
+                await asyncio.shield(asyncio.Event().wait())
+
+        monkeypatch.setattr(database, "_engine", _Unreachable())
+        with capture_logs() as logs:
+            await asyncio.wait_for(database.dispose(max_wait=0.05), timeout=2)
+        assert [entry["event"] for entry in logs] == ["storage.dispose_timed_out"]
+        await real_engine.dispose()
