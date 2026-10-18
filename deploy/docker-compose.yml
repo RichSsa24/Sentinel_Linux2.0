@@ -1,6 +1,6 @@
 # Sentinel-Linux 2.0 — full stack: Sentinel + PostgreSQL + Prometheus + Grafana.
 #
-#   cp deploy/.env.example deploy/.env     # then set the three secrets
+#   install -m 600 deploy/.env.example deploy/.env   # owner-only; then set the secrets
 #   docker compose -f deploy/docker-compose.yml up -d --build
 #
 # Secrets are mandatory: Compose refuses to start (`:?`) rather than falling

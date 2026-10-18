@@ -204,7 +204,7 @@ condition:
 ### Docker Compose: Sentinel + PostgreSQL + Prometheus + Grafana
 
 ```bash
-cp deploy/.env.example deploy/.env      # set the three secrets (Compose refuses to start without them)
+install -m 600 deploy/.env.example deploy/.env   # owner-only; set the secrets (Compose refuses to start without them)
 docker compose -f deploy/docker-compose.yml up -d --build
 sudo scripts/demo.sh                    # harmless host activity -> alerts (cleans up after itself)
 ```

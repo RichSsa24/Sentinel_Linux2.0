@@ -31,8 +31,8 @@ uv sync --frozen
 # Install pre-commit hooks once.
 uv run pre-commit install
 
-# Copy the environment template.
-cp .env.example .env
+# Copy the environment template, readable only by you (it will hold secrets).
+install -m 600 .env.example .env
 ```
 
 ## Quality gates (must pass before every commit)

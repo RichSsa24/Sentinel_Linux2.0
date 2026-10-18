@@ -36,7 +36,7 @@ echo "[2/3] listener on unexpected port 4444 (rule: new-listening-service, T1571
 # A bare listening socket that never accepts. (Not `http.server`: run under
 # sudo it would serve the working directory — e.g. deploy/.env — as root to
 # any local user for as long as the demo runs.)
-python3 -c 'import socket, time
+python3 -I -c 'import socket, time
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 4444)); s.listen(); time.sleep(30)' &
 LISTENER_PID=$!
@@ -63,4 +63,4 @@ PY
 # it): on the command line the API key would be readable by every local user
 # in /proc/<pid>/cmdline.
 printf 'Authorization: Bearer %s\n' "$KEY" \
-    | curl -fsS -H @- "$API/alerts?limit=20" | python3 -c "$PRINT_ALERTS"
+    | curl -fsS -H @- "$API/alerts?limit=20" | python3 -I -c "$PRINT_ALERTS"
