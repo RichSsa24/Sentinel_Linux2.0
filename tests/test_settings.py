@@ -89,6 +89,36 @@ class TestSettingsValidation:
             settings_no_env_file()
 
     @pytest.mark.security
+    @pytest.mark.parametrize(
+        ("url", "reason"),
+        [
+            ("postgresql://sentinel:dbsecret@db/sentinel", "postgresql://"),
+            ("sqlite:///./sentinel.db", "sqlite://"),
+            ("not a url ://dbsecret", "not a valid SQLAlchemy URL"),
+        ],
+    )
+    def test_requires_an_async_database_driver(
+        self, monkeypatch: pytest.MonkeyPatch, url: str, reason: str
+    ) -> None:
+        # Regression: a sync URL passed validation and the service died at
+        # start-up with a driver traceback (ModuleNotFoundError: psycopg2).
+        monkeypatch.setenv("SENTINEL_ENV", "production")
+        monkeypatch.setenv("SENTINEL_DATABASE_URL", url)
+        with pytest.raises(ValidationError) as excinfo:
+            settings_no_env_file()
+        message = str(excinfo.value)
+        assert reason in message
+        assert "dbsecret" not in message  # the URL may carry the password
+
+    @pytest.mark.parametrize(
+        "url", ["sqlite+aiosqlite:///./sentinel.db", "postgresql+asyncpg://u@db/sentinel"]
+    )
+    def test_accepts_the_async_drivers(self, monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "production")
+        monkeypatch.setenv("SENTINEL_DATABASE_URL", url)
+        assert settings_no_env_file().database_url.get_secret_value() == url
+
+    @pytest.mark.security
     def test_rejects_a_wildcard_cors_origin(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SENTINEL_ENV", "production")
         monkeypatch.setenv("SENTINEL_API_CORS_ORIGINS", "https://a.test, *")

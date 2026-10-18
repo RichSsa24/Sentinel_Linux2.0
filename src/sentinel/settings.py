@@ -17,6 +17,8 @@ from typing import Final
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 class Environment(StrEnum):
@@ -63,6 +65,8 @@ ENV_PREFIX: Final[str] = "SENTINEL_"
 # The placeholder shipped in .env.example; a key equal to it is no secret.
 API_KEY_PLACEHOLDER: Final[str] = "replace-with-a-long-random-token"  # pragma: allowlist secret
 API_KEY_MIN_LENGTH: Final[int] = 32
+# The storage layer is async end to end: a sync driver fails at startup.
+ASYNC_DATABASE_DRIVERS: Final[tuple[str, ...]] = ("sqlite+aiosqlite", "postgresql+asyncpg")
 
 # Collector names accepted by `SENTINEL_COLLECTORS` (each is a collector's `name`).
 KNOWN_COLLECTORS: Final[tuple[str, ...]] = ("auth-log", "file-integrity", "process", "network")
@@ -292,6 +296,23 @@ class Settings(BaseSettings):
     def _require_absolute(cls, value: Path) -> Path:
         if not value.is_absolute():
             msg = f"must be an absolute path; got {str(value)!r}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("database_url")
+    @classmethod
+    def _require_async_driver(cls, value: SecretStr) -> SecretStr:
+        # Never echo the URL: it may carry the database password.
+        try:
+            driver = make_url(value.get_secret_value()).drivername
+        except ArgumentError:
+            msg = "database_url is not a valid SQLAlchemy URL"
+            raise ValueError(msg) from None
+        if driver not in ASYNC_DATABASE_DRIVERS:
+            msg = (
+                f"database_url must use an async driver: one of "
+                f"{', '.join(f'{d}://' for d in ASYNC_DATABASE_DRIVERS)}; got {driver}://"
+            )
             raise ValueError(msg)
         return value
 
