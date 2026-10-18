@@ -53,7 +53,8 @@ services:
     stop_grace_period: 45s
     environment:
       SENTINEL_API_KEY: ${SENTINEL_API_KEY:?set SENTINEL_API_KEY in deploy/.env}
-      SENTINEL_DATABASE_URL: postgresql+asyncpg://sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/sentinel
+      # Its own least-privilege role (deploy/postgres/initdb): never the superuser.
+      SENTINEL_DATABASE_URL: postgresql+asyncpg://sentinel:${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD in deploy/.env}@postgres:5432/sentinel
       # The host is visible read-only under /host (see volumes); collectors
       # read beneath it and report host-native paths and the host's name.
       SENTINEL_HOST_ROOT: /host
@@ -89,14 +90,19 @@ services:
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     security_opt: ["no-new-privileges:true"]
     environment:
-      POSTGRES_USER: sentinel
+      # The superuser is for administration (backups, upgrades) only; the
+      # initdb script creates the `sentinel` role and database the app uses.
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
-      POSTGRES_DB: sentinel
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD in deploy/.env}
     volumes:
       - sentinel-db-data:/var/lib/postgresql/data
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     networks: [sentinel-net]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel"]
+      # Over TCP: while initdb runs, a temporary server answers on the unix
+      # socket only, before the sentinel role and database exist.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U sentinel -d sentinel"]
       interval: 10s
       timeout: 5s
       retries: 5
