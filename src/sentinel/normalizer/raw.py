@@ -38,6 +38,10 @@ class RawSource(StrEnum):
 _RAW_MODEL: Final[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
 _MAX_PORT: Final[int] = 65535
+# Length limits for host-supplied text. Collectors clip to these (see
+# sentinel.collectors.base.clip) so an oversized value still yields an event.
+MAX_COMMAND_LINE: Final[int] = 10_000
+MAX_PATH: Final[int] = 4096
 _MAX_PID: Final[int] = 2**31 - 1
 
 
@@ -87,8 +91,8 @@ class RawProcessEvent(_RawBase):
     ppid: int = Field(ge=0, le=_MAX_PID)
     starttime: int = Field(ge=0, description="Field 22 of /proc/<pid>/stat; identity component.")
     comm: str = Field(default="", max_length=256)
-    cmdline: str | None = Field(default=None, max_length=10_000)
-    executable: str | None = Field(default=None, max_length=4096)
+    cmdline: str | None = Field(default=None, max_length=MAX_COMMAND_LINE)
+    executable: str | None = Field(default=None, max_length=MAX_PATH)
 
 
 class RawFileEvent(_RawBase):
@@ -97,7 +101,7 @@ class RawFileEvent(_RawBase):
     source: Literal[RawSource.FILE] = RawSource.FILE
     action: str = Field(min_length=1, max_length=200)
     severity: int = Field(ge=0, le=7)
-    path: str = Field(min_length=1, max_length=4096)
+    path: str = Field(min_length=1, max_length=MAX_PATH)
     size: int = Field(ge=0)
     mode: str = Field(
         min_length=1, max_length=8, description="POSIX bits as octal text, e.g. '0644'."

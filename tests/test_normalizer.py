@@ -105,6 +105,15 @@ class TestDeadLetter:
         assert event is None
         assert normalizer.stats == {"normalized": 0, "dead_letters": 1}
 
+    def test_build_dead_letters_a_record_the_model_rejects(self) -> None:
+        # Collectors build records from host data through Normalizer.build; a
+        # value the model rejects must be counted, not raised into the collector.
+        normalizer = Normalizer()
+        fields = _raw_dict("process") | {"pid": -1}
+        fields.pop("source")
+        assert normalizer.build(RawProcessEvent, **fields) is None
+        assert normalizer.stats["dead_letters"] == 1
+
     def test_valid_record_increments_normalized_counter(self) -> None:
         normalizer = Normalizer()
         normalizer.normalize(RAW_EVENT_ADAPTER.validate_python(_raw_dict("process")))

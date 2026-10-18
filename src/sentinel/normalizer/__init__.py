@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from sentinel.normalizer.mapper import Normalizer, map_raw
 from sentinel.normalizer.raw import (
+    MAX_COMMAND_LINE,
+    MAX_PATH,
     RawAuthEvent,
     RawEvent,
     RawFileEvent,
@@ -18,6 +20,8 @@ from sentinel.normalizer.raw import (
 )
 
 __all__ = [
+    "MAX_COMMAND_LINE",
+    "MAX_PATH",
     "Normalizer",
     "RawAuthEvent",
     "RawEvent",

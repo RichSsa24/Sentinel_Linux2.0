@@ -153,6 +153,14 @@ class TestParseRejected:
     def test_unrecognised_lines_return_none(self, line: str) -> None:
         assert parse_auth_line(line, year=YEAR) is None
 
+    @pytest.mark.security
+    def test_a_huge_port_number_is_rejected_not_raised(self) -> None:
+        # Regression: int() raises ValueError past 4300 digits, which escaped
+        # the parser and stopped the auth-log collector for good. sshd lines
+        # can be forged by any local user (logger -p auth.info -t sshd ...).
+        line = _line("Failed password for bob from 10.0.0.9 port " + "9" * 5_000 + " ssh2")
+        assert parse_auth_line(line, year=YEAR) is None
+
     def test_overlong_line_is_rejected_before_parsing(self) -> None:
         huge = _line() + "A" * 9_000
         assert parse_auth_line(huge, year=YEAR) is None

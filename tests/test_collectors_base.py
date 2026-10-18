@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from sentinel.collectors.base import AbstractCollector, os_text, under_host_root
+from sentinel.collectors.base import AbstractCollector, clip, os_text, under_host_root
 from sentinel.pipeline.queue import BoundedEventQueue
 
 
@@ -141,3 +141,20 @@ class TestOsText:
     @pytest.mark.parametrize("name", [os.fsdecode(b"/x/\xff"), "/x/\ud800", "/x/\udfff\ud83d"])
     def test_result_is_always_valid_utf8(self, name: str) -> None:
         os_text(name).encode("utf-8")  # strict: raises on any lone surrogate
+
+
+class TestClip:
+    def test_short_text_is_unchanged(self) -> None:
+        assert clip("bash -i", 100) == "bash -i"
+
+    def test_keeps_head_and_tail_within_the_limit(self) -> None:
+        # An attacker can pad either side of a payload; both ends must survive.
+        text = "PAYLOAD-HEAD " + "x" * 50_000 + " PAYLOAD-TAIL"
+        clipped = clip(text, 100)
+        assert len(clipped) == 100
+        assert clipped.startswith("PAYLOAD-HEAD")
+        assert clipped.endswith("PAYLOAD-TAIL")
+
+    @pytest.mark.parametrize("limit", [0, 1, 3, 5, 6])
+    def test_never_exceeds_tiny_limits(self, limit: int) -> None:
+        assert len(clip("y" * 100, limit)) <= max(limit, len(" ... "))

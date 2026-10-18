@@ -17,7 +17,7 @@ An invalid event therefore can never leave the normalizer.
 
 from __future__ import annotations
 
-from typing import Final, assert_never
+from typing import Any, Final, TypeVar, assert_never
 
 from pydantic import ValidationError
 
@@ -165,6 +165,9 @@ def map_raw(raw: RawEvent) -> Event:
             assert_never(raw)
 
 
+_RawT = TypeVar("_RawT", RawAuthEvent, RawProcessEvent, RawFileEvent, RawNetworkEvent)
+
+
 class Normalizer:
     """Fail-closed raw -> Event front door with a dead-letter path."""
 
@@ -193,6 +196,26 @@ class Normalizer:
             return None
         self._normalized += 1
         return event
+
+    def build(self, model: type[_RawT], **fields: Any) -> _RawT | None:
+        """Construct a raw record from collector data, or dead-letter it.
+
+        Collectors build raw records from hostile host data. A value the raw
+        model rejects is counted and logged here like any unmappable record,
+        never raised: an exception inside a collector would stop that
+        collector (and, through it, the pipeline) for good.
+        """
+        try:
+            return model(**fields)
+        except (ValidationError, ValueError) as exc:
+            self._dead_letters += 1
+            self._log.warning(
+                "normalizer.dead_letter",
+                source=model.__name__,
+                action=fields.get("action"),
+                reason=type(exc).__name__,
+            )
+            return None
 
     @property
     def stats(self) -> dict[str, int]:

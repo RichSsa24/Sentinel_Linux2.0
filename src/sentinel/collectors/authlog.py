@@ -76,14 +76,14 @@ _SYSLOG_RE: Final[re.Pattern[str]] = re.compile(
 )
 _FAILED_RE: Final[re.Pattern[str]] = re.compile(
     r"^Failed (?P<method>password|publickey) for (?P<invalid>invalid user )?"
-    r"(?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)"
+    r"(?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d{1,5})"
 )
 _ACCEPTED_RE: Final[re.Pattern[str]] = re.compile(
     r"^Accepted (?P<method>password|publickey) for (?P<user>\S+) "
-    r"from (?P<ip>\S+) port (?P<port>\d+)"
+    r"from (?P<ip>\S+) port (?P<port>\d{1,5})"
 )
 _INVALID_RE: Final[re.Pattern[str]] = re.compile(
-    r"^Invalid user (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)"
+    r"^Invalid user (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d{1,5})"
 )
 
 
@@ -182,7 +182,7 @@ def parse_auth_line(
             port=int(body.port),
             message=syslog["msg"],
         )
-    except ValidationError:
+    except (ValidationError, ValueError):
         return None
 
 

@@ -58,9 +58,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
-from sentinel.collectors.base import AbstractCollector, os_text, under_host_root
+from sentinel.collectors.base import AbstractCollector, clip, os_text, under_host_root
 from sentinel.logging import get_logger
-from sentinel.normalizer import Normalizer, RawFileEvent
+from sentinel.normalizer import MAX_PATH, Normalizer, RawFileEvent
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -283,7 +283,7 @@ class FileIntegrityCollector(AbstractCollector):
         ``chmod u+s`` in one poll yields both events, so the setuid change still
         reaches the rules that match attribute changes.
         """
-        records: list[RawFileEvent] = []
+        records: list[RawFileEvent | None] = []
         for path, state in new.items():
             previous = old.get(path)
             if previous is None:
@@ -296,33 +296,34 @@ class FileIntegrityCollector(AbstractCollector):
         for path, previous in old.items():
             if path not in new:
                 records.append(self._deleted(path, previous))
-        return records
+        return [record for record in records if record is not None]
 
     # ------------------------------------------------------------------ builders
 
-    def _created(self, path: str, state: _FileState) -> RawFileEvent:
+    def _created(self, path: str, state: _FileState) -> RawFileEvent | None:
         return self._raw(path, state, _ACTION_CREATED, _SEV_CREATED, _fingerprint(state))
 
-    def _modified(self, path: str, state: _FileState) -> RawFileEvent:
+    def _modified(self, path: str, state: _FileState) -> RawFileEvent | None:
         return self._raw(path, state, _ACTION_MODIFIED, _SEV_MODIFIED, _fingerprint(state))
 
-    def _attrs_modified(self, path: str, state: _FileState) -> RawFileEvent:
+    def _attrs_modified(self, path: str, state: _FileState) -> RawFileEvent | None:
         seed = f"{state.mode:04o}:{state.uid}:{state.gid}"
         return self._raw(path, state, _ACTION_ATTRS, _SEV_ATTRS, seed)
 
-    def _deleted(self, path: str, state: _FileState) -> RawFileEvent:
+    def _deleted(self, path: str, state: _FileState) -> RawFileEvent | None:
         return self._raw(path, state, _ACTION_DELETED, _SEV_DELETED, _fingerprint(state))
 
     def _raw(
         self, path: str, state: _FileState, action: str, severity: int, seed: str
-    ) -> RawFileEvent:
+    ) -> RawFileEvent | None:
         """Build the raw file record the normalizer maps to an ECS Event."""
-        return RawFileEvent(
+        return self._normalizer.build(
+            RawFileEvent,
             occurred_at=datetime.now(tz=UTC),
             host=self._host,
             action=action,
             severity=severity,
-            path=os_text(path),
+            path=clip(os_text(path), MAX_PATH),
             size=state.size,
             mode=f"{state.mode:04o}",
             sha256=state.sha256,

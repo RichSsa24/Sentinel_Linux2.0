@@ -186,29 +186,30 @@ class NetworkCollector(AbstractCollector):
         self, old: dict[SocketKey, Socket], new: dict[SocketKey, Socket]
     ) -> list[RawNetworkEvent]:
         """Compute open/close raw records between two socket snapshots."""
-        records: list[RawNetworkEvent] = []
+        records: list[RawNetworkEvent | None] = []
         records.extend(self._appeared(s) for k, s in new.items() if k not in old)
         records.extend(self._disappeared(s) for k, s in old.items() if k not in new)
-        return records
+        return [record for record in records if record is not None]
 
-    def _appeared(self, sock: Socket) -> RawNetworkEvent:
+    def _appeared(self, sock: Socket) -> RawNetworkEvent | None:
         if sock.state == STATE_LISTEN:
             return self._raw(sock, _ACTION_LISTEN_OPEN, _SEV_LISTEN_OPEN)
         return self._raw(sock, _ACTION_CONN_OPEN, _SEV_CONN_OPEN)
 
-    def _disappeared(self, sock: Socket) -> RawNetworkEvent:
+    def _disappeared(self, sock: Socket) -> RawNetworkEvent | None:
         if sock.state == STATE_LISTEN:
             return self._raw(sock, _ACTION_LISTEN_CLOSE, _SEV_LISTEN_CLOSE)
         return self._raw(sock, _ACTION_CONN_CLOSE, _SEV_CONN_CLOSE)
 
-    def _raw(self, sock: Socket, action: str, severity: int) -> RawNetworkEvent:
+    def _raw(self, sock: Socket, action: str, severity: int) -> RawNetworkEvent | None:
         """Build the raw socket record the normalizer maps to an ECS Event.
 
         The decoded ``state`` rides along so the normalizer can decide whether a
         record has a peer (a connection) or not (a listener) — that ECS shaping
         is the normalizer's job, not the collector's.
         """
-        return RawNetworkEvent(
+        return self._normalizer.build(
+            RawNetworkEvent,
             occurred_at=datetime.now(tz=UTC),
             host=self._host,
             action=action,

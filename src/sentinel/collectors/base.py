@@ -64,6 +64,22 @@ def os_text(value: str) -> str:
     return raw.decode("utf-8", "backslashreplace")
 
 
+_CLIP_MARKER = " ... "
+
+
+def clip(text: str, limit: int) -> str:
+    """Shorten ``text`` to at most ``limit`` characters, keeping head and tail.
+
+    Both ends survive because an attacker can pad either side of what matters
+    (argv padding before or after a payload); the middle becomes a marker.
+    """
+    if len(text) <= limit:
+        return text
+    keep = max(limit - len(_CLIP_MARKER), 0)
+    tail = keep // 2
+    return text[: keep - tail] + _CLIP_MARKER + (text[-tail:] if tail else "")
+
+
 class AbstractCollector(abc.ABC):
     """Base class for every event source.
 

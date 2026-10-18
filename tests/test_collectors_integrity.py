@@ -31,6 +31,7 @@ from sentinel.collectors.integrity import (
     _FileState,
 )
 from sentinel.events import Event
+from sentinel.normalizer import MAX_PATH
 from sentinel.pipeline.queue import BoundedEventQueue
 from sentinel.pipeline.runner import Pipeline
 from tests.conftest import DeadLetterNormalizer, settings_no_env_file
@@ -123,7 +124,9 @@ class TestDiff:
         records = _collector(tmp_path)._diff({"/etc/sudoers": before}, {"/etc/sudoers": after})
 
         assert [r.action for r in records] == ["file_attributes_modified"]
-        assert records[0].id_seed != _collector(tmp_path)._attrs_modified("/x", before).id_seed
+        unchanged = _collector(tmp_path)._attrs_modified("/x", before)
+        assert unchanged is not None
+        assert records[0].id_seed != unchanged.id_seed
 
     def test_deleted(self, tmp_path: Path) -> None:
         records = _collector(tmp_path)._diff({"/etc/x": _state(H1)}, {})
@@ -339,6 +342,26 @@ class TestScanning:
         assert [e.event.action for e in events] == ["file_created"]
         assert events[0].file is not None
         assert events[0].file.path.endswith("/evil\\xff")
+
+    @pytest.mark.security
+    @pytest.mark.asyncio
+    async def test_a_long_undecodable_path_is_clipped_not_fatal(self, tmp_path: Path) -> None:
+        # Regression: escaping inflates each undecodable byte to four characters,
+        # so a ~1,250-byte path of 0xff passed the 4,096-character limit and
+        # the collector raised.
+        deep = tmp_path
+        for _ in range(5):
+            deep = deep / os.fsdecode(b"\xff" * 250)
+        deep.mkdir(parents=True)
+        collector = _collector(tmp_path, recursive=True)
+        await _drain(collector)
+        (deep / "payload").write_bytes(b"x")
+        events = await _drain(collector)
+
+        assert [e.event.action for e in events] == ["file_created"]
+        assert events[0].file is not None
+        assert len(events[0].file.path) <= MAX_PATH
+        assert events[0].file.path.endswith("/payload")
 
     @pytest.mark.asyncio
     async def test_subdirectories_are_not_tracked_as_files(self, tmp_path: Path) -> None:

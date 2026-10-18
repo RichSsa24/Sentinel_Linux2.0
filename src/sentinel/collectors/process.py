@@ -58,9 +58,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
-from sentinel.collectors.base import AbstractCollector, os_text
+from sentinel.collectors.base import AbstractCollector, clip, os_text
 from sentinel.logging import get_logger
-from sentinel.normalizer import Normalizer, RawProcessEvent
+from sentinel.normalizer import MAX_COMMAND_LINE, MAX_PATH, Normalizer, RawProcessEvent
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -253,12 +253,12 @@ class ProcessCollector(AbstractCollector):
         except OSError:
             return None
         text = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
-        return text or None
+        return clip(text, MAX_COMMAND_LINE) or None
 
     def _read_exe(self, base: Path) -> str | None:
         """Resolve the /proc/<pid>/exe symlink target, or None if unavailable."""
         with contextlib.suppress(OSError):
-            return os_text(str((base / "exe").readlink()))
+            return clip(os_text(str((base / "exe").readlink())), MAX_PATH)
         return None
 
     # ------------------------------------------------------------------ diffing
@@ -267,7 +267,7 @@ class ProcessCollector(AbstractCollector):
         self, old: dict[int, _ProcState], new: dict[int, _ProcState]
     ) -> list[RawProcessEvent]:
         """Compute start/stop raw records between two process snapshots."""
-        records: list[RawProcessEvent] = []
+        records: list[RawProcessEvent | None] = []
         for pid, state in new.items():
             previous = old.get(pid)
             if previous is None:
@@ -282,17 +282,18 @@ class ProcessCollector(AbstractCollector):
         for pid, previous in old.items():
             if pid not in new:
                 records.append(self._stopped(previous))
-        return records
+        return [record for record in records if record is not None]
 
-    def _started(self, state: _ProcState) -> RawProcessEvent:
+    def _started(self, state: _ProcState) -> RawProcessEvent | None:
         return self._raw(state, _ACTION_STARTED, _SEV_STARTED)
 
-    def _stopped(self, state: _ProcState) -> RawProcessEvent:
+    def _stopped(self, state: _ProcState) -> RawProcessEvent | None:
         return self._raw(state, _ACTION_STOPPED, _SEV_STOPPED)
 
-    def _raw(self, state: _ProcState, action: str, severity: int) -> RawProcessEvent:
+    def _raw(self, state: _ProcState, action: str, severity: int) -> RawProcessEvent | None:
         """Build the raw process record the normalizer maps to an ECS Event."""
-        return RawProcessEvent(
+        return self._normalizer.build(
+            RawProcessEvent,
             occurred_at=datetime.now(tz=UTC),
             host=self._host,
             action=action,

@@ -30,6 +30,7 @@ from sentinel.collectors.process import (
     parse_stat,
 )
 from sentinel.events import Event
+from sentinel.normalizer import MAX_COMMAND_LINE, MAX_PATH
 from sentinel.pipeline.queue import BoundedEventQueue
 from sentinel.pipeline.runner import Pipeline
 from tests.conftest import DeadLetterNormalizer, settings_no_env_file
@@ -280,6 +281,45 @@ class TestScanning:
         events = await _drain(collector)
 
         assert [e.process.executable for e in events] == ["/tmp/evil\\xff"]
+
+
+@pytest.mark.security
+class TestOversizedHostValues:
+    """Regression: a value past a raw-model limit raised inside the collector."""
+
+    @pytest.mark.asyncio
+    async def test_a_huge_command_line_is_clipped_not_fatal(self, tmp_path: Path) -> None:
+        # Any local user can do this: `sh -c '...' $(printf 'A%.0s' {1..12000})`.
+        collector = _collector(tmp_path)
+        await _drain(collector)
+        _mkproc(tmp_path, 73, comm="python3", cmdline=None)
+        (tmp_path / "73" / "cmdline").write_bytes(
+            b"python3\x00-c\x00" + b"A" * 12_000 + b"\x00/dev/tcp/203.0.113.7/4444\x00"
+        )
+        events = await _drain(collector)
+
+        assert len(events) == 1
+        command_line = events[0].process.command_line
+        assert command_line is not None
+        assert len(command_line) <= MAX_COMMAND_LINE
+        assert command_line.startswith("python3 -c AAAA")
+        assert command_line.endswith("/dev/tcp/203.0.113.7/4444")  # the tail survives
+
+    @pytest.mark.asyncio
+    async def test_an_executable_path_inflated_by_escaping_is_clipped(self, tmp_path: Path) -> None:
+        # Each undecodable byte becomes four characters (\xNN): 1,300 bytes of
+        # 0xff is a 5,200-character path, past the 4,096 limit.
+        collector = _collector(tmp_path)
+        await _drain(collector)
+        _mkproc(tmp_path, 74, comm="x")
+        (tmp_path / "74" / "exe").symlink_to(os.fsdecode(b"/" + b"\xff" * 1_300))
+        events = await _drain(collector)
+
+        assert len(events) == 1
+        executable = events[0].process.executable
+        assert executable is not None
+        assert len(executable) <= MAX_PATH
+        assert executable.startswith("/\\xff")
 
 
 class TestDeadLetter:
