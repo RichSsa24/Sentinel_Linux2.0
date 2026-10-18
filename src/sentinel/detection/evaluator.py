@@ -13,10 +13,14 @@ Two hostile inputs are defended against:
 - **Malformed events.** Every operator degrades to ``False`` on a missing field
   or a type mismatch; evaluation never raises on event data, so one odd event
   cannot stall the engine.
-- **ReDoS from hostile rule regexes.** Rule files are untrusted config, so a
-  ``regex`` match runs through the :mod:`regex` engine with a hard ``timeout``
-  (which stdlib ``re`` cannot do) and a bounded input length; a catastrophic
-  pattern is abandoned and logged, never allowed to hang the process.
+- **ReDoS, and evasion through it.** A ``regex`` match runs through the
+  :mod:`regex` engine with a hard ``timeout`` (which stdlib ``re`` cannot do)
+  over a bounded input. Running out of time must not mean "no match": an
+  attacker who controls the input (a command line) could otherwise pad it
+  until the rule gives up. A timeout raises :class:`EvaluationIncomplete`,
+  which the engine treats as a match — a false positive, never a miss.
+  Values up to ``_MAX_REGEX_INPUT`` are scanned whole; longer ones by their
+  head *and* tail, so padding on one side cannot push a payload out of reach.
 """
 
 from __future__ import annotations
@@ -32,11 +36,15 @@ from sentinel.logging import get_logger
 
 _log = get_logger("sentinel.detection.evaluator")
 
-# ReDoS bounds: a single match may not run longer than this, and only the first
-# N characters of a value are ever scanned (catastrophic backtracking grows with
-# input length, so the cap is defence in depth atop the timeout).
+# ReDoS bounds: a single match may not run longer than this, and a value longer
+# than _MAX_REGEX_INPUT is scanned as two windows (head and tail) of half that.
+# Collectors clip command lines to 10,000 characters, so they are scanned whole.
 _REGEX_TIMEOUT_S: Final[float] = 0.1
-_MAX_REGEX_INPUT: Final[int] = 8_192
+_MAX_REGEX_INPUT: Final[int] = 16_384
+
+
+class EvaluationIncomplete(Exception):  # noqa: N818 — a state, not an error to fix
+    """A condition could not be decided in time; the caller must not read it as False."""
 
 
 @lru_cache(maxsize=1024)
@@ -87,15 +95,26 @@ def _numeric_compare(actual: object, expected: object, op: Callable[[float, floa
     return False
 
 
+def _scan_windows(value: str) -> tuple[str, ...]:
+    """The parts of ``value`` a regex scans: all of it, or its head and its tail."""
+    if len(value) <= _MAX_REGEX_INPUT:
+        return (value,)
+    half = _MAX_REGEX_INPUT // 2
+    return (value[:half], value[-half:])
+
+
 def _regex_search(actual: object, expected: object) -> bool:
     if not isinstance(actual, str) or not isinstance(expected, str):
         return False
-    value = actual[:_MAX_REGEX_INPUT]
     try:
-        return _compiled(expected).search(value, timeout=_REGEX_TIMEOUT_S) is not None
-    except TimeoutError:
+        pattern = _compiled(expected)
+        return any(
+            pattern.search(window, timeout=_REGEX_TIMEOUT_S) is not None
+            for window in _scan_windows(actual)
+        )
+    except TimeoutError as exc:
         _log.warning("detection.regex_timeout", value_len=len(actual))
-        return False
+        raise EvaluationIncomplete from exc
     except regex.error:
         # Patterns are compiled and validated at load; this is belt-and-braces.
         return False
@@ -122,7 +141,10 @@ _OPERATORS: Final[dict[Operator, Callable[[object, object], bool]]] = {
 
 
 def evaluate_condition(condition: Condition, event: Mapping[str, object]) -> bool:
-    """True if the event satisfies the condition. Never raises on event data.
+    """True if the event satisfies the condition.
+
+    Never raises on event data, except :class:`EvaluationIncomplete` when a
+    regex ran out of time — that answer is unknown, not False.
 
     A ``threshold`` node contributes only its per-event ``match`` here; the
     stateful sliding window lives in :class:`~sentinel.detection.engine.DetectionEngine`.

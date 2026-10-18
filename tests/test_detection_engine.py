@@ -178,6 +178,26 @@ class TestSafetyAndStats:
         assert stats["evaluations"] == 2
         assert stats["fired"] == 1
 
+    @pytest.mark.security
+    @pytest.mark.parametrize("negated", [False, True], ids=["regex", "not-regex"])
+    def test_a_regex_timeout_fires_the_rule(self, negated: bool) -> None:
+        # Regression: a timeout read as "no match", so an attacker who controls
+        # the input could pad it until the rule gave up. Undecidable now fires
+        # (a false positive, never a miss) — under `not` as well.
+        leaf = {"field": "process.command_line", "op": "regex", "value": "(a|a|a)*$"}
+        rule = _simple_rule().model_copy(
+            update={
+                "condition": Rule.model_validate(
+                    {**_simple_rule().model_dump(), "condition": {"not": leaf} if negated else leaf}
+                ).condition
+            }
+        )
+        engine = DetectionEngine([rule])
+        detections = engine.evaluate(_event("process_started", cmd="a" * 80 + "!"))
+        assert [d.rule_id for d in detections] == ["reverse-shell-process"]
+        assert "evaluation incomplete" in detections[0].message
+        assert engine.stats["incomplete"] == 1
+
     @pytest.mark.slow
     def test_throughput_is_reasonable(self) -> None:
         # Sanity check: 5k events across a handful of rules in well under a second.

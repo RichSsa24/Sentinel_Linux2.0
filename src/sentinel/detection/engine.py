@@ -39,7 +39,7 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from sentinel.detection.evaluator import evaluate_condition, resolve_field
+from sentinel.detection.evaluator import EvaluationIncomplete, evaluate_condition, resolve_field
 from sentinel.detection.schema import Condition, Operator, Rule, Threshold
 from sentinel.events import Event
 from sentinel.logging import get_logger
@@ -129,6 +129,7 @@ class DetectionEngine:
         self._log = get_logger("sentinel.detection.engine")
         self._evaluations = 0
         self._fired = 0
+        self._incomplete = 0
 
     @property
     def rules(self) -> tuple[Rule, ...]:
@@ -144,9 +145,17 @@ class DetectionEngine:
         view = event.model_dump(mode="json")
         detections: list[Detection] = []
         for rule in candidates:
-            if self._fires(rule, event, view):
+            try:
+                fired, complete = self._fires(rule, event, view), True
+            except EvaluationIncomplete:
+                # Fail safe: an undecidable match fires (a false positive, never a
+                # miss), so padding an input until the regex gives up hides nothing.
+                fired, complete = True, False
+                self._incomplete += 1
+                self._log.warning("detection.evaluation_incomplete", rule_id=rule.id)
+            if fired:
                 self._fired += 1
-                detections.append(self._build(rule, event))
+                detections.append(self._build(rule, event, complete=complete))
         return detections
 
     def _candidates_for(self, action: str) -> tuple[Rule, ...]:
@@ -200,8 +209,9 @@ class DetectionEngine:
         self._windows[key] = window
         return window
 
-    def _build(self, rule: Rule, event: Event) -> Detection:
+    def _build(self, rule: Rule, event: Event, *, complete: bool = True) -> Detection:
         techniques = ",".join(rule.attack)
+        note = "" if complete else " (evaluation incomplete: a pattern timed out; review)"
         return Detection(
             rule_id=rule.id,
             title=rule.title,
@@ -212,7 +222,8 @@ class DetectionEngine:
             event_id=event.event.id,
             host=event.host.name,
             timestamp=event.timestamp,
-            message=f"{rule.title} [{techniques}] — {event.event.action} on {event.host.name}",
+            message=f"{rule.title} [{techniques}] — {event.event.action} on {event.host.name}"
+            + note,
         )
 
     @property
@@ -222,5 +233,6 @@ class DetectionEngine:
             "rules": len(self._rules),
             "evaluations": self._evaluations,
             "fired": self._fired,
+            "incomplete": self._incomplete,
             "threshold_groups": len(self._windows),
         }

