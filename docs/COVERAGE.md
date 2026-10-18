@@ -12,9 +12,9 @@
 | `cron-persistence` | Cron-based persistence | 5 | [T1053.003](https://attack.mitre.org/techniques/T1053/003/) | DE.CM, PR.PS | D3-FA |
 | `interactive-shell-spawn` | Interactive shell spawned with -i | 5 | [T1059.004](https://attack.mitre.org/techniques/T1059/004/) | DE.CM | D3-PSA |
 | `kernel-module-load` | Kernel module load | 5 | [T1547.006](https://attack.mitre.org/techniques/T1547/006/) | DE.CM | D3-PSA |
-| `log-tampering` | Log file deleted | 6 | [T1070.002](https://attack.mitre.org/techniques/T1070/002/) | DE.CM, PR.PS | D3-FA |
+| `log-tampering` | Log file deleted or truncated | 6 | [T1070.002](https://attack.mitre.org/techniques/T1070/002/) | DE.CM, PR.PS | D3-FA |
 | `new-listening-service` | New listening service on an unexpected port | 4 | [T1571](https://attack.mitre.org/techniques/T1571/) | DE.CM | D3-NTA |
-| `new-suid-binary` | New or newly-setuid binary | 6 | [T1548.001](https://attack.mitre.org/techniques/T1548/001/) | DE.CM | D3-FA |
+| `new-suid-binary` | New or newly setuid/setgid binary | 6 | [T1548.001](https://attack.mitre.org/techniques/T1548/001/) | DE.CM | D3-FA |
 | `passwd-file-modified` | Account database (/etc/passwd) modified | 6 | [T1098](https://attack.mitre.org/techniques/T1098/) | DE.CM | D3-FA |
 | `reverse-shell-process` | Reverse-shell-style process invocation | 7 | [T1059.004](https://attack.mitre.org/techniques/T1059/004/) | DE.CM, DE.AE | D3-PSA |
 | `shadow-file-modified` | Shadow password file modified | 7 | [T1003.008](https://attack.mitre.org/techniques/T1003/008/) | DE.CM | D3-FA |

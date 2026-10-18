@@ -1,8 +1,10 @@
 id: log-tampering
-title: Log file deleted
+title: Log file deleted or truncated
 description: >-
-  Deletion of a file under /var/log — a hallmark of anti-forensics, an intruder
-  removing evidence of their activity.
+  Deletion of a file under /var/log, or its truncation to zero bytes
+  (`> /var/log/auth.log`, `truncate -s0`) — a hallmark of anti-forensics, an
+  intruder removing evidence of their activity. Requires /var/log in
+  SENTINEL_FIM_PATHS.
 severity: 6
 attack: [T1070.002]
 nist_csf: [DE.CM, PR.PS]
@@ -11,5 +13,9 @@ references:
   - https://attack.mitre.org/techniques/T1070/002/
 condition:
   all:
-    - {field: event.action, op: equals, value: file_deleted}
-    - {field: file.path, op: startswith, value: /var/log}
+    - {field: file.path, op: startswith, value: /var/log/}
+    - any:
+        - {field: event.action, op: equals, value: file_deleted}
+        - all:
+            - {field: event.action, op: equals, value: file_modified}
+            - {field: file.size, op: equals, value: 0}

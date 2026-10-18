@@ -1,8 +1,10 @@
 id: interactive-shell-spawn
 title: Interactive shell spawned with -i
 description: >-
-  A shell started with the interactive flag (sh -i, bash -i, ...). Common in
-  reverse shells and hands-on-keyboard activity from a non-login context.
+  A shell started with the interactive flag (sh -i, bash -i, bash -li,
+  bash -l -i, ...), including one whose argv[0] was renamed to hide it
+  (exec -a). Common in reverse shells and hands-on-keyboard activity from a
+  non-login context.
 severity: 5
 attack: [T1059.004]
 nist_csf: [DE.CM]
@@ -12,4 +14,8 @@ references:
 condition:
   all:
     - {field: event.action, op: equals, value: process_started}
-    - {field: process.command_line, op: regex, value: '\b(?:bash|sh|zsh|dash|ksh)\s+-i\b'}
+    - any:
+        - {field: process.command_line, op: regex, value: '\b(?:bash|sh|zsh|dash|ksh)(?:\s+-[a-zA-Z]{1,8}){0,4}?\s+-[a-zA-Z]{0,7}i[a-zA-Z]{0,7}\b'}
+        - all:
+            - {field: process.executable, op: regex, value: '/(?:ba|z|da|k)?sh$'}
+            - {field: process.command_line, op: regex, value: '^(?!\S*\b(?:ba|z|da|k)?sh\b)\S+(?:\s+-[a-zA-Z]{1,8}){0,4}?\s+-[a-zA-Z]{0,7}i[a-zA-Z]{0,7}(?:\s|$)'}

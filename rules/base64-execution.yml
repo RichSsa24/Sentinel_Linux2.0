@@ -1,8 +1,10 @@
 id: base64-execution
 title: Base64-decoded command execution
 description: >-
-  A command line that pipes or decodes base64, a common obfuscation wrapper for
-  staging and executing a payload while evading naive string matching.
+  A command line that pipes or decodes base64 — base64 -d in any spelling GNU
+  accepts (-di, --deco, ...), openssl base64 -d, or an interpreter's
+  b64decode — a common obfuscation wrapper for staging and executing a payload
+  while evading naive string matching.
 severity: 5
 attack: [T1027]
 nist_csf: [DE.CM]
@@ -14,6 +16,9 @@ condition:
   # and would otherwise alert a second time for the same process.
   all:
     - {field: event.action, op: equals, value: process_started}
-    - field: process.command_line
-      op: regex
-      value: 'base64\s+(?:-d|--decode|-{1,2}d)\b|\|\s*base64\b'
+    - any:
+        - field: process.command_line
+          op: regex
+          value: '\bbase64\s+(?:-[a-zA-Z]{0,4}d[a-zA-Z]{0,4}\b|--d(?:e(?:c(?:o(?:d(?:e)?)?)?)?)?\b)|\|\s*base64\b'
+        - {field: process.command_line, op: regex, value: '\bopenssl\b[^\n]{0,128}?\bbase64\b[^\n]{0,128}?\s-d\b'}
+        - {field: process.command_line, op: regex, value: '\b(?:b64decode|decodebytes|a2b_base64)\b'}

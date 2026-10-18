@@ -2,8 +2,11 @@ id: reverse-shell-process
 title: Reverse-shell-style process invocation
 description: >-
   A command line bearing the hallmarks of an interactive reverse shell —
-  netcat with -e, a /dev/tcp redirection, an interactive shell flag, or a
-  Python pty/socket one-liner.
+  netcat or ncat handing its socket to a program (-e, -c, --exec), a /dev/tcp
+  redirection, socat EXEC/SYSTEM, an interactive shell flag (also as -li or
+  -l -i, or behind a renamed argv[0]), or a Python, Perl, Ruby or PHP socket
+  one-liner. Gaps are bounded ({0,N}) so no input can make the pattern
+  backtrack quadratically.
 severity: 7
 attack: [T1059.004]
 nist_csf: [DE.CM, DE.AE]
@@ -15,6 +18,17 @@ condition:
   # and would otherwise alert a second time for the same process.
   all:
     - {field: event.action, op: equals, value: process_started}
-    - field: process.command_line
-      op: regex
-      value: '(?:\bnc\b|\bncat\b|\bnetcat\b).*\s-e|/dev/(?:tcp|udp)/|(?:bash|sh|zsh|dash)\s+-i|python[0-9]?\b.*(?:pty\.spawn|socket\.socket)'
+    - any:
+        - field: process.command_line
+          op: regex
+          value: '\b(?:nc|ncat|netcat)\b[^\n|;&]{0,256}?\s(?:-[a-zA-Z]*[ec]\b|--(?:sh-)?exec\b)'
+        - {field: process.command_line, op: regex, value: '/dev/(?:tcp|udp)/'}
+        - {field: process.command_line, op: regex, value: '\bsocat\b[^\n]{0,256}?\b(?:exec|system):'}
+        - field: process.command_line
+          op: regex
+          value: '\bpython[0-9.]*\b[^\n]{0,512}?(?:pty\.spawn|socket\.socket)|\bperl\b[^\n]{0,512}?\bSocket\b|\bruby\b[^\n]{0,512}?\bTCPSocket\b|\bphp\b[^\n]{0,512}?\bfsockopen\b'
+        - {field: process.command_line, op: regex, value: '\b(?:bash|sh|zsh|dash|ksh)(?:\s+-[a-zA-Z]{1,8}){0,4}?\s+-[a-zA-Z]{0,7}i[a-zA-Z]{0,7}\b'}
+        # `exec -a '[kworker]' bash -i`: argv[0] renamed, the executable is a shell.
+        - all:
+            - {field: process.executable, op: regex, value: '/(?:ba|z|da|k)?sh$'}
+            - {field: process.command_line, op: regex, value: '^(?!\S*\b(?:ba|z|da|k)?sh\b)\S+(?:\s+-[a-zA-Z]{1,8}){0,4}?\s+-[a-zA-Z]{0,7}i[a-zA-Z]{0,7}(?:\s|$)'}

