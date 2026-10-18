@@ -22,8 +22,11 @@ Security posture (per the collector contract in
   the timestamp is parsed with an explicit month table rather than the
   locale-dependent ``%b`` directive so a hostile or unusual ``LANG`` cannot
   change parsing behaviour.
-- **Degrades safely.** A missing or unreadable file is logged and retried, not
-  fatal — one temporarily-unavailable source must not take the process down.
+- **Degrades safely.** A missing or unreadable file is retried, not fatal —
+  one temporarily-unavailable source must not take the process down. It is
+  logged when it goes missing and when it comes back (not on every poll), and
+  :attr:`source_available` reports it, because a collector that cannot see its
+  file looks exactly like a host where nobody logs in.
 - **Bounded.** At most ``_MAX_READ`` bytes are read per poll and a partial line
   is never buffered past the line cap, so a huge or newline-free file cannot
   exhaust memory or stall the event loop.
@@ -61,6 +64,11 @@ if TYPE_CHECKING:
 _MAX_LINE_LEN: Final[int] = 8_192
 # Bytes read per poll; the rest waits for the next poll.
 _MAX_READ: Final[int] = 1 << 20
+# Where the auth log lives when it is not /var/log/auth.log, for the warning.
+_MISSING_HINT: Final[str] = (
+    "set SENTINEL_AUTH_LOG_PATH (RHEL and Fedora: /var/log/secure); a host that "
+    "logs only to the systemd journal needs rsyslog to write an auth log"
+)
 # Lines parsed between yields to the event loop.
 _YIELD_EVERY: Final[int] = 1_000
 # Upper bound on how many events one "message repeated N times" line expands to.
@@ -319,8 +327,10 @@ class AuthLogCollector(AbstractCollector):
         try:
             lines = await asyncio.to_thread(self._read_new_lines)
         except OSError as exc:
-            self._log.warning("authlog.read_error", path=str(self._path), error=str(exc))
+            self._mark_source(False, path=str(self._path), error=type(exc).__name__)
             return
+        if self._handle is not None:  # read from an open file: the source is there
+            self._mark_source(True, path=str(self._path))
         for index, line in enumerate(lines, start=1):
             records = parse_auth_records(
                 line, year=self._year, tz=self._tz, host_override=self._host_override
@@ -374,6 +384,7 @@ class AuthLogCollector(AbstractCollector):
             self._handle = self._path.open("rb")
         except FileNotFoundError:
             self._skip_history = False  # a file that appears later is all new
+            self._mark_source(False, path=str(self._path), hint=_MISSING_HINT)
             return False
         if not self._skip_history:
             self._handle.seek(self._pos)

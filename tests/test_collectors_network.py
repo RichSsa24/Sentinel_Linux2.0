@@ -456,3 +456,16 @@ class TestHostNamespace:
         events = await _drain(collector)
 
         assert [e.source.port for e in events] == [4444]
+
+
+class TestSourceAvailability:
+    async def test_no_readable_table_is_an_outage(self, tmp_path: Path) -> None:
+        collector = _collector(tmp_path)
+        await _drain(collector)
+        assert not collector.source_available
+
+    async def test_ipv4_alone_is_normal_when_ipv6_is_disabled(self, tmp_path: Path) -> None:
+        _mk_net(tmp_path, tcp=[])
+        collector = _collector(tmp_path)
+        await _drain(collector)
+        assert collector.source_available

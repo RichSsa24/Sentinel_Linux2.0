@@ -53,6 +53,7 @@ class RuntimeSnapshot:
     retention_deleted: Mapping[str, int] = field(default_factory=dict)
     pipeline_up: bool = False
     collector_restarts: Mapping[str, int] = field(default_factory=dict)
+    sources_up: Mapping[str, bool] = field(default_factory=dict)
 
 
 class _RuntimeCollector(Collector):
@@ -74,6 +75,14 @@ class _RuntimeCollector(Collector):
             "collector",
             snap.collector_restarts,
         )
+        sources = GaugeMetricFamily(
+            "sentinel_collector_source_up",
+            "1 while a collector can read its source (log file, /proc, watched paths).",
+            labels=["collector"],
+        )
+        for name in sorted(snap.sources_up):
+            sources.add_metric([name], int(snap.sources_up[name]))
+        yield sources
         yield GaugeMetricFamily(
             "sentinel_queue_depth",
             "Current depth of the bounded pipeline queue.",

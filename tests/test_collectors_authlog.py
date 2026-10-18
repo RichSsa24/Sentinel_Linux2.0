@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from sentinel.collectors.authlog import AuthLogCollector, parse_auth_line, parse_auth_records
 from sentinel.events import Event
@@ -245,9 +246,16 @@ class TestTailer:
         monkeypatch.setattr(collector, "_read_new_lines", _boom)
 
         # A read failure must be swallowed: no exception, nothing parsed.
-        await collector._drain_once(BoundedEventQueue(maxsize=4))
+        with capture_logs() as logs:
+            await collector._drain_once(BoundedEventQueue(maxsize=4))
+            await collector._drain_once(BoundedEventQueue(maxsize=4))
 
         assert collector.stats["parsed"] == 0
+        assert not collector.source_available
+        # Logged when it starts failing, not on every poll.
+        assert [(e["event"], e["error"]) for e in logs] == [
+            ("collector.source_unavailable", "OSError")
+        ]
 
     @pytest.mark.asyncio
     async def test_reads_existing_lines(self, tmp_path: Path) -> None:
@@ -588,3 +596,28 @@ class TestStartAtEnd:
         events = await _drain_events(collector)
         collector._close()
         assert [e.host.name for e in events] == ["h3"]
+
+
+class TestSourceAvailability:
+    """Regression: a missing auth log was silent — indistinguishable from a quiet host."""
+
+    async def test_a_missing_log_is_reported_once_with_a_hint_and_its_return_too(
+        self, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "auth.log"
+        collector = AuthLogCollector(log, year=YEAR)
+        with capture_logs() as logs:
+            for _ in range(3):
+                await _drain_events(collector)
+            available = [collector.source_available]
+            log.write_text(_line() + "\n", encoding="utf-8")
+            events = await _drain_events(collector)
+            available.append(collector.source_available)
+        collector._close()
+        assert len(events) == 1
+        assert available == [False, True]
+        assert [e["event"] for e in logs] == [
+            "collector.source_unavailable",
+            "collector.source_available",
+        ]
+        assert "SENTINEL_AUTH_LOG_PATH" in logs[0]["hint"]

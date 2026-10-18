@@ -664,4 +664,5 @@ class Runtime:
             retention_deleted=dict(self._pruned),
             pipeline_up=self.running,
             collector_restarts=self._pipeline.collector_restarts,
+            sources_up={c.name: c.source_available for c in self._collectors},
         )

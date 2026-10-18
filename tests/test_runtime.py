@@ -874,6 +874,7 @@ class TestAppLifespan:
             body = (await client.get("/metrics", headers=auth_header())).text
         assert "sentinel_queue_depth" in body
         assert 'sentinel_alerts_suppressed_total{reason="throttled"}' in body
+        assert 'sentinel_collector_source_up{collector="auth-log"} 0.0' in body  # no file
 
     async def test_failed_startup_still_releases_the_database(
         self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch

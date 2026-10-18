@@ -371,6 +371,11 @@ class FileIntegrityCollector(AbstractCollector):
         )
 
     @property
+    def source_available(self) -> bool:
+        """False while any watched path is missing or unreadable (each is logged)."""
+        return not self._missing
+
+    @property
     def stats(self) -> dict[str, int]:
         """Snapshot counters for observability and tests."""
         return {

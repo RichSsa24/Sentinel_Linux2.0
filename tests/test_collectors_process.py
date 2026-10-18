@@ -478,3 +478,16 @@ class TestExecVisibility:
         await _drain(collector)  # second sighting: details confirmed, now settled
         (tmp_path / "7" / "cmdline").write_bytes(b"nginx: worker process\x00")
         assert await _drain(collector) == []  # argv rewrite later in life: not re-read
+
+
+class TestSourceAvailability:
+    async def test_an_unreadable_proc_is_reported_not_mistaken_for_no_processes(
+        self, tmp_path: Path
+    ) -> None:
+        collector = _collector(tmp_path / "no-proc")
+        await _drain(collector)
+        assert not collector.source_available
+        (tmp_path / "no-proc").mkdir()
+        _mkproc(tmp_path / "no-proc", 1)
+        await _drain(collector)
+        assert collector.source_available

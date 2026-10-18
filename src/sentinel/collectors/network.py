@@ -170,8 +170,12 @@ class NetworkCollector(AbstractCollector):
         """
         listeners: list[Socket] = []
         connections: list[Socket] = []
+        tables = {filename: self._read_proc_net(filename) for _proto, filename in _SOURCES}
+        # tcp6 is absent when IPv6 is disabled; no readable table at all is an outage.
+        readable = [name for name, text in tables.items() if text is not None]
+        self._mark_source(bool(readable), path=str(self._net_dir))
         for proto, filename in _SOURCES:
-            for line in self._read_proc_net(filename).splitlines():
+            for line in (tables[filename] or "").splitlines():
                 sock = parse_net_line(line, proto=proto)
                 if sock is not None and sock.state in self._tracked_states:
                     (listeners if sock.state == STATE_LISTEN else connections).append(sock)
@@ -186,15 +190,15 @@ class NetworkCollector(AbstractCollector):
         self._capped = False
         return snapshot
 
-    def _read_proc_net(self, filename: str) -> str:
-        """Read /proc/net/<filename>, returning '' if it is absent/unreadable."""
+    def _read_proc_net(self, filename: str) -> str | None:
+        """Read /proc/net/<filename>, or None if it is absent/unreadable."""
         path = self._net_dir / filename
         try:
             return path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             # IPv6 disabled (no tcp6), non-Linux host, or a transient read error:
             # treat as "no sockets from this source" rather than crashing.
-            return ""
+            return None
 
     # ------------------------------------------------------------------ diffing
 

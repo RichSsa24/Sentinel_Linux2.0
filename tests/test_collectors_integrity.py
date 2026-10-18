@@ -698,3 +698,15 @@ class TestStatCache:
 
         events = await _drain(collector)
         assert [e.event.action for e in events] == ["file_modified"]
+
+
+class TestSourceAvailability:
+    @pytest.mark.asyncio
+    async def test_a_missing_watched_path_marks_the_source_down(self, tmp_path: Path) -> None:
+        watched = tmp_path / "etc"
+        collector = FileIntegrityCollector([watched], host="testhost")
+        await _drain(collector)
+        assert not collector.source_available
+        watched.mkdir()
+        await _drain(collector)
+        assert collector.source_available

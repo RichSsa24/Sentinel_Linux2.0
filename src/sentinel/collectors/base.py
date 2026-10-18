@@ -29,6 +29,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from sentinel.logging import get_logger
+
 if TYPE_CHECKING:
     # Imported only for type hints — runtime would cycle through
     # sentinel.pipeline.runner -> AbstractCollector.
@@ -102,6 +104,7 @@ class AbstractCollector(abc.ABC):
             )
             raise ValueError(msg)
         self._stop_event = asyncio.Event()
+        self._source_available = True
 
     @abc.abstractmethod
     async def run(self, queue: BoundedEventQueue) -> None:
@@ -117,6 +120,26 @@ class AbstractCollector(abc.ABC):
     def stats(self) -> Mapping[str, int]:
         """Snapshot counters for observability (subclasses extend this)."""
         return {}
+
+    @property
+    def source_available(self) -> bool:
+        """False while the collector cannot read its source (exported as a gauge).
+
+        A collector that cannot see its source produces no events, which
+        looks exactly like a quiet host; this is how the two are told apart.
+        """
+        return self._source_available
+
+    def _mark_source(self, available: bool, **context: object) -> None:
+        """Record whether the source could be read, logging only the changes."""
+        if available == self._source_available:
+            return
+        self._source_available = available
+        log = get_logger("sentinel.collectors")
+        if available:
+            log.info("collector.source_available", collector=self.name, **context)
+        else:
+            log.warning("collector.source_unavailable", collector=self.name, **context)
 
     async def stop(self) -> None:
         """Signal a graceful stop. Idempotent."""

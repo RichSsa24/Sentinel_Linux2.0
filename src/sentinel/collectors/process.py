@@ -203,9 +203,11 @@ class ProcessCollector(AbstractCollector):
         """Yield the numeric pid directories under the proc root."""
         try:
             entries = list(self._proc_root.iterdir())
-        except OSError:
+        except OSError as exc:
             # No /proc (e.g. non-Linux host) or it became unreadable: no procs.
+            self._mark_source(False, path=str(self._proc_root), error=type(exc).__name__)
             return
+        self._mark_source(True, path=str(self._proc_root))
         for entry in entries:
             if entry.name.isdigit():
                 yield int(entry.name)
