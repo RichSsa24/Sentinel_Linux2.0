@@ -29,10 +29,16 @@ Security posture (per the collector contract in
   vanished entries are skipped, not coerced.
 - **Tolerates the inherent TOCTOU of /proc.** A process can exit mid-read; every
   per-pid read is guarded and a disappearing process is simply omitted.
-- **Bounded work.** At most ``max_procs`` entries are fingerprinted per scan,
-  and only ``/proc/<pid>/stat`` is read for a process already seen: its
-  ``comm``, ``cmdline`` and ``exe`` were captured when it started and are
-  reused, so a steady-state poll costs one read per process instead of four.
+- **Bounded work.** At most ``max_procs`` entries are fingerprinted per scan.
+  A process's ``comm``, ``cmdline`` and ``exe`` are read when it is first seen
+  and once more on the next poll, then cached for its lifetime, so a
+  steady-state poll costs one read (``stat``) per process instead of four.
+- **The second read closes the fork-to-exec window.** A poll can catch a child
+  after ``fork`` but before ``exec``, while it still shows its parent's image.
+  The exec is over by the next poll, so the confirming read sees the real
+  program; if the image changed, a fresh ``process_started`` is emitted for it
+  (its id includes the image, so the dedup window does not mistake it for the
+  first start). A transiently failed first read is repaired the same way.
 - **Never blocks the event loop.** The scan runs in a worker thread via
   :func:`asyncio.to_thread`.
 
@@ -85,6 +91,8 @@ class _ProcState(NamedTuple):
     comm: str
     cmdline: str | None
     executable: str | None
+    # False until the details are re-read on the next poll (see module docstring).
+    settled: bool = False
 
 
 def parse_stat(content: str) -> tuple[int, int] | None:
@@ -210,9 +218,10 @@ class ProcessCollector(AbstractCollector):
         if parsed is None:
             return None
         ppid, starttime = parsed
-        if known is not None and known.starttime == starttime:
-            # Same process instance as last poll. ppid comes fresh from stat
-            # (orphans are re-parented); the rest was captured at start.
+        same_instance = known is not None and known.starttime == starttime
+        if known is not None and same_instance and known.settled:
+            # Seen and confirmed before. ppid comes fresh from stat (orphans are
+            # re-parented); the image details were captured and confirmed.
             return known if known.ppid == ppid else known._replace(ppid=ppid)
         return _ProcState(
             pid=pid,
@@ -221,6 +230,7 @@ class ProcessCollector(AbstractCollector):
             comm=self._read_comm(base, stat_content),
             cmdline=self._read_cmdline(base),
             executable=self._read_exe(base),
+            settled=same_instance,  # second sighting of this instance: confirmed
         )
 
     def _read_comm(self, base: Path, stat_content: str) -> str:
@@ -260,6 +270,9 @@ class ProcessCollector(AbstractCollector):
             elif previous.starttime != state.starttime:
                 # pid recycled: the old instance ended, a new one began.
                 records.append(self._stopped(previous))
+                records.append(self._started(state))
+            elif (previous.cmdline, previous.executable) != (state.cmdline, state.executable):
+                # Same instance, new image: it exec'd after we first saw it.
                 records.append(self._started(state))
         for pid, previous in old.items():
             if pid not in new:

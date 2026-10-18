@@ -329,12 +329,12 @@ class TestKnownProcessCache:
     def test_known_process_details_are_not_reread(self, tmp_path: Path) -> None:
         _mkproc(tmp_path, 42, cmdline="nginx -g daemon off;")
         collector = _collector(tmp_path)
-        first = collector._scan()
-        # The process rewrites its argv (setproctitle-style). Same instance, so
-        # the start-time capture stands and cmdline is not read again.
+        settled = collector._scan(collector._scan())  # seen twice: confirmed
+        # The process rewrites its argv later in life (setproctitle-style). Same
+        # settled instance, so the capture stands and cmdline is not read again.
         (tmp_path / "42" / "cmdline").write_bytes(b"nginx: worker process\x00")
-        second = collector._scan(first)
-        assert second[42] is first[42]
+        later = collector._scan(settled)
+        assert later[42] is settled[42]
 
     def test_recycled_pid_is_read_afresh(self, tmp_path: Path) -> None:
         _mkproc(tmp_path, 42, starttime=1_000, cmdline="sleep 1")
@@ -358,3 +358,38 @@ class TestKnownProcessCache:
         second = collector._scan(first)
         assert second[42].ppid == 1
         assert second[42].cmdline == first[42].cmdline
+
+
+class TestExecVisibility:
+    """A process first seen between fork and exec must still be seen post-exec."""
+
+    @pytest.mark.security
+    @pytest.mark.asyncio
+    async def test_exec_after_first_sighting_is_reported(self, tmp_path: Path) -> None:
+        collector = _collector(tmp_path)
+        await _drain(collector)  # empty baseline
+        # Poll lands in the fork->exec window: the child still shows the shell.
+        _mkproc(tmp_path, 4242, starttime=5_000, comm="bash", cmdline="bash")
+        started = await _drain(collector)
+        assert [e.process.command_line for e in started] == ["bash"]
+
+        # The child execs; same pid, same starttime, new image.
+        (tmp_path / "4242" / "cmdline").write_bytes(b"useradd\x00-m\x00backdoor\x00")
+        (tmp_path / "4242" / "comm").write_text("useradd\n", encoding="utf-8")
+        events = await _drain(collector)
+
+        assert [(e.event.action, e.process.command_line) for e in events] == [
+            ("process_started", "useradd -m backdoor")
+        ]
+        # A new image is a new event, not a re-observation the dedup would drop.
+        assert events[0].event.id != started[0].event.id
+
+    @pytest.mark.asyncio
+    async def test_settled_processes_are_not_reread(self, tmp_path: Path) -> None:
+        collector = _collector(tmp_path)
+        await _drain(collector)
+        _mkproc(tmp_path, 7, cmdline="nginx -g daemon off;")
+        await _drain(collector)  # first sighting
+        await _drain(collector)  # second sighting: details confirmed, now settled
+        (tmp_path / "7" / "cmdline").write_bytes(b"nginx: worker process\x00")
+        assert await _drain(collector) == []  # argv rewrite later in life: not re-read

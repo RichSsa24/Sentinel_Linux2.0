@@ -1,10 +1,11 @@
 """Raw -> ECS ``Event`` mapping: the one place a source becomes a common event.
 
 Each ``_map_*`` is a pure function that turns one source-specific raw record
-into a fully-populated, schema-valid :class:`~sentinel.events.Event`. The
-``event.id`` each computes is byte-for-byte the value the collectors used to
-produce inline, so moving the logic here changes *where* an event is built, not
-*what* it is — dedup and the exactly-once guarantee are unaffected.
+into a fully-populated, schema-valid :class:`~sentinel.events.Event`. Each
+``event.id`` is a deterministic hash of the record's identity, so re-observing
+the same thing yields the same id and the dedup window collapses it. For
+processes the identity includes the executable and command line, so an exec
+observed after a process was first seen is a new event, not a duplicate.
 
 :class:`Normalizer` is the fail-closed front door. It dispatches on the raw
 record's ``source`` and, if mapping raises (an out-of-range value the ECS schema
@@ -71,7 +72,11 @@ def _map_process(raw: RawProcessEvent) -> Event:
     return Event(
         timestamp=raw.occurred_at,
         event=EventMeta(
-            id=Event.compute_id(raw.pid, raw.starttime, raw.action),
+            # The image is part of the identity: a process that execs after it
+            # was first seen produces a second start that must not be deduped.
+            id=Event.compute_id(
+                raw.pid, raw.starttime, raw.action, raw.executable or "", raw.cmdline or ""
+            ),
             kind=EventKind.EVENT,
             category=EventCategory.PROCESS,
             action=raw.action,
