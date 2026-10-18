@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 import pytest
@@ -57,6 +58,43 @@ class TestEventsEndpoint:
         first_ids = {row["id"] for row in first["data"]}
         second_ids = {row["id"] for row in second["data"]}
         assert first_ids.isdisjoint(second_ids)
+
+    @pytest.mark.parametrize("path", ["/events", "/alerts"])
+    async def test_the_table_is_counted_on_the_first_page_only(
+        self,
+        database: Database,
+        api_client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+    ) -> None:
+        # Regression: every page ran count(*), a scan of the whole table, so
+        # walking N rows cost O(N^2 / limit).
+        await _seed_events(database, 5)
+        await _seed_alerts(database, 5)
+        counts: list[str] = []
+
+        def counting(name: str) -> Any:
+            original = getattr(Repository, name)
+
+            async def counted(self: Repository) -> int:
+                counts.append(name)
+                return int(await original(self))
+
+            return counted
+
+        for name in ("count_events", "count_alerts"):
+            monkeypatch.setattr(Repository, name, counting(name))
+        cursor: int | None = None
+        totals: list[int | None] = []
+        while True:
+            query = f"{path}?limit=2" + (f"&cursor={cursor}" if cursor else "")
+            page = (await api_client.get(query, headers=auth_header())).json()["pagination"]
+            totals.append(page["total"])
+            cursor = page["cursor"]
+            if not page["hasMore"]:
+                break
+        assert totals == [5, None, None]
+        assert len(counts) == 1
 
     async def test_last_page_has_no_cursor(
         self, database: Database, api_client: httpx.AsyncClient

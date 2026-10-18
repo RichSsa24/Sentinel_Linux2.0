@@ -102,7 +102,9 @@ class Pagination(BaseModel):
 
     cursor: int | None = Field(default=None, description="Pass as ?cursor= to fetch the next page.")
     has_more: bool = Field(serialization_alias="hasMore")
-    total: int | None = None
+    total: int | None = Field(
+        default=None, description="Rows in the collection; reported on the first page only."
+    )
 
 
 class Page[T](BaseModel):

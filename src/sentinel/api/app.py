@@ -6,7 +6,9 @@ responses go through the project envelope. Interactive docs and the OpenAPI
 schema are disabled — this is a machine read-API, not a public dev portal, and a
 smaller surface is a safer surface. Errors are generic (no stack traces or
 internal detail leak); all list endpoints are keyset-paginated with a bounded
-page size.
+page size. A list's ``total`` is counted on the first page only (``null`` on
+later ones): counting is a scan of the table, and doing it per page made
+walking N rows cost O(N²/limit).
 
 The app's lifespan runs the detection system itself: it starts a
 :class:`~sentinel.runtime.Runtime` (built from the same ``Settings``) on startup
@@ -286,7 +288,7 @@ def create_app(
         async with database.session() as session:
             repo = Repository(session)
             rows = await repo.list_events(limit=limit + 1, before_id=cursor)
-            total = await repo.count_events()
+            total = await repo.count_events() if cursor is None else None
         has_more = len(rows) > limit
         rows = rows[:limit]
         data = [EventOut.from_row(row) for row in rows]
@@ -303,7 +305,7 @@ def create_app(
         async with database.session() as session:
             repo = Repository(session)
             rows = await repo.list_alerts(limit=limit + 1, before_id=cursor)
-            total = await repo.count_alerts()
+            total = await repo.count_alerts() if cursor is None else None
         has_more = len(rows) > limit
         rows = rows[:limit]
         data = [AlertOut.from_row(row) for row in rows]
