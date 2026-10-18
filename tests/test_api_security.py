@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 import structlog
+from structlog.testing import capture_logs
 
 from sentinel.api import create_app
 from sentinel.detection.schema import Rule
@@ -32,6 +33,42 @@ class TestAuthentication:
     async def test_non_bearer_scheme_is_401(self, api_client: httpx.AsyncClient) -> None:
         resp = await api_client.get("/events", headers={"Authorization": "Basic abc"})
         assert resp.status_code == 401
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            f"Bearer {TEST_API_KEY[:-1]}",
+            f"Bearer {TEST_API_KEY}x",
+            f"Bearer {TEST_API_KEY.upper()}",
+            f"Bearer {TEST_API_KEY[1:]}",
+            f"Basic {TEST_API_KEY}",
+            f"Token {TEST_API_KEY}",
+            f"{TEST_API_KEY}",
+            "Bearer",
+            "Bearer ",
+        ],
+        ids=[
+            "prefix",
+            "extended",
+            "upper-case",
+            "suffix",
+            "basic",
+            "token",
+            "bare",
+            "empty",
+            "blank",
+        ],
+    )
+    async def test_anything_but_the_exact_bearer_key_is_401(
+        self, api_client: httpx.AsyncClient, header: str
+    ) -> None:
+        resp = await api_client.get("/events", headers={"Authorization": header})
+        assert resp.status_code == 401
+
+    async def test_the_scheme_is_case_insensitive(self, api_client: httpx.AsyncClient) -> None:
+        # RFC 9110 §11.1: the authentication scheme is case-insensitive.
+        resp = await api_client.get("/events", headers={"Authorization": f"bearer {TEST_API_KEY}"})
+        assert resp.status_code == 200
 
     async def test_valid_token_is_200(self, api_client: httpx.AsyncClient) -> None:
         assert (await api_client.get("/events", headers=auth_header())).status_code == 200
@@ -214,3 +251,43 @@ class TestPaginationBounds:
         largest = await api_client.get(f"{path}?cursor={2**63 - 1}", headers=auth_header())
         assert too_big.status_code == 422
         assert largest.status_code == 200
+
+
+class TestMutationGaps:
+    async def test_security_headers_have_exact_values(self, api_client: httpx.AsyncClient) -> None:
+        headers = (await api_client.get("/healthz")).headers
+        assert {name: headers[name] for name in _EXPECTED_HEADERS} == _EXPECTED_HEADERS
+
+    @pytest.mark.parametrize(
+        ("authorization", "detail", "reason"),
+        [
+            (None, "missing bearer token", "missing_bearer_token"),
+            ("Bearer wrong-key", "invalid token", "invalid_token"),
+        ],
+    )
+    async def test_401_says_what_is_wrong_and_logs_why(
+        self,
+        api_client: httpx.AsyncClient,
+        authorization: str | None,
+        detail: str,
+        reason: str,
+    ) -> None:
+        headers = {"Authorization": authorization} if authorization else {}
+        with capture_logs() as logs:
+            resp = await api_client.get("/events", headers=headers)
+        assert resp.status_code == 401
+        assert resp.json()["error"] == {"code": "UNAUTHORIZED", "message": detail}
+        assert resp.headers["WWW-Authenticate"] == "Bearer"
+        assert [e["reason"] for e in logs if e["event"] == "api.auth_failed"] == [reason]
+
+
+# Written out, not imported: a test that reads the constant passes whatever it says.
+_EXPECTED_HEADERS = {
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+}

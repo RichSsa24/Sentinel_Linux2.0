@@ -153,3 +153,27 @@ class TestReDoSResistance:
         # evaluator must not raise) yields no match rather than an error.
         condition = Condition.model_validate({"field": "m", "op": "regex", "value": "("})
         assert evaluate_condition(condition, {"m": "anything"}) is False
+
+
+class TestMutationGaps:
+    @pytest.mark.parametrize(
+        ("op", "value", "expected"),
+        [("gt", 5, False), ("gte", 5, True), ("lt", 5, False), ("lte", 5, True)],
+    )
+    def test_comparisons_at_the_boundary(self, op: str, value: int, expected: bool) -> None:
+        assert _match("n", op, value, {"n": 5}) is expected
+
+    def test_startswith_is_not_contains(self) -> None:
+        event: dict[str, object] = {"cmd": "sudo bash -i"}
+        assert _match("cmd", "startswith", "bash", event) is False
+        assert _match("cmd", "contains", "bash", event) is True
+        assert _match("cmd", "endswith", "bash", event) is False
+
+    def test_regex_ignores_case(self) -> None:
+        assert _match("cmd", "regex", "base64 -d", {"cmd": "BASE64 -D payload"}) is True
+
+    @pytest.mark.parametrize("offset", [8_000, 19_990])
+    def test_a_long_value_is_searched_at_both_ends(self, offset: int) -> None:
+        value = "a" * 20_000
+        value = value[:offset] + "nc -e" + value[offset + 5 :]
+        assert _match("cmd", "regex", r"nc\s+-e", {"cmd": value}) is True

@@ -10,7 +10,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 
-from sentinel.api import create_app
+from sentinel.api import create_app, security
 from sentinel.api.security import RateLimitMiddleware
 from sentinel.detection.schema import Rule
 from sentinel.metrics import Metrics
@@ -133,3 +133,29 @@ class TestRateLimitIntegration:
                 for _ in range(5)
             }
         assert codes == {200}
+
+
+class TestMutationGaps:
+    async def test_each_client_has_its_own_budget(self) -> None:
+        app = Starlette(routes=[Route("/", _ok)])
+        app.add_middleware(
+            RateLimitMiddleware, limit=1, window_seconds=60, time_source=_FakeClock()
+        )
+
+        def client(address: str) -> httpx.AsyncClient:
+            transport = httpx.ASGITransport(app=app, client=(address, 40000))
+            return httpx.AsyncClient(transport=transport, base_url="http://testserver")
+
+        async with client("10.0.0.1") as first, client("10.0.0.2") as second:
+            assert (await first.get("/")).status_code == 200
+            assert (await first.get("/")).status_code == 429
+            assert (await second.get("/")).status_code == 200  # not charged for the first
+
+    def test_at_the_tracking_cap_the_oldest_client_is_forgotten(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(security, "_MAX_TRACKED_CLIENTS", 2)
+        limiter = RateLimitMiddleware(_ok, limit=1, window_seconds=60)  # type: ignore[arg-type]
+        for client in ("a", "b", "c"):
+            limiter._window_for(client)
+        assert list(limiter._hits) == ["b", "c"]

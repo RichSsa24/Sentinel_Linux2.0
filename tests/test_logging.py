@@ -79,6 +79,41 @@ class TestRedactSensitiveProcessor:
         assert result == {"event": "auth.login", "user_id": "42", "ip": "10.0.0.1"}
 
 
+# Written out, not derived from SENSITIVE_KEY_PATTERNS: a test that iterates
+# the constant passes whatever the constant says.
+_MUST_REDACT = (
+    "password",
+    "db_passwd",
+    "webhook_hmac_secret",
+    "access_token",
+    "api_key",
+    "x_apikey",
+    "authorization",
+    "auth_header",
+    "set_cookie",
+    "session_id",
+    "credentials",
+    "ssh_private_key",
+    "hmac",
+    "smtp_password",
+    "SMTP_PASS",
+)
+
+
+@pytest.mark.parametrize("key", _MUST_REDACT)
+def test_credential_bearing_keys_are_redacted(key: str) -> None:
+    result = redact_sensitive_processor(None, "info", {key: "real-secret-value"})
+    assert result[key] == REDACTED_PLACEHOLDER
+
+
+@pytest.mark.parametrize("code", [*range(0x20), 0x7F])
+def test_every_control_character_but_tab_and_newline_is_neutralised(code: int) -> None:
+    char = chr(code)
+    result = strip_control_chars_processor(None, "info", {"msg": f"a{char}b"})
+    expected = f"a{char}b" if char in "\t\n" else "a?b"
+    assert result["msg"] == expected
+
+
 class TestStripControlCharsProcessor:
     def test_strips_null_byte(self) -> None:
         result = strip_control_chars_processor(None, "info", {"msg": "foo\x00bar"})

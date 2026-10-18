@@ -252,3 +252,79 @@ class TestHardenedDelivery:
         WebhookSink(_PUBLIC_URL, _SECRET)
         assert captured["trust_env"] is False  # a proxy would resolve behind the guard
         assert captured["follow_redirects"] is False
+
+
+class TestMutationGaps:
+    """Behaviours mutation testing showed no test pinned."""
+
+    @pytest.mark.security
+    def test_the_default_client_is_bounded_and_ignores_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        class _SpyClient:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", _SpyClient)
+        WebhookSink(_PUBLIC_URL, _SECRET, timeout_seconds=2.5)
+        assert captured == {
+            "timeout": 2.5,
+            "verify": True,
+            "trust_env": False,  # no HTTPS_PROXY: a proxy would resolve behind the guard
+            "follow_redirects": False,
+        }
+
+    @pytest.mark.security
+    async def test_the_guard_resolves_the_configured_host_and_port(self) -> None:
+        asked: list[tuple[str, int]] = []
+
+        async def resolver(host: str, port: int) -> list[str]:
+            asked.append((host, port))
+            return ["93.184.216.34"]
+
+        handler = _Handler([200])
+        sink = WebhookSink(
+            "https://hooks.example.com:8443/x", _SECRET, client=_client(handler), resolver=resolver
+        )
+        await sink.emit(make_alert())
+        assert asked == [("hooks.example.com", 8443)]
+        assert handler.requests[0].url.host == "93.184.216.34"  # pinned to what was checked
+
+    async def test_a_client_error_is_final_and_too_many_requests_is_retried(self) -> None:
+        refused = _Handler([400])
+        sink = WebhookSink(_PUBLIC_URL, _SECRET, client=_client(refused), sleeper=_noop_sleep)
+        with pytest.raises(WebhookError):
+            await sink.emit(make_alert())
+        assert len(refused.requests) == 1
+
+        throttled = _Handler([429, 200])
+        sink = WebhookSink(_PUBLIC_URL, _SECRET, client=_client(throttled), sleeper=_noop_sleep)
+        await sink.emit(make_alert())
+        assert len(throttled.requests) == 2
+
+    async def test_backoff_doubles_between_attempts_and_not_after_the_last(self) -> None:
+        waits: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            waits.append(seconds)
+
+        handler = _Handler([503, 503, 503, 503])
+        sink = WebhookSink(
+            _PUBLIC_URL, _SECRET, client=_client(handler), sleeper=sleeper, max_retries=4
+        )
+        with pytest.raises(WebhookError):
+            await sink.emit(make_alert())
+        assert waits == [0.5, 1.0, 2.0]  # four attempts tell doubling from linear
+
+    async def test_the_default_sleeper_really_waits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        waits: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            waits.append(seconds)
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        handler = _Handler([503, 200])
+        await WebhookSink(_PUBLIC_URL, _SECRET, client=_client(handler)).emit(make_alert())
+        assert waits == [0.5]

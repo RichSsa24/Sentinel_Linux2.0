@@ -678,6 +678,21 @@ class TestWriteBehind:
         # Throttled alerts are stored too, so they are lost (and counted) as well.
         assert snapshot.alerts_unpersisted == alerts["emitted"] + alerts["throttled"] > 0
 
+    async def test_the_outage_buffer_drops_the_oldest_records(
+        self, unreachable_database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        runtime = Runtime(
+            make_api_settings(persist_batch_size=1, persist_max_buffered=2),
+            database=unreachable_database,
+            metrics=Metrics(),
+            rules=rules,
+            sinks=[],
+        )
+        for event in _events(5):
+            await runtime._consume(event)
+        assert [e.message for e in runtime._pending_events] == ["e3", "e4"]
+        assert runtime.snapshot().dropped["persist_error"] == 3
+
     async def test_flush_interval_bounds_staleness(
         self, database: Database, rules: tuple[Rule, ...]
     ) -> None:

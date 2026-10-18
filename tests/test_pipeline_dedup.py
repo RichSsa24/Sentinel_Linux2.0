@@ -129,3 +129,14 @@ class TestMembershipDoesNotMutateCounters:
         w.seen("a")
         assert 42 not in w
         assert None not in w
+
+
+class TestMutationGaps:
+    def test_an_entry_lives_for_exactly_its_ttl(self) -> None:
+        clock = FakeClock()
+        window = DedupWindow(ttl_seconds=10, max_entries=10, time_source=clock)
+        window.seen("a")
+        clock.advance(9.999)
+        assert window.seen("a") is True  # still inside the window
+        clock.advance(0.001)  # exactly ttl after the first sighting (not extended by it)
+        assert window.seen("a") is False

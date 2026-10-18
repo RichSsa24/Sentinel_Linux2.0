@@ -710,3 +710,62 @@ class TestSourceAvailability:
         watched.mkdir()
         await _drain(collector)
         assert collector.source_available
+
+
+class TestMutationGaps:
+    """Behaviours mutation testing showed no test pinned."""
+
+    def test_a_creation_does_not_end_the_diff(self, tmp_path: Path) -> None:
+        # A new file listed first must not hide a change to the next one.
+        records = _collector(tmp_path)._diff(
+            {"/etc/old": _state(H1)},
+            {"/etc/new": _state(H1), "/etc/old": _state(H2)},
+        )
+        assert sorted((r.path, r.action) for r in records) == [
+            ("/etc/new", "file_created"),
+            ("/etc/old", "file_modified"),
+        ]
+
+    def test_the_scan_records_owner_and_group(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Distinct uid and gid, so neither can stand in for the other.
+        (tmp_path / "owned").write_text("x", encoding="utf-8")
+        real_lstat = Path.lstat
+
+        class _Owned:
+            def __init__(self, real: os.stat_result) -> None:
+                self._real = real
+                self.st_uid, self.st_gid = 1234, 5678
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._real, name)
+
+        def lstat(self: Path) -> object:
+            result = real_lstat(self)
+            return _Owned(result) if self.name == "owned" else result
+
+        monkeypatch.setattr(Path, "lstat", lstat)
+        state = _collector(tmp_path)._scan()[str(tmp_path / "owned")]
+        assert (state.uid, state.gid) == (1234, 5678)
+
+
+class TestMutationGapsLifecycle:
+    @pytest.mark.asyncio
+    async def test_a_change_just_before_stop_is_reported(self, tmp_path: Path) -> None:
+        collector = _collector(tmp_path, poll_interval=60)
+        queue = BoundedEventQueue(maxsize=16)
+        task = asyncio.create_task(collector.run(queue))
+        assert await _wait_for(lambda: collector._seeded)
+        (tmp_path / "dropped").write_text("x", encoding="utf-8")
+        await collector.stop()  # long before the next 60 s poll
+        await asyncio.wait_for(task, timeout=2)
+        assert queue.qsize() == 1  # the final scan reported it
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_file_too_big_to_hash_is_not_reported(self, tmp_path: Path) -> None:
+        (tmp_path / "big").write_bytes(b"x" * 64)
+        collector = _collector(tmp_path, max_hash_bytes=8)
+        await _drain(collector)  # baseline
+        assert await _drain(collector) == []
+        assert await _drain(collector) == []

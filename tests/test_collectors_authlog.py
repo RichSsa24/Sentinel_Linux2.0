@@ -27,7 +27,7 @@ from structlog.testing import capture_logs
 
 from sentinel.collectors.authlog import AuthLogCollector, parse_auth_line, parse_auth_records
 from sentinel.events import Event
-from sentinel.normalizer import Normalizer, RawAuthEvent, RawSource
+from sentinel.normalizer import Normalizer, RawAuthEvent, RawEvent, RawSource
 from sentinel.pipeline.queue import BoundedEventQueue
 from sentinel.pipeline.runner import Pipeline
 from tests.conftest import DeadLetterNormalizer, settings_no_env_file
@@ -621,3 +621,45 @@ class TestSourceAvailability:
             "collector.source_available",
         ]
         assert "SENTINEL_AUTH_LOG_PATH" in logs[0]["hint"]
+
+
+class _NthRecordDeadLettered(Normalizer):
+    """Dead-letters only the n-th record it is given (1-based)."""
+
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self._n = n
+        self.calls = 0
+
+    def normalize(self, raw: RawEvent) -> Event | None:
+        self.calls += 1
+        return None if self.calls == self._n else super().normalize(raw)
+
+
+class TestMutationGaps:
+    """Behaviours mutation testing showed no test pinned."""
+
+    async def test_one_dead_letter_does_not_drop_the_rest_of_its_line(self, tmp_path: Path) -> None:
+        # rsyslog's repeat summary turns one line into several records.
+        log = tmp_path / "auth.log"
+        log.write_text(
+            _line() + "\n" + _line("message repeated 3 times: [ " + _FAILED + "]") + "\n",
+            encoding="utf-8",
+        )
+        # Record 2 is the first of the repeated line's three.
+        collector = AuthLogCollector(log, year=YEAR, normalizer=_NthRecordDeadLettered(2))
+        events = await _drain_events(collector)
+        collector._close()
+        assert len(events) == 3  # 1 + 3 records, one dead-lettered
+
+    async def test_lines_written_just_before_stop_are_read(self, tmp_path: Path) -> None:
+        log = tmp_path / "auth.log"
+        log.write_text("", encoding="utf-8")
+        collector = AuthLogCollector(log, year=YEAR, poll_interval=60)
+        queue = BoundedEventQueue(maxsize=16)
+        task = asyncio.create_task(collector.run(queue))
+        assert await _wait_for(lambda: collector._handle is not None)  # first poll done
+        log.write_text(_line() + "\n", encoding="utf-8")
+        await collector.stop()  # long before the next 60 s poll
+        await asyncio.wait_for(task, timeout=2)
+        assert queue.qsize() == 1  # the final catch-up read it
