@@ -183,6 +183,9 @@ async def run_demo(rules: Sequence[Rule], *, stream: TextIO | None = None) -> De
                 queue_maxsize=10_000,
                 queue_backpressure=BackpressurePolicy.BLOCK,
                 persist_flush_interval_seconds=0.05,
+                # The scenario includes a log wipe under /var/log: declare it
+                # watched, as a deployment running log-tampering would.
+                fim_paths="/etc,/var/spool/cron,/var/log",
             ),
             database=database,
             metrics=metrics,

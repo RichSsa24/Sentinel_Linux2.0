@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 import structlog
 import uvicorn
+from structlog.testing import capture_logs
 
 from sentinel import cli
 from sentinel.demo import ScenarioCollector, run_demo
@@ -58,6 +59,14 @@ async def test_demo_detects_every_attack_step_and_nothing_benign() -> None:
 
 
 @pytest.mark.integration
+async def test_demo_prints_no_configuration_warning() -> None:
+    # The scenario's paths are watched in its settings, so the shop window
+    # does not open with "these rules cannot fire" for a rule it then fires.
+    with capture_logs() as logs:
+        await run_demo(load_rules(_RULES), stream=io.StringIO())
+    assert [e["event"] for e in logs if e["log_level"] == "warning"] == []
+
+
 async def test_demo_returns_even_if_the_pipeline_dies(monkeypatch: pytest.MonkeyPatch) -> None:
     # Regression: the demo waited for every event to be analyzed with no exit,
     # so a pipeline failure hung `sentinel demo` forever.
