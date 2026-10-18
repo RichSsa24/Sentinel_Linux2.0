@@ -151,6 +151,7 @@ class TestStripControlCharsProcessor:
         assert result["msg"] == "hello world 123"
 
 
+@pytest.mark.usefixtures("_restore_logging")
 class TestConfiguredPipeline:
     """End-to-end: configure with JSON renderer, emit a log, parse the line."""
 

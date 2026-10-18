@@ -690,6 +690,10 @@ class TestStatCache:
         collector = _collector(tmp_path)
         await _drain(collector)  # baseline, cacheable
         before = target.stat()
+        # Before Linux 6.13 ctime has jiffy granularity (4-10 ms): an edit in
+        # the same tick keeps the baseline's ctime, which the shifted clock
+        # above would hide. A real scan re-hashes such "racy" entries.
+        await asyncio.sleep(0.05)
 
         target.write_text("evil ALL=(ALL) ALL\n", encoding="utf-8")  # same length
         os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
