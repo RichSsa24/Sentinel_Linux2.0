@@ -37,19 +37,28 @@ without HTTP and is exercised end to end in `tests/test_runtime.py`.
 
 ### 2. Write-behind persistence
 
-Detection and alert delivery stay synchronous with consumption. Only the
-database write is deferred: events and their alerts are buffered and written
-in one transaction per `SENTINEL_PERSIST_BATCH_SIZE` events or
-`SENTINEL_PERSIST_FLUSH_INTERVAL_SECONDS`, whichever comes first, and flushed
-on shutdown. Batches use a bulk `executemany` INSERT (audit rows never need
-their generated keys back). SQLite runs in WAL mode with `synchronous=NORMAL`.
+Detection and alert delivery stay synchronous with consumption; the database
+write never runs on that path. Events and their alerts are buffered, and a
+dedicated flusher task writes them in one transaction when
+`SENTINEL_PERSIST_BATCH_SIZE` events are buffered (the consumer only signals
+it) or every `SENTINEL_PERSIST_FLUSH_INTERVAL_SECONDS`, and on shutdown. Batches
+use a bulk `executemany` INSERT (audit rows never need their generated keys
+back). SQLite runs in WAL mode with `synchronous=NORMAL`.
 
-*Trade-offs:* the read API may lag by one flush interval (0.5 s default); a
-hard kill loses at most one unflushed batch — events that were only in memory
-anyway; SQLite may roll back the last transactions on power loss (no
-corruption). A failed write is counted and logged, never propagated, so a
-database outage cannot stall detection. PostgreSQL is recommended where
-durability matters. *Result:* ~500 → ~10,000 events/s end to end.
+A failed write is put back at the front of the buffer and retried with
+exponential backoff (capped at 30 s), so a database restart loses nothing.
+During a longer outage the buffer is capped at 16 batches: the oldest records
+are dropped, and they — like anything still unwritten at shutdown — are
+counted in `sentinel_events_dropped_total{reason="persist_error"}` and
+`sentinel_alerts_unpersisted_total`. Alerts are delivered to their sinks
+regardless.
+
+*Trade-offs:* the read API may lag by about one flush interval (0.5 s default);
+a hard kill loses what was buffered — events that were only in memory anyway;
+SQLite may roll back the last transactions on power loss (no corruption).
+PostgreSQL is recommended where durability matters. *Result:* ~500 → ~20,000
+events/s end to end (code review then moved the size-triggered write off the
+consumer path, which roughly doubled the first version's ~10,000).
 
 ### 3. Index rules by the actions they can match
 

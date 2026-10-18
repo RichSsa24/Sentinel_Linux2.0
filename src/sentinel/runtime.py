@@ -18,14 +18,20 @@ Configuration errors fail closed at construction time: a half-configured sink
 :class:`ConfigurationError` instead of silently running without that channel.
 
 **Write-behind persistence.** Detection and alert delivery happen as each event
-is consumed; only the database write is deferred. Events and their alerts are
-buffered and written in one transaction when ``persist_batch_size`` events have
-accumulated or ``persist_flush_interval_seconds`` has elapsed, whichever comes
-first, and the buffer is always flushed on shutdown. One commit per event caps
-SQLite at a few hundred events per second; batching is what lets persistence
-keep up with the pipeline. The cost is bounded staleness in the read API (at
-most one flush interval) and, on a hard kill, losing at most one unflushed
-batch — events that were only in memory anyway.
+is consumed; the database write never sits on that path. Events and their
+alerts are buffered and a dedicated flusher task writes them in one transaction
+when ``persist_batch_size`` events have accumulated (the consumer signals it)
+or ``persist_flush_interval_seconds`` has elapsed, whichever comes first; the
+buffer is always flushed on shutdown. One commit per event caps SQLite at a few
+hundred events per second; batching is what lets persistence keep up.
+
+A failed write (a database restart, a lock timeout) is put back at the front of
+the buffer and retried with exponential backoff, so a transient outage loses
+nothing. The buffer is capped at ``_MAX_PENDING_BATCHES`` batches; beyond that
+the oldest records are dropped and counted, as is anything still unwritten at
+shutdown. The costs are bounded staleness in the read API (about one flush
+interval) and, on a hard kill, losing what was buffered — events that were only
+in memory anyway.
 """
 
 from __future__ import annotations
@@ -61,6 +67,10 @@ from sentinel.storage import Database, Repository
 
 _HOST_ROOT: Final[Path] = Path("/")
 _PROC: Final[Path] = Path("/proc")
+# Write-behind buffer bound during a database outage, in batches, and the cap on
+# the retry backoff.
+_MAX_PENDING_BATCHES: Final[int] = 16
+_MAX_RETRY_BACKOFF_S: Final[float] = 30.0
 
 
 class ConfigurationError(ValueError):
@@ -192,18 +202,22 @@ class Runtime:
         for collector in self._collectors:
             self._pipeline.register(collector)
         self._pipeline.set_consumer(self._consume)
-        metrics.observe_runtime(self.snapshot)
         self._task: asyncio.Task[None] | None = None
         # Write-behind buffer (see module docstring). The lock serialises the
-        # size-triggered and timer-triggered flushes so commits stay ordered.
+        # flusher's writes with the final shutdown flush so commits stay ordered.
         self._batch_size = settings.persist_batch_size
         self._flush_interval = settings.persist_flush_interval_seconds
+        self._max_pending = settings.persist_batch_size * _MAX_PENDING_BATCHES
         self._pending_events: list[Event] = []
         self._pending_alerts: list[Alert] = []
         self._flush_lock = asyncio.Lock()
-        self._flusher: asyncio.Task[None] | None = None
+        self._flush_wanted = asyncio.Event()
         self._stop_flushing = asyncio.Event()
-        self._persist_failed = 0
+        self._flusher: asyncio.Task[None] | None = None
+        self._events_unpersisted = 0
+        self._alerts_unpersisted = 0
+        # Last: a registry may call snapshot() during registration.
+        metrics.observe_runtime(self.snapshot)
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -245,8 +259,10 @@ class Runtime:
             # Ask, never cancel: a batch leaves the buffer before it is written,
             # so cancelling a flush mid-write would silently drop that batch.
             self._stop_flushing.set()
+            self._flush_wanted.set()
             await self._flusher
-        await self.flush()  # everything the drained pipeline consumed lands
+        if not await self.flush():  # one last attempt for what the drain consumed
+            self._discard_pending("runtime.unpersisted_at_shutdown")
         await self._alerts.aclose()
 
     def _on_pipeline_exit(self, task: asyncio.Task[None]) -> None:
@@ -270,38 +286,77 @@ class Runtime:
                 self._pending_alerts.append(alert)
         self._pending_events.append(event)
         self._metrics.events_ingested.inc()
+        if len(self._pending_events) > self._max_pending:
+            self._trim_pending()
         if len(self._pending_events) >= self._batch_size:
-            await self.flush()
+            self._flush_wanted.set()  # the flusher writes; detection never waits on it
 
-    async def flush(self) -> None:
+    async def flush(self) -> bool:
         """Write every buffered event and alert in one transaction.
 
-        A failed write is logged (exception type only) and counted as
-        ``dropped{reason="persist_error"}``; it never propagates into the
-        consumer, so a database outage cannot stall detection and alerting.
+        Returns False if the write failed. The batch is then put back at the
+        front of the buffer (order preserved) for the next attempt, and the
+        failure is logged by exception type only — it never propagates, so a
+        database outage cannot stall detection and alerting.
         """
         async with self._flush_lock:
             events, self._pending_events = self._pending_events, []
             alerts, self._pending_alerts = self._pending_alerts, []
             if not events and not alerts:
-                return
+                return True
             try:
                 async with self._database.session() as session:
                     await Repository(session).save_batch(events=events, alerts=alerts)
             except Exception as exc:
-                self._persist_failed += len(events)
+                self._pending_events[:0] = events
+                self._pending_alerts[:0] = alerts
+                self._trim_pending()
                 self._log.error(
                     "runtime.persist_failed",
                     events=len(events),
                     alerts=len(alerts),
+                    buffered=len(self._pending_events),
                     error=type(exc).__name__,
                 )
+                return False
+            return True
 
     async def _flush_periodically(self) -> None:
+        """Flush on a full batch or every interval; back off while writes fail."""
+        delay = self._flush_interval
         while not self._stop_flushing.is_set():
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._stop_flushing.wait(), timeout=self._flush_interval)
-            await self.flush()
+                await asyncio.wait_for(self._flush_wanted.wait(), timeout=delay)
+            self._flush_wanted.clear()
+            if await self.flush():
+                delay = self._flush_interval
+            else:
+                # Do not hammer a database that is down: wait out the backoff
+                # (unless shutting down) before the next attempt.
+                delay = min(delay * 2, _MAX_RETRY_BACKOFF_S)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._stop_flushing.wait(), timeout=delay)
+
+    def _trim_pending(self) -> None:
+        """Enforce the buffer cap by dropping (and counting) the oldest records."""
+        excess_events = len(self._pending_events) - self._max_pending
+        if excess_events > 0:
+            del self._pending_events[:excess_events]
+            self._events_unpersisted += excess_events
+        excess_alerts = len(self._pending_alerts) - self._max_pending
+        if excess_alerts > 0:
+            del self._pending_alerts[:excess_alerts]
+            self._alerts_unpersisted += excess_alerts
+
+    def _discard_pending(self, reason: str) -> None:
+        """Count and log whatever is still buffered as lost."""
+        events, alerts = len(self._pending_events), len(self._pending_alerts)
+        if events or alerts:
+            self._events_unpersisted += events
+            self._alerts_unpersisted += alerts
+            self._pending_events.clear()
+            self._pending_alerts.clear()
+            self._log.error(reason, events=events, alerts=alerts)
 
     # ------------------------------------------------------------------ observability
 
@@ -317,7 +372,7 @@ class Runtime:
                 "duplicate": pipeline["deduped"],
                 "consumer_error": pipeline["consumer_errors"],
                 "dead_letter": dead_letters,
-                "persist_error": self._persist_failed,
+                "persist_error": self._events_unpersisted,
             },
             alerts_delivered=self._alerts.delivered_by_sink,
             alerts_suppressed={
@@ -326,4 +381,5 @@ class Runtime:
                 "throttled": alerts["throttled"],
             },
             sink_errors=alerts["sink_errors"],
+            alerts_unpersisted=self._alerts_unpersisted,
         )

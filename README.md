@@ -159,7 +159,7 @@ runs) on a 4-vCPU Xeon @ 2.8 GHz VM, Python 3.13 — re-run it on your hardware.
 
 | Hot path | Before | After | Change |
 | --- | --- | --- | --- |
-| End to end: collector → dedup → 17 rules → alerts → SQLite | ~500 events/s | ~10,000 events/s | **~20×** — write-behind batching, bulk insert, SQLite WAL |
+| End to end: collector → dedup → 17 rules → alerts → SQLite | ~500 events/s | ~20,000 events/s | **~40×** — write-behind flusher off the detection path, bulk insert, SQLite WAL |
 | Rule engine | ~18,000 events/s | ~30,000 events/s | ~1.7× — action index, cached field paths |
 | FIM poll, 2,000 unchanged files (31 MiB) | ~210 ms | ~50 ms | ~4× — stat cache |
 | Process poll, per process | ~125 µs | ~60 µs | ~2× — read only `stat` for known processes |

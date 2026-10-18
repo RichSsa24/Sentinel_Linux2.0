@@ -236,13 +236,13 @@ def bench_runtime() -> str:
     events = _mixed_events(5_000)
     rules = load_rules(_ROOT / "rules")
 
-    async def run(batch_size: int) -> float:
+    async def run() -> float:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(f"sqlite+aiosqlite:///{tmp}/bench.db")
             await db.create_all()
             metrics = Metrics()
             runtime = Runtime(
-                Settings(env="test", persist_batch_size=batch_size),
+                Settings(env="test"),  # default write-behind settings
                 database=db,
                 metrics=metrics,
                 rules=rules,
@@ -258,12 +258,8 @@ def bench_runtime() -> str:
             await db.dispose()
             return elapsed
 
-    single = statistics.median([asyncio.run(run(1)) for _ in range(3)])
-    batched = statistics.median([asyncio.run(run(256)) for _ in range(3)])
-    return (
-        f"{len(events) / batched:,.0f} events/s (batch 256) · "
-        f"{len(events) / single:,.0f} events/s (batch 1)"
-    )
+    seconds = statistics.median([asyncio.run(run()) for _ in range(3)])
+    return f"{len(events) / seconds:,.0f} events/s ({len(events):,} events, all persisted)"
 
 
 BENCHMARKS: dict[str, Callable[[], str]] = {

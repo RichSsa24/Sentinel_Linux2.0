@@ -44,6 +44,7 @@ class RuntimeSnapshot:
     alerts_delivered: Mapping[str, int] = field(default_factory=dict)
     alerts_suppressed: Mapping[str, int] = field(default_factory=dict)
     sink_errors: int = 0
+    alerts_unpersisted: int = 0
 
 
 class _RuntimeCollector(Collector):
@@ -61,7 +62,7 @@ class _RuntimeCollector(Collector):
         )
         yield _labelled_counter(
             "sentinel_events_dropped",
-            "Events not passed to detection, by reason.",
+            "Events dropped before detection or never persisted, by reason.",
             "reason",
             snap.dropped,
         )
@@ -82,6 +83,12 @@ class _RuntimeCollector(Collector):
         )
         errors.add_metric([], snap.sink_errors)
         yield errors
+        unpersisted = CounterMetricFamily(
+            "sentinel_alerts_unpersisted",
+            "Delivered alerts that could not be written to the database.",
+        )
+        unpersisted.add_metric([], snap.alerts_unpersisted)
+        yield unpersisted
 
 
 def _labelled_counter(

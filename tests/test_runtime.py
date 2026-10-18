@@ -347,11 +347,116 @@ class TestWriteBehind:
         runtime.start()
         try:
             assert await _wait_for(lambda: metrics.events_ingested._value.get() == 10)
-            # Two full batches of 4 are on disk; the last 2 wait for the timer.
-            assert await _count_events(database) == 8
+            # A full batch wakes the flusher at once — no waiting for the 60 s
+            # timer (how many land per write depends on scheduling).
+            written = 0
+            for _ in range(100):
+                written = await _count_events(database)
+                if written >= 4:
+                    break
+                await asyncio.sleep(0.02)
+            assert written >= 4
         finally:
             await runtime.stop()
         assert await _count_events(database) == 10  # shutdown flushes the remainder
+
+    async def test_detection_never_waits_on_a_slow_database(
+        self,
+        database: Database,
+        rules: tuple[Rule, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Regression: a full batch used to be written inline by the consumer, so
+        # detection and alerting stalled for the whole commit.
+        writing, release = asyncio.Event(), asyncio.Event()
+        original = Repository.save_batch
+
+        async def blocked_save(self: Repository, **batch: Any) -> int:
+            writing.set()
+            await release.wait()
+            return await original(self, **batch)
+
+        monkeypatch.setattr(Repository, "save_batch", blocked_save)
+        metrics = Metrics()
+        runtime = Runtime(
+            make_api_settings(persist_batch_size=2, persist_flush_interval_seconds=60),
+            database=database,
+            metrics=metrics,
+            rules=rules,
+            collectors=[_Replay(_events(30))],
+            sinks=[],
+        )
+        runtime.start()
+        try:
+            await asyncio.wait_for(writing.wait(), timeout=2)
+            # Every event is analyzed while the first write is still blocked.
+            assert await _wait_for(lambda: metrics.events_ingested._value.get() == 30)
+        finally:
+            release.set()
+            await runtime.stop()
+        assert await _count_events(database) == 30
+
+    async def test_failed_batches_are_retried_not_dropped(
+        self,
+        database: Database,
+        rules: tuple[Rule, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        failures = {"left": 2}
+        original = Repository.save_batch
+
+        async def flaky_save(self: Repository, **batch: Any) -> int:
+            if failures["left"]:
+                failures["left"] -= 1
+                raise OSError("database restarting")
+            return await original(self, **batch)
+
+        monkeypatch.setattr(Repository, "save_batch", flaky_save)
+        runtime = Runtime(
+            make_api_settings(persist_batch_size=1, persist_flush_interval_seconds=0.01),
+            database=database,
+            metrics=Metrics(),
+            rules=rules,
+            collectors=[_Replay(_events(5))],
+            sinks=[],
+        )
+        runtime.start()
+        try:
+            written = 0
+            for _ in range(200):
+                written = await _count_events(database)
+                if written == 5:
+                    break
+                await asyncio.sleep(0.02)
+            assert written == 5
+        finally:
+            await runtime.stop()
+        assert failures["left"] == 0
+        assert runtime.snapshot().dropped["persist_error"] == 0
+
+    async def test_outage_buffer_is_bounded_and_losses_are_counted(
+        self, tmp_path: Path, rules: tuple[Rule, ...]
+    ) -> None:
+        broken = Database(f"sqlite+aiosqlite:///{tmp_path / 'missing-dir' / 'x.db'}")
+        metrics = Metrics()
+        runtime = Runtime(
+            # batch 1 -> the buffer holds at most 16 records during the outage
+            make_api_settings(persist_batch_size=1, persist_flush_interval_seconds=0.01),
+            database=broken,
+            metrics=metrics,
+            rules=rules,
+            collectors=[_Replay(_events(40))],
+            sinks=[],
+        )
+        runtime.start()
+        assert await _wait_for(lambda: metrics.events_ingested._value.get() == 40)
+        assert len(runtime._pending_events) <= 16
+        await runtime.stop()
+        await broken.dispose()
+        snapshot = runtime.snapshot()
+        # Everything is accounted for: dropped by the cap, or unwritten at shutdown.
+        assert snapshot.dropped["persist_error"] == 40
+        assert snapshot.alerts_unpersisted == runtime._alerts.stats["emitted"] > 0
 
     async def test_flush_interval_bounds_staleness(
         self, database: Database, rules: tuple[Rule, ...]
