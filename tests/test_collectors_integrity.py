@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import os
 import time
 from collections.abc import Callable
@@ -420,11 +421,59 @@ class TestSafeDegradation:
         target = tmp_path / "locked.bin"
         target.write_text("secret", encoding="utf-8")
 
-        def _denied(self: Path, *args: object, **kwargs: object) -> object:
+        def _denied(*args: object, **kwargs: object) -> int:
             raise PermissionError("EACCES")
 
-        monkeypatch.setattr(Path, "open", _denied)
-        assert _collector(tmp_path)._hash_file(target) is None
+        expected = target.lstat()
+        monkeypatch.setattr(os, "open", _denied)
+        assert _collector(tmp_path)._hash_file(target, expected) is None
+
+
+@pytest.mark.security
+class TestEntrySwappedAfterLstat:
+    """Regression: the scan hashed with a plain open() after classifying with lstat.
+
+    Whoever can write to a watched directory could swap the entry in between:
+    a FIFO blocked the scan thread forever, a symlink to /dev/zero never ended.
+    Each case must now return promptly with "unhashable".
+    """
+
+    def test_a_fifo_is_refused_without_blocking(self, tmp_path: Path) -> None:
+        regular = tmp_path / "f"
+        regular.write_bytes(b"x")
+        expected = regular.lstat()
+        regular.unlink()
+        os.mkfifo(regular)
+        assert _collector(tmp_path)._hash_file(regular, expected) is None
+
+    def test_a_symlink_is_not_followed(self, tmp_path: Path) -> None:
+        regular = tmp_path / "f"
+        regular.write_bytes(b"x")
+        expected = regular.lstat()
+        regular.unlink()
+        regular.symlink_to("/dev/zero")
+        assert _collector(tmp_path)._hash_file(regular, expected) is None
+
+    def test_a_different_file_is_refused(self, tmp_path: Path) -> None:
+        regular = tmp_path / "f"
+        regular.write_bytes(b"x")
+        expected = regular.lstat()
+        replacement = tmp_path / "g"
+        replacement.write_bytes(b"x")
+        replacement.replace(regular)  # same name, another inode
+        assert _collector(tmp_path)._hash_file(regular, expected) is None
+
+    def test_reading_stops_at_the_hash_cap(self, tmp_path: Path) -> None:
+        grown = tmp_path / "f"
+        grown.write_bytes(b"x" * 64)
+        collector = _collector(tmp_path, max_hash_bytes=16)
+        assert collector._hash_file(grown, grown.lstat()) is None
+
+    def test_an_unchanged_file_still_hashes(self, tmp_path: Path) -> None:
+        regular = tmp_path / "f"
+        regular.write_bytes(b"abc")
+        digest = _collector(tmp_path)._hash_file(regular, regular.lstat())
+        assert digest == hashlib.sha256(b"abc").hexdigest()
 
 
 class TestDeadLetter:

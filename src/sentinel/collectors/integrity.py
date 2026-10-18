@@ -260,19 +260,49 @@ class FileIntegrityCollector(AbstractCollector):
             return state._replace(sha256=previous.sha256)
         if lst.st_size <= self._max_hash_bytes:
             self._hashed += 1
-            return state._replace(sha256=self._hash_file(path))
+            return state._replace(sha256=self._hash_file(path, lst))
         return state
 
-    def _hash_file(self, path: Path) -> str | None:
-        """Stream a file's SHA-256, or None on read failure."""
-        digest = hashlib.sha256()
+    def _hash_file(self, path: Path, expected: os.stat_result) -> str | None:
+        """Stream a file's SHA-256, or None if it cannot be read *safely*.
+
+        The path was classified by ``lstat``; between that call and the open,
+        anyone who can write to the directory can swap the entry. A plain
+        ``open()`` would then follow a symlink (to ``/dev/zero``: a read that
+        never ends) or block forever on a FIFO, hanging the scan thread and
+        silencing file-integrity monitoring. So the open neither follows links
+        nor blocks, ``fstat`` must show the same regular file the ``lstat``
+        saw, and at most ``max_hash_bytes`` are read (a file grown past the cap
+        since is treated as unhashable).
+        """
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
         try:
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(_HASH_CHUNK), b""):
-                    digest.update(chunk)
+            fd = os.open(path, flags)
         except OSError:
             return None
-        return digest.hexdigest()
+        try:
+            return self._digest_if_same_file(fd, expected)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+
+    def _digest_if_same_file(self, fd: int, expected: os.stat_result) -> str | None:
+        """SHA-256 of ``fd`` if it is the regular file ``expected`` describes."""
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            return None
+        if (opened.st_ino, opened.st_dev) != (expected.st_ino, expected.st_dev):
+            return None
+        digest = hashlib.sha256()
+        remaining = self._max_hash_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(_HASH_CHUNK, remaining))
+            if not chunk:
+                return digest.hexdigest()
+            digest.update(chunk)
+            remaining -= len(chunk)
+        return None  # grew past the cap since the lstat
 
     # ------------------------------------------------------------------ diffing
 
