@@ -49,3 +49,22 @@ def test_prometheus_loads_the_rules() -> None:
     compose = yaml.safe_load((_DEPLOY / "docker-compose.yml").read_text("utf-8"))
     volumes = compose["services"]["prometheus"]["volumes"]
     assert "./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro" in volumes
+
+
+def _anchors(markdown: str) -> set[str]:
+    """GitHub's heading anchors: lower-case, punctuation dropped, spaces to hyphens."""
+    headings = re.findall(r"^#{1,6} (.+)$", markdown, flags=re.MULTILINE)
+    return {re.sub(r"[^\w\- ]", "", h).strip().lower().replace(" ", "-") for h in headings}
+
+
+def test_every_alert_links_to_a_runbook_section_that_exists() -> None:
+    runbook = (_DEPLOY.parent / "docs" / "OPERATIONS.md").read_text(encoding="utf-8")
+    anchors = _anchors(runbook)
+    groups = yaml.safe_load(_RULES_FILE.read_text(encoding="utf-8"))["groups"]
+    links = {rule["alert"]: rule["annotations"]["runbook"] for g in groups for rule in g["rules"]}
+    assert all(link.startswith("docs/OPERATIONS.md#") for link in links.values())
+    missing = {alert: link for alert, link in links.items() if link.split("#")[1] not in anchors}
+    assert missing == {}
+    unit = (_DEPLOY / "systemd" / "sentinel.service").read_text(encoding="utf-8")
+    for reference in re.findall(r"docs/OPERATIONS\.md#([\w-]+)", unit):
+        assert reference in anchors
