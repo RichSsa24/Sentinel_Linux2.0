@@ -587,6 +587,28 @@ class TestAppLifespan:
         assert "sentinel_queue_depth" in body
         assert 'sentinel_alerts_suppressed_total{reason="throttled"}' in body
 
+    async def test_failed_startup_still_releases_the_database(
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        disposed: list[bool] = []
+        original = database.dispose
+
+        async def spy() -> None:
+            disposed.append(True)
+            await original()
+
+        monkeypatch.setattr(database, "dispose", spy)
+        app = create_app(
+            make_api_settings(webhook_url="https://hooks.example.com/x"),  # no HMAC secret
+            database=database,
+            metrics=Metrics(),
+            rules=rules,
+        )
+        with pytest.raises(ConfigurationError):
+            async with app.router.lifespan_context(app):
+                pass
+        assert disposed == [True]
+
 
 class TestGetApp:
     def test_configures_logging_and_loads_rules_from_settings(

@@ -83,20 +83,24 @@ def _runtime_lifespan(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-        runtime = Runtime(
-            settings,
-            database=database,
-            metrics=metrics,
-            rules=rules,
-            collectors=collectors,
-            sinks=sinks,
-        )
-        app.state.runtime = runtime
-        runtime.start()
+        runtime: Runtime | None = None
         try:
+            # Inside the try: a ConfigurationError from building the runtime
+            # must still release the database pool.
+            runtime = Runtime(
+                settings,
+                database=database,
+                metrics=metrics,
+                rules=rules,
+                collectors=collectors,
+                sinks=sinks,
+            )
+            app.state.runtime = runtime
+            runtime.start()
             yield
         finally:
-            await runtime.stop()
+            if runtime is not None:
+                await runtime.stop()
             await database.dispose()
 
     return lifespan
