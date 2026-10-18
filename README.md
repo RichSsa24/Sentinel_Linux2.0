@@ -249,7 +249,7 @@ Every push runs ([`ci.yml`](.github/workflows/ci.yml)), on Python 3.12 and 3.13:
 
 | Gate | Tool |
 | --- | --- |
-| 580+ tests, branch coverage ≥ 95% enforced (98.8% at time of writing) | pytest, Hypothesis |
+| 600+ tests, branch coverage ≥ 95% enforced (98.7% at time of writing) | pytest, Hypothesis |
 | Strict typing | mypy `--strict` + pydantic plugin |
 | Lint and format | ruff |
 | Security lint, secret scanning | bandit, detect-secrets |
@@ -272,13 +272,18 @@ uv run mypy && uv run ruff check . && uv run pre-commit run --all-files
 Stated plainly, because a detector's blind spots matter as much as its rules:
 
 - **Polling, not kernel events.** Processes and connections that start and end
-  within one poll interval (1–2 s) are missed, as is an `exec` that replaces a
-  process image in place. An eBPF or netlink proc-connector collector is the fix.
+  within one poll interval (1–2 s) are missed. An `exec` right after `fork` is
+  caught (a new process is re-read once to confirm its image), but an `exec` by
+  a process already confirmed is not. An eBPF or netlink proc-connector
+  collector is the fix.
 - **Privilege vs. visibility.** Resolving `/proc/<pid>/exe` requires ptrace-read
   access to the target (`proc(5)`), so the non-root container records the
   executable path only for processes it may inspect; command-line rules are
   unaffected. Unreadable files (e.g. `/etc/shadow`) are tracked by metadata,
-  including `ctime`, instead of by hash.
+  including `ctime`, instead of by hash. Because only `ctime` reveals them, an
+  ACL, xattr, SELinux-label or `chattr` change to such a file is reported as a
+  modification (fail-safe: a false positive, never a miss). Grant read access
+  for content-accurate monitoring.
 - **SQLite trades durability for speed** (`synchronous=NORMAL` in WAL mode): the
   last transactions can roll back on power loss. Use PostgreSQL in production.
 - **No retention policy yet** — the events table grows until pruned externally.

@@ -61,11 +61,14 @@ the way. Residual risks are listed explicitly at the end.
   raises the cost and leaves traces (FIM, log-tampering, process and socket
   events), but a host-based detector cannot defend against its own host's kernel.
 - **Polling blind spots.** Processes and connections that live for less than one
-  poll interval, and an `exec` that replaces a process image in place, are not
-  observed. Kernel event sources (eBPF) would close this gap.
+  poll interval are not observed, nor is an `exec` by a process that was already
+  confirmed (the `fork`→`exec` window right after creation is covered). Kernel
+  event sources (eBPF) would close this gap.
 - **Reduced visibility when unprivileged.** Without ptrace-read access to a
   process, its executable path cannot be resolved; unreadable files are tracked
-  by metadata rather than content.
+  by metadata rather than content. For those files a change that moves only
+  `ctime` (ACL, xattr, SELinux label, `chattr`) is reported as a modification:
+  fail-safe, at the cost of a false positive.
 - **Database custody.** Whoever holds the database credentials can delete rows.
   Ship events to an external SIEM (via the webhook sink or log forwarding) when
   tamper-evidence matters.
