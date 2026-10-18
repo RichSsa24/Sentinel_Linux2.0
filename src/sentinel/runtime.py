@@ -42,7 +42,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import socket
-import time
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Final
@@ -54,8 +53,10 @@ from sentinel.alerting import (
     AlertManager,
     AlertSink,
     ConsoleSink,
+    DestinationBlockedError,
     EmailSink,
     WebhookSink,
+    validate_destination,
 )
 from sentinel.collectors.authlog import AuthLogCollector
 from sentinel.collectors.base import AbstractCollector, under_host_root
@@ -150,6 +151,13 @@ def build_sinks(settings: Settings) -> list[AlertSink]:
         if settings.webhook_hmac_secret is None:
             msg = "SENTINEL_WEBHOOK_URL is set but SENTINEL_WEBHOOK_HMAC_SECRET is not"
             raise ConfigurationError(msg)
+        try:  # https, a host, no blocked IP literal; names are checked per send
+            validate_destination(
+                settings.webhook_url.get_secret_value(),
+                allow_private=settings.webhook_allow_private,
+            )
+        except DestinationBlockedError as exc:
+            raise ConfigurationError(f"SENTINEL_WEBHOOK_URL: {exc}") from exc
         sinks.append(
             WebhookSink(
                 settings.webhook_url.get_secret_value(),
@@ -183,7 +191,10 @@ def build_sinks(settings: Settings) -> list[AlertSink]:
 
 
 def build_alert_manager(
-    settings: Settings, rules: Iterable[Rule], sinks: Sequence[AlertSink]
+    settings: Settings,
+    rules: Iterable[Rule],
+    sinks: Sequence[AlertSink],
+    on_delivered: Callable[[float], None] | None = None,
 ) -> AlertManager:
     """An alert manager with the configured gates and every rule's own throttle."""
     return AlertManager(
@@ -193,6 +204,7 @@ def build_alert_manager(
         throttle_max=settings.alert_throttle_max,
         throttle_window_seconds=settings.alert_throttle_window_seconds,
         rule_throttles={rule.id: rule.throttle for rule in rules if rule.throttle is not None},
+        on_delivered=on_delivered,
     )
 
 
@@ -217,7 +229,10 @@ class Runtime:
         self._log = get_logger("sentinel.runtime")
         self._engine = DetectionEngine(rule_list)
         self._alerts = build_alert_manager(
-            settings, rule_list, sinks if sinks is not None else build_sinks(settings)
+            settings,
+            rule_list,
+            sinks if sinks is not None else build_sinks(settings),
+            on_delivered=metrics.alert_latency.observe,
         )
         self._collectors = tuple(
             collectors if collectors is not None else build_collectors(settings)
@@ -311,11 +326,9 @@ class Runtime:
             self._metrics.detections_fired.labels(
                 rule_id=detection.rule_id, severity=str(detection.severity)
             ).inc()
-            started = time.perf_counter()
+            # Notifications are queued per sink; latency is observed on delivery.
             alert = await self._alerts.process(detection)
             if alert is not None:  # notified or throttled: stored either way
-                if alert.notified:
-                    self._metrics.alert_latency.observe(time.perf_counter() - started)
                 self._pending_alerts.append(alert)
         self._pending_events.append(event)
         self._metrics.events_ingested.inc()
@@ -471,6 +484,7 @@ class Runtime:
                 "throttled": alerts["throttled"],
             },
             sink_errors=alerts["sink_errors"],
+            alert_deliveries_dropped=self._alerts.dropped_by_sink,
             alerts_unpersisted=self._alerts_unpersisted,
             pipeline_up=self.running,
             collector_restarts=self._pipeline.collector_restarts,

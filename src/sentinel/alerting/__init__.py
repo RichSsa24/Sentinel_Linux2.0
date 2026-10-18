@@ -11,6 +11,7 @@ from sentinel.alerting.sinks import (
     EmailSink,
     WebhookError,
     WebhookSink,
+    resolve_destination,
     validate_destination,
 )
 
@@ -23,6 +24,7 @@ __all__ = [
     "EmailSink",
     "WebhookError",
     "WebhookSink",
+    "resolve_destination",
     "severity_label",
     "validate_destination",
 ]

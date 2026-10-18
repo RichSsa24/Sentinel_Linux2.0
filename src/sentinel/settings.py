@@ -163,7 +163,9 @@ class Settings(BaseSettings):
         "services (Slack, Teams, Discord) the URL itself is the credential.",
     )
     webhook_hmac_secret: SecretStr | None = Field(
-        default=None, description="Shared secret for HMAC-signing webhook payloads."
+        default=None,
+        min_length=32,
+        description="Shared secret for HMAC-signing webhook payloads, at least 32 characters.",
     )
     webhook_allow_private: bool = Field(
         default=False,

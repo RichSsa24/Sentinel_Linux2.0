@@ -18,12 +18,19 @@ flood (a notification-channel DoS):
    first throttled alert of a window is logged, and the rule's next
    notification states how many were withheld.
 
-Delivery is firewalled: a sink that raises is counted and logged (by type, never
-the payload or any secret) and the other sinks still receive the alert.
+Delivery is bulkheaded: every sink has its own bounded queue and delivery
+worker, and each delivery has a deadline. A slow, hung or failing channel
+(an unresponsive webhook, broken DNS) delays only its own notifications —
+never detection, the other sinks, or the API. A sink that raises is counted
+and logged (by type, never the payload or any secret); a full queue drops the
+notification for that sink and counts it. :meth:`AlertManager.aclose` drains
+the queues, within a deadline, before closing the sinks.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -40,6 +47,85 @@ _DEFAULT_DEDUP_WINDOW_S: Final[float] = 300.0
 _DEFAULT_DEDUP_MAX_ENTRIES: Final[int] = 100_000
 _DEFAULT_THROTTLE_MAX: Final[int] = 10
 _DEFAULT_THROTTLE_WINDOW_S: Final[float] = 60.0
+_DEFAULT_SINK_QUEUE: Final[int] = 1_000
+_DEFAULT_DELIVERY_TIMEOUT_S: Final[float] = 30.0
+_DEFAULT_DRAIN_TIMEOUT_S: Final[float] = 10.0
+
+
+class _SinkLane:
+    """One sink's bounded queue and delivery worker (the bulkhead)."""
+
+    def __init__(
+        self,
+        sink: AlertSink,
+        *,
+        maxsize: int,
+        timeout_seconds: float,
+        on_delivered: Callable[[float], None] | None,
+        log: object,
+    ) -> None:
+        self.sink = sink
+        self._queue: asyncio.Queue[tuple[Alert, float]] = asyncio.Queue(maxsize)
+        self._timeout = timeout_seconds
+        self._on_delivered = on_delivered
+        self._log = log
+        self._worker: asyncio.Task[None] | None = None
+        self.delivered = 0
+        self.errors = 0
+        self.dropped = 0
+
+    def offer(self, alert: Alert) -> None:
+        """Queue ``alert`` for delivery without waiting; drop and count it if full."""
+        if self._worker is None:
+            self._worker = asyncio.create_task(self._deliver(), name=f"sink:{self.sink.name}")
+        try:
+            self._queue.put_nowait((alert, time.perf_counter()))
+        except asyncio.QueueFull:
+            self.dropped += 1
+            self._log.warning(  # type: ignore[attr-defined]
+                "alert.sink.queue_full", sink=self.sink.name, rule_id=alert.rule_id
+            )
+
+    async def _deliver(self) -> None:
+        while True:
+            alert, queued_at = await self._queue.get()
+            try:
+                async with asyncio.timeout(self._timeout):
+                    await self.sink.emit(alert)
+            except Exception as exc:
+                # Firewall: a failing sink must not stop the others, and must
+                # not leak the alert payload or any secret — log the type only.
+                self.errors += 1
+                self._log.warning(  # type: ignore[attr-defined]
+                    "alert.sink.error",
+                    sink=self.sink.name,
+                    rule_id=alert.rule_id,
+                    error=type(exc).__name__,
+                )
+            else:
+                self.delivered += 1
+                if self._on_delivered is not None:
+                    self._on_delivered(time.perf_counter() - queued_at)
+            finally:
+                self._queue.task_done()
+
+    async def drain(self, max_wait: float | None) -> None:
+        """Wait until every queued notification has been attempted."""
+        if self._worker is not None:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(max_wait):
+                    await self._queue.join()
+
+    async def stop(self) -> int:
+        """Stop the worker; return how many notifications were abandoned."""
+        abandoned = self._queue.qsize()
+        if self._worker is not None:
+            self._worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker
+            self._worker = None
+        self.dropped += abandoned
+        return abandoned
 
 
 class AlertManager:
@@ -56,6 +142,9 @@ class AlertManager:
         throttle_window_seconds: float = _DEFAULT_THROTTLE_WINDOW_S,
         rule_throttles: Mapping[str, Throttle] | None = None,
         time_source: Callable[[], float] = time.monotonic,
+        sink_queue_size: int = _DEFAULT_SINK_QUEUE,
+        delivery_timeout_seconds: float = _DEFAULT_DELIVERY_TIMEOUT_S,
+        on_delivered: Callable[[float], None] | None = None,
     ) -> None:
         self._sinks: tuple[AlertSink, ...] = tuple(sinks)
         self._min_severity = min_severity
@@ -73,8 +162,16 @@ class AlertManager:
         self._suppressed_severity = 0
         self._deduped = 0
         self._throttled = 0
-        self._sink_errors = 0
-        self._delivered: dict[str, int] = {sink.name: 0 for sink in self._sinks}
+        self._lanes = tuple(
+            _SinkLane(
+                sink,
+                maxsize=sink_queue_size,
+                timeout_seconds=delivery_timeout_seconds,
+                on_delivered=on_delivered,
+                log=self._log,
+            )
+            for sink in self._sinks
+        )
 
     async def process(self, detection: Detection) -> Alert | None:
         """Run a detection through the gates; return the alert to store, or None.
@@ -104,7 +201,9 @@ class AlertManager:
         if withheld:
             note = f" [+{withheld} more alert(s) from this rule withheld by the throttle]"
             alert = alert.model_copy(update={"summary": alert.summary + note})
-        await self._dispatch(alert)
+        for lane in self._lanes:
+            if lane.sink.accepts(alert):
+                lane.offer(alert)
         self._emitted += 1
         return alert
 
@@ -127,27 +226,20 @@ class AlertManager:
             return override.max_alerts, float(override.window_seconds)
         return self._throttle_max, self._throttle_window
 
-    async def _dispatch(self, alert: Alert) -> None:
-        for sink in self._sinks:
-            if not sink.accepts(alert):
-                continue
-            try:
-                await sink.emit(alert)
-            except Exception as exc:
-                # Firewall: a failing sink must not stop the others, and must
-                # not leak the alert payload or any secret — log the type only.
-                self._sink_errors += 1
-                self._log.warning(
-                    "alert.sink.error",
-                    sink=sink.name,
-                    rule_id=alert.rule_id,
-                    error=type(exc).__name__,
-                )
-            else:
-                self._delivered[sink.name] = self._delivered.get(sink.name, 0) + 1
+    async def drain(self, max_wait: float | None = None) -> None:
+        """Wait until every queued notification has been attempted."""
+        for lane in self._lanes:
+            await lane.drain(max_wait)
 
-    async def aclose(self) -> None:
-        """Release every sink's resources (e.g. pooled HTTP connections)."""
+    async def aclose(self, drain_timeout: float = _DEFAULT_DRAIN_TIMEOUT_S) -> None:
+        """Deliver what is queued (within ``drain_timeout``), then close the sinks."""
+        await asyncio.gather(*(lane.drain(drain_timeout) for lane in self._lanes))
+        for lane in self._lanes:
+            abandoned = await lane.stop()
+            if abandoned:
+                self._log.error(
+                    "alert.sink.undelivered_at_shutdown", sink=lane.sink.name, alerts=abandoned
+                )
         for sink in self._sinks:
             try:
                 await sink.aclose()
@@ -164,7 +256,12 @@ class AlertManager:
     @property
     def delivered_by_sink(self) -> Mapping[str, int]:
         """Successful deliveries per sink name (a snapshot)."""
-        return dict(self._delivered)
+        return {lane.sink.name: lane.delivered for lane in self._lanes}
+
+    @property
+    def dropped_by_sink(self) -> Mapping[str, int]:
+        """Notifications dropped per sink: queue full, or abandoned at shutdown."""
+        return {lane.sink.name: lane.dropped for lane in self._lanes}
 
     @property
     def stats(self) -> dict[str, int]:
@@ -174,5 +271,5 @@ class AlertManager:
             "suppressed_severity": self._suppressed_severity,
             "deduped": self._deduped,
             "throttled": self._throttled,
-            "sink_errors": self._sink_errors,
+            "sink_errors": sum(lane.errors for lane in self._lanes),
         }

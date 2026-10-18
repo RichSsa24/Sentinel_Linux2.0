@@ -32,7 +32,9 @@ from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metri
 from prometheus_client.registry import Collector
 
 # Buckets for detection-to-alert latency: sub-millisecond to a few seconds.
-_LATENCY_BUCKETS = (0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0)
+# Detection-to-delivery latency: sub-millisecond up to the per-delivery deadline
+# (30 s), so a slow channel shows up instead of piling into the top bucket.
+_LATENCY_BUCKETS = (0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0)
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,7 @@ class RuntimeSnapshot:
     alerts_delivered: Mapping[str, int] = field(default_factory=dict)
     alerts_suppressed: Mapping[str, int] = field(default_factory=dict)
     sink_errors: int = 0
+    alert_deliveries_dropped: Mapping[str, int] = field(default_factory=dict)
     alerts_unpersisted: int = 0
     pipeline_up: bool = False
     collector_restarts: Mapping[str, int] = field(default_factory=dict)
@@ -91,6 +94,12 @@ class _RuntimeCollector(Collector):
             "reason",
             snap.alerts_suppressed,
         )
+        yield _labelled_counter(
+            "sentinel_alert_deliveries_dropped",
+            "Notifications dropped because a sink's queue was full or at shutdown, by sink.",
+            "sink",
+            snap.alert_deliveries_dropped,
+        )
         errors = CounterMetricFamily(
             "sentinel_alert_sink_errors", "Alert deliveries that raised in a sink."
         )
@@ -131,7 +140,7 @@ class Metrics:
         )
         self.alert_latency = Histogram(
             "sentinel_alert_latency_seconds",
-            "Latency from detection to alert delivery.",
+            "Latency from detection to alert delivery, per sink delivery.",
             buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )

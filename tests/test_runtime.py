@@ -209,10 +209,25 @@ class TestBuildSinks:
         with pytest.raises(ConfigurationError, match="HMAC"):
             build_sinks(settings)
 
+    @pytest.mark.security
+    @pytest.mark.parametrize(
+        "url",
+        ["http://hooks.example.com/x", "https://169.254.169.254/latest/meta-data"],
+        ids=["plain-http", "cloud-metadata-literal"],
+    )
+    def test_an_unsafe_webhook_url_fails_at_startup(self, url: str) -> None:
+        # Regression: these were accepted and failed only at the first alert.
+        settings = make_api_settings(
+            webhook_url=url,
+            webhook_hmac_secret=SecretStr("s3cret-" + "x" * 32),  # pragma: allowlist secret
+        )
+        with pytest.raises(ConfigurationError, match="SENTINEL_WEBHOOK_URL"):
+            build_sinks(settings)
+
     async def test_webhook_with_secret_is_enabled(self) -> None:
         settings = make_api_settings(
             webhook_url="https://hooks.example.com/x",
-            webhook_hmac_secret=SecretStr("s3cret"),  # pragma: allowlist secret
+            webhook_hmac_secret=SecretStr("s3cret-" + "x" * 32),  # pragma: allowlist secret
         )
         sinks = build_sinks(settings)
         assert [type(s) for s in sinks] == [ConsoleSink, WebhookSink]
@@ -240,6 +255,7 @@ class TestBuildAlertManager:
         manager = build_alert_manager(make_api_settings(), rules, [sink])
         for i in range(3):
             await manager.process(make_detection(rule_id="ssh-brute-force", event_id=f"{i:064d}"))
+        await manager.drain()
         assert len(sink.received) == 1
         assert manager.stats["throttled"] == 2
 
@@ -250,6 +266,7 @@ class TestBuildAlertManager:
         manager = build_alert_manager(make_api_settings(alert_throttle_max=2), rules, [sink])
         for i in range(3):
             await manager.process(make_detection(event_id=f"{i:064d}"))
+        await manager.drain()
         assert len(sink.received) == 2
 
     async def test_min_severity_setting_is_applied(self, rules: tuple[Rule, ...]) -> None:

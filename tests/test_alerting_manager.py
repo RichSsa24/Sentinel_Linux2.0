@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from structlog.testing import capture_logs
 
@@ -58,6 +60,7 @@ class TestGates:
         manager = AlertManager([sink])
 
         alert = await manager.process(make_detection())
+        await manager.drain()
 
         assert alert is not None
         assert len(sink.received) == 1
@@ -82,6 +85,7 @@ class TestGates:
 
         for _ in range(3):
             await manager.process(detection)
+        await manager.drain()
 
         assert len(sink.received) == 1
         assert manager.stats["deduped"] == 2
@@ -95,6 +99,7 @@ class TestGates:
         # first two within the window should reach the sink.
         for i in range(5):
             await manager.process(make_detection(event_id=f"{i:064d}"))
+        await manager.drain()
 
         assert len(sink.received) == 2
         assert manager.stats["throttled"] == 3
@@ -109,10 +114,12 @@ class TestGates:
 
         for i in range(3):  # two pass, the third is throttled
             await manager.process(make_detection(event_id=f"{i:064d}"))
+        await manager.drain()
         assert len(sink.received) == 2
 
         clock.advance(61)  # slide past the throttle window — old hits expire
         await manager.process(make_detection(event_id="f" * 64))
+        await manager.drain()
         assert len(sink.received) == 3
 
     @pytest.mark.security
@@ -133,6 +140,7 @@ class TestGates:
 
         clock.advance(61)
         delivered = await manager.process(make_detection(event_id="4" * 64))
+        await manager.drain()
         assert delivered is not None
         assert delivered.notified
         assert "+2 more alert(s) from this rule withheld" in sink.received[-1].summary
@@ -151,6 +159,7 @@ class TestRoutingAndFirewall:
         manager = AlertManager([low, high])
 
         await manager.process(make_detection(severity=4))
+        await manager.drain()
 
         assert len(low.received) == 1
         assert high.received == []  # below the email-grade sink's floor
@@ -161,6 +170,7 @@ class TestRoutingAndFirewall:
         manager = AlertManager([_Boom(), good])
 
         alert = await manager.process(make_detection())
+        await manager.drain()
 
         assert alert is not None  # delivery was attempted and counted
         assert len(good.received) == 1
@@ -174,6 +184,7 @@ class TestRoutingAndFirewall:
 
         with capture_logs() as logs:
             await manager.process(make_detection())
+            await manager.drain()
 
         blob = repr(logs)
         assert secret not in blob  # the exception message must not be logged
@@ -192,6 +203,7 @@ class TestDeliveryAccounting:
         manager = AlertManager([good, bad])
         await manager.process(make_detection(event_id="1" * 64))
         await manager.process(make_detection(event_id="2" * 64))
+        await manager.drain()
         assert manager.delivered_by_sink == {"good": 2, "boom": 0}
 
     @pytest.mark.asyncio
@@ -206,6 +218,7 @@ class TestDeliveryAccounting:
         for i in range(3):
             await manager.process(make_detection(rule_id="noisy", event_id=f"{i:064d}"))
         await manager.process(make_detection(rule_id="quiet", event_id="9" * 64))
+        await manager.drain()
         assert [a.rule_id for a in sink.received] == ["noisy", "quiet"]
 
 
@@ -217,3 +230,70 @@ class TestClose:
         with capture_logs() as logs:
             await manager.aclose()  # must not raise
         assert any(entry["event"] == "alert.sink.close_error" for entry in logs)
+
+
+class _Hung(AlertSink):
+    """A channel that never answers (an unresponsive webhook, broken DNS)."""
+
+    name = "hung"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def emit(self, alert: Alert) -> None:
+        self.attempts += 1
+        await asyncio.Event().wait()
+
+
+@pytest.mark.security
+class TestBulkheads:
+    """Regression: one slow channel held the single consumer for ~16.5 s per alert."""
+
+    @pytest.mark.asyncio
+    async def test_a_hung_sink_delays_neither_detection_nor_other_sinks(self) -> None:
+        hung, good = _Hung(), _Recorder()
+        manager = AlertManager([hung, good], delivery_timeout_seconds=0.05)
+        loop = asyncio.get_running_loop()
+
+        started = loop.time()
+        for i in range(3):
+            await manager.process(make_detection(event_id=f"{i:064d}"))
+        assert loop.time() - started < 0.05  # the consumer never waits on a sink
+
+        await manager.drain(max_wait=2)
+        assert len(good.received) == 3
+        assert manager.stats["sink_errors"] == 3  # each delivery hit its deadline
+        assert manager.delivered_by_sink == {"hung": 0, "recorder": 3}
+
+    @pytest.mark.asyncio
+    async def test_a_full_sink_queue_drops_and_counts(self) -> None:
+        manager = AlertManager([_Hung()], sink_queue_size=1, delivery_timeout_seconds=60)
+        with capture_logs() as logs:
+            await manager.process(make_detection(event_id="0" * 64))
+            await asyncio.sleep(0)  # the worker takes the first alert
+            for i in range(1, 4):
+                await manager.process(make_detection(event_id=f"{i:064d}"))
+        # One in flight, one queued, two dropped.
+        assert manager.dropped_by_sink == {"hung": 2}
+        assert sum(entry["event"] == "alert.sink.queue_full" for entry in logs) == 2
+        await manager.aclose(drain_timeout=0)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_counts_what_it_could_not_deliver(self) -> None:
+        manager = AlertManager([_Hung()], delivery_timeout_seconds=60)
+        for i in range(3):
+            await manager.process(make_detection(event_id=f"{i:064d}"))
+        with capture_logs() as logs:
+            await manager.aclose(drain_timeout=0.05)
+        assert manager.dropped_by_sink == {"hung": 2}  # the third was in flight
+        assert any(entry["event"] == "alert.sink.undelivered_at_shutdown" for entry in logs)
+
+    @pytest.mark.asyncio
+    async def test_latency_is_observed_on_delivery(self) -> None:
+        latencies: list[float] = []
+        manager = AlertManager([_Recorder()], on_delivered=latencies.append)
+        await manager.process(make_detection())
+        await manager.drain()
+        assert len(latencies) == 1
+        assert latencies[0] >= 0

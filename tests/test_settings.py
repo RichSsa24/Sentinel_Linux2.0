@@ -82,6 +82,13 @@ class TestSettingsValidation:
             settings_no_env_file()
 
     @pytest.mark.security
+    def test_rejects_a_short_webhook_hmac_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "production")
+        monkeypatch.setenv("SENTINEL_WEBHOOK_HMAC_SECRET", "x")  # pragma: allowlist secret
+        with pytest.raises(ValidationError):
+            settings_no_env_file()
+
+    @pytest.mark.security
     def test_rejects_a_wildcard_cors_origin(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SENTINEL_ENV", "production")
         monkeypatch.setenv("SENTINEL_API_CORS_ORIGINS", "https://a.test, *")
@@ -178,16 +185,17 @@ class TestAlertingSettings:
     @pytest.mark.security
     def test_secrets_load_from_env_and_do_not_leak(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SENTINEL_ENV", "production")
-        monkeypatch.setenv("SENTINEL_WEBHOOK_HMAC_SECRET", "hmac-shhh")  # pragma: allowlist secret
+        hmac_secret = "hmac-shhh-0123456789abcdef0123456789"  # pragma: allowlist secret
+        monkeypatch.setenv("SENTINEL_WEBHOOK_HMAC_SECRET", hmac_secret)
         monkeypatch.setenv("SENTINEL_SMTP_PASSWORD", "smtp-shhh")  # pragma: allowlist secret
         s = settings_no_env_file()
 
         assert s.webhook_hmac_secret is not None
-        assert s.webhook_hmac_secret.get_secret_value() == "hmac-shhh"
+        assert s.webhook_hmac_secret.get_secret_value() == "hmac-shhh-0123456789abcdef0123456789"
         assert s.smtp_password is not None
         assert s.smtp_password.get_secret_value() == "smtp-shhh"
         # SecretStr must mask the value in any string/repr rendering.
-        assert "hmac-shhh" not in repr(s)
+        assert "hmac-shhh-0123456789abcdef0123456789" not in repr(s)
         assert "smtp-shhh" not in str(s.smtp_password)
 
     @pytest.mark.security

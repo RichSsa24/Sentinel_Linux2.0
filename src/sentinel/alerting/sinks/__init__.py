@@ -9,6 +9,7 @@ from sentinel.alerting.sinks.webhook import (
     DestinationBlockedError,
     WebhookError,
     WebhookSink,
+    resolve_destination,
     validate_destination,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "SmtpClient",
     "WebhookError",
     "WebhookSink",
+    "resolve_destination",
     "validate_destination",
 ]
