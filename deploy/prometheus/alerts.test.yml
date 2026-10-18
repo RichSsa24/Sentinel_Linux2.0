@@ -1,0 +1,186 @@
+# promtool test rules alerts.test.yml - each alert fires on the failure it
+# names, with its annotations rendered, and stays quiet on a healthy series.
+
+rule_files:
+- alerts.yml
+evaluation_interval: 1m
+tests:
+- interval: 1m
+  input_series:
+  - series: up{job="sentinel", instance="sentinel:8000"}
+    values: 1 1 0 0 0 0
+  - series: sentinel_pipeline_up{instance="sentinel:8000"}
+    values: 1 0 0 0
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: SentinelDown
+    exp_alerts: []
+  - eval_time: 5m
+    alertname: SentinelDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        job: sentinel
+        instance: sentinel:8000
+      exp_annotations:
+        summary: Sentinel is not answering scrapes
+        description: Prometheus cannot scrape sentinel:8000, so nothing about the detector is visible.
+          Check the container or unit and its logs.
+        runbook: docs/OPERATIONS.md#sentineldown
+  - eval_time: 3m
+    alertname: SentinelPipelineDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: sentinel:8000
+      exp_annotations:
+        summary: The detection pipeline is not running
+        description: No event is being analyzed. The process restarts itself when the pipeline dies; if
+          this persists the restart is failing.
+        runbook: docs/OPERATIONS.md#sentinelpipelinedown
+- interval: 1m
+  input_series:
+  - series: sentinel_collector_source_up{collector="auth-log"}
+    values: '0x15'
+  - series: sentinel_collector_source_up{collector="process"}
+    values: 1x15
+  alert_rule_test:
+  - eval_time: 5m
+    alertname: SentinelCollectorSourceDown
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: SentinelCollectorSourceDown
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        collector: auth-log
+      exp_annotations:
+        summary: Collector auth-log cannot read its source
+        description: auth-log produces no events because its source (log file, /proc, watched path) is
+          missing or unreadable.
+        runbook: docs/OPERATIONS.md#sentinelcollectorsourcedown
+- interval: 1m
+  input_series:
+  - series: sentinel_collector_restarts_total{collector="network"}
+    values: 0 1 2 3 4 5
+  - series: sentinel_collector_restarts_total{collector="process"}
+    values: 0 0 0 0 0 1
+  alert_rule_test:
+  - eval_time: 5m
+    alertname: SentinelCollectorRestarting
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        collector: network
+      exp_annotations:
+        summary: Collector network keeps crashing
+        description: network was restarted more than 3 times in 15 minutes; it is blind for the backoff
+          after each crash.
+        runbook: docs/OPERATIONS.md#sentinelcollectorrestarting
+- interval: 1m
+  input_series:
+  - series: sentinel_events_ingested_total
+    values: 0+10x30 300x120
+  - series: sentinel_pipeline_up
+    values: 1x150
+  alert_rule_test:
+  - eval_time: 60m
+    alertname: SentinelNoEvents
+    exp_alerts: []
+  - eval_time: 100m
+    alertname: SentinelNoEvents
+    exp_alerts: []
+  - eval_time: 110m
+    alertname: SentinelNoEvents
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+      exp_annotations:
+        summary: No event ingested for an hour
+        description: A live host starts processes and opens sockets all the time; an hour without a single
+          event usually means the collectors see nothing.
+        runbook: docs/OPERATIONS.md#sentinelnoevents
+- interval: 1m
+  input_series:
+  - series: sentinel_events_dropped_total{reason="duplicate"}
+    values: 0 50 100 150
+  - series: sentinel_events_dropped_total{reason="persist_error"}
+    values: 0 0 3 3
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: SentinelEventsDropped
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        reason: persist_error
+      exp_annotations:
+        summary: 'Events lost: persist_error'
+        description: Events were not analyzed (queue_full, consumer_error) or not stored (persist_error)
+          in the last 10 minutes.
+        runbook: docs/OPERATIONS.md#sentineleventsdropped
+- interval: 1m
+  input_series:
+  - series: sentinel_queue_depth
+    values: 100 9000 9000 9000 9000 9000 9000 9000
+  - series: sentinel_queue_capacity
+    values: 10000x7
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: SentinelQueueSaturated
+    exp_alerts: []
+  - eval_time: 7m
+    alertname: SentinelQueueSaturated
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+      exp_annotations:
+        summary: The pipeline queue is over 80% full
+        description: Detection is falling behind the collectors; at 100% events are dropped or collectors
+          block, depending on SENTINEL_QUEUE_BACKPRESSURE.
+        runbook: docs/OPERATIONS.md#sentinelqueuesaturated
+- interval: 1m
+  input_series:
+  - series: sentinel_persist_failures_total
+    values: 0 1 2 3 4 5 6 7
+  alert_rule_test:
+  - eval_time: 7m
+    alertname: SentinelPersistenceFailing
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+      exp_annotations:
+        summary: Database writes are failing
+        description: Events and alerts are held in memory and retried; past SENTINEL_PERSIST_MAX_BUFFERED
+          the oldest are dropped. /readyz says why.
+        runbook: docs/OPERATIONS.md#sentinelpersistencefailing
+- interval: 1m
+  input_series:
+  - series: sentinel_alert_sink_errors_total
+    values: 0 0 1
+  - series: sentinel_alert_deliveries_dropped_total{sink="webhook"}
+    values: 0 0 2
+  alert_rule_test:
+  - eval_time: 1m
+    alertname: SentinelAlertDeliveryFailing
+    exp_alerts: []
+  - eval_time: 2m
+    alertname: SentinelAlertDeliveryFailing
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+      exp_annotations:
+        summary: Alert notifications are failing
+        description: A sink (webhook, email) raised while delivering; the error type is in the alert.sink.error
+          log entries.
+        runbook: docs/OPERATIONS.md#sentinelalertdeliveryfailing
+  - eval_time: 2m
+    alertname: SentinelAlertDeliveriesDropped
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        sink: webhook
+      exp_annotations:
+        summary: Alert notifications dropped by webhook
+        description: webhook's queue was full or the service stopped before delivering. The alerts are
+          stored; their notifications were not sent.
+        runbook: docs/OPERATIONS.md#sentinelalertdeliveriesdropped

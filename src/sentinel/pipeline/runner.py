@@ -227,6 +227,7 @@ class Pipeline:
         """Snapshot counters for observability and tests."""
         return {
             "queue_size": self._queue.qsize(),
+            "queue_capacity": self._queue.maxsize,
             "queue_accepted": self._queue.accepted,
             "queue_dropped": self._queue.dropped,
             "processed": self._processed,

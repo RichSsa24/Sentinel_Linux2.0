@@ -641,6 +641,7 @@ class Runtime:
         dead_letters = sum(c.stats.get("dead_lettered", 0) for c in self._collectors)
         return RuntimeSnapshot(
             queue_depth=pipeline["queue_size"],
+            queue_capacity=pipeline["queue_capacity"],
             dropped={
                 "queue_full": pipeline["queue_dropped"],
                 "duplicate": pipeline["deduped"],

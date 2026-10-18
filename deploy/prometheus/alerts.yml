@@ -1,0 +1,130 @@
+# Alerting rules for Sentinel's own health: a detector that has stopped
+# detecting looks exactly like a quiet host, so every way it can go blind or
+# lose data has a rule here. Runbook: docs/OPERATIONS.md#alerts.
+#
+# Validated in CI with `promtool check rules` and unit-tested with
+# `promtool test rules alerts.test.yml`; tests/test_alert_rules.py checks that
+# every metric named here is one Sentinel exports.
+
+groups:
+  - name: sentinel-availability
+    rules:
+      - alert: SentinelDown
+        expr: up{job="sentinel"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Sentinel is not answering scrapes
+          description: >-
+            Prometheus cannot scrape {{ $labels.instance }}, so nothing about the
+            detector is visible. Check the container or unit and its logs.
+          runbook: docs/OPERATIONS.md#sentineldown
+
+      - alert: SentinelPipelineDown
+        expr: sentinel_pipeline_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: The detection pipeline is not running
+          description: >-
+            No event is being analyzed. The process restarts itself when the
+            pipeline dies; if this persists the restart is failing.
+          runbook: docs/OPERATIONS.md#sentinelpipelinedown
+
+      - alert: SentinelCollectorSourceDown
+        expr: sentinel_collector_source_up == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Collector {{ $labels.collector }} cannot read its source"
+          description: >-
+            {{ $labels.collector }} produces no events because its source (log
+            file, /proc, watched path) is missing or unreadable.
+          runbook: docs/OPERATIONS.md#sentinelcollectorsourcedown
+
+      - alert: SentinelCollectorRestarting
+        expr: increase(sentinel_collector_restarts_total[15m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Collector {{ $labels.collector }} keeps crashing"
+          description: >-
+            {{ $labels.collector }} was restarted more than 3 times in 15 minutes;
+            it is blind for the backoff after each crash.
+          runbook: docs/OPERATIONS.md#sentinelcollectorrestarting
+
+      - alert: SentinelNoEvents
+        expr: increase(sentinel_events_ingested_total[1h]) == 0 and sentinel_pipeline_up == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: No event ingested for an hour
+          description: >-
+            A live host starts processes and opens sockets all the time; an hour
+            without a single event usually means the collectors see nothing.
+          runbook: docs/OPERATIONS.md#sentinelnoevents
+
+  - name: sentinel-data-loss
+    rules:
+      - alert: SentinelEventsDropped
+        expr: increase(sentinel_events_dropped_total{reason=~"queue_full|consumer_error|persist_error"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Events lost: {{ $labels.reason }}"
+          description: >-
+            Events were not analyzed (queue_full, consumer_error) or not stored
+            (persist_error) in the last 10 minutes.
+          runbook: docs/OPERATIONS.md#sentineleventsdropped
+
+      - alert: SentinelQueueSaturated
+        expr: sentinel_queue_depth / sentinel_queue_capacity > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The pipeline queue is over 80% full
+          description: >-
+            Detection is falling behind the collectors; at 100% events are
+            dropped or collectors block, depending on SENTINEL_QUEUE_BACKPRESSURE.
+          runbook: docs/OPERATIONS.md#sentinelqueuesaturated
+
+      - alert: SentinelPersistenceFailing
+        expr: increase(sentinel_persist_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Database writes are failing
+          description: >-
+            Events and alerts are held in memory and retried; past
+            SENTINEL_PERSIST_MAX_BUFFERED the oldest are dropped. /readyz says why.
+          runbook: docs/OPERATIONS.md#sentinelpersistencefailing
+
+  - name: sentinel-alert-delivery
+    rules:
+      - alert: SentinelAlertDeliveryFailing
+        expr: increase(sentinel_alert_sink_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Alert notifications are failing
+          description: >-
+            A sink (webhook, email) raised while delivering; the error type is
+            in the alert.sink.error log entries.
+          runbook: docs/OPERATIONS.md#sentinelalertdeliveryfailing
+
+      - alert: SentinelAlertDeliveriesDropped
+        expr: increase(sentinel_alert_deliveries_dropped_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Alert notifications dropped by {{ $labels.sink }}"
+          description: >-
+            {{ $labels.sink }}'s queue was full or the service stopped before
+            delivering. The alerts are stored; their notifications were not sent.
+          runbook: docs/OPERATIONS.md#sentinelalertdeliveriesdropped

@@ -2,6 +2,12 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Sentinel's own health: blindness, data loss, failing notifications.
+# Runbook: docs/OPERATIONS.md#alerts. Route them with an Alertmanager
+# (`alerting:` below) or view them in Prometheus/Grafana.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: "sentinel"
     # /metrics is authenticated like every data endpoint. The bearer token is

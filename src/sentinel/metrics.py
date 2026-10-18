@@ -42,6 +42,7 @@ class RuntimeSnapshot:
     """Point-in-time counters from the running pipeline and alert manager."""
 
     queue_depth: int = 0
+    queue_capacity: int = 0
     dropped: Mapping[str, int] = field(default_factory=dict)
     alerts_delivered: Mapping[str, int] = field(default_factory=dict)
     alerts_suppressed: Mapping[str, int] = field(default_factory=dict)
@@ -87,6 +88,11 @@ class _RuntimeCollector(Collector):
             "sentinel_queue_depth",
             "Current depth of the bounded pipeline queue.",
             value=snap.queue_depth,
+        )
+        yield GaugeMetricFamily(
+            "sentinel_queue_capacity",
+            "Size of the bounded pipeline queue (SENTINEL_QUEUE_MAXSIZE); depth over it is load.",
+            value=snap.queue_capacity,
         )
         yield _labelled_counter(
             "sentinel_events_dropped",
