@@ -2,10 +2,13 @@
 
 Security posture (OWASP A02, NIST SC-8/SC-12):
 
-- **TLS always.** The default path issues STARTTLS before authenticating;
-  Python's ``starttls()`` uses a verifying default SSL context, so credentials
-  never cross the wire in clear text. Implicit TLS (SMTP_SSL) is supported by
-  injecting a factory.
+- **Verified TLS.** STARTTLS (port 587) or implicit TLS (port 465) always runs
+  with ``ssl.create_default_context()``: certificate chain *and* host name are
+  checked. (``smtplib``'s ``starttls()`` without a context does neither, so a
+  machine in the middle could present any certificate and read the password.)
+  A server that does not offer STARTTLS is an error, not a silent downgrade.
+- **No credentials in clear text.** Credentials without TLS are refused at
+  construction; a password without a user name (or the reverse) too.
 - **Credentials from the caller only.** The username/password are passed in
   (the app sources them from env-backed settings) and are never logged — a
   delivery failure surfaces only the exception type to the manager.
@@ -16,7 +19,9 @@ Security posture (OWASP A02, NIST SC-8/SC-12):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import smtplib
+import ssl
 from collections.abc import Callable, Sequence
 from email.message import EmailMessage
 from typing import TYPE_CHECKING, Final, Protocol
@@ -34,17 +39,22 @@ _DEFAULT_TIMEOUT_S: Final[float] = 10.0
 class SmtpClient(Protocol):
     """The subset of ``smtplib.SMTP`` the sink relies on (for injectable tests)."""
 
-    def starttls(self) -> object: ...
+    def starttls(self, *, context: ssl.SSLContext) -> object: ...
     def login(self, user: str, password: str) -> object: ...
     def send_message(self, msg: EmailMessage) -> object: ...
     def quit(self) -> object: ...
 
 
-SmtpFactory = Callable[[str, int, float], SmtpClient]
+# (host, port, timeout, context): a context means implicit TLS from the first byte.
+SmtpFactory = Callable[[str, int, float, ssl.SSLContext | None], SmtpClient]
 
 
-def _default_factory(host: str, port: int, timeout: float) -> SmtpClient:
-    return smtplib.SMTP(host, port, timeout=timeout)  # pragma: no cover - real SMTP
+def _default_factory(
+    host: str, port: int, timeout: float, context: ssl.SSLContext | None
+) -> SmtpClient:  # pragma: no cover - real SMTP
+    if context is not None:
+        return smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
+    return smtplib.SMTP(host, port, timeout=timeout)
 
 
 class EmailSink(AlertSink):
@@ -62,6 +72,7 @@ class EmailSink(AlertSink):
         username: str | None = None,
         password: str | None = None,
         use_starttls: bool = True,
+        implicit_tls: bool = False,
         timeout_seconds: float = _DEFAULT_TIMEOUT_S,
         smtp_factory: SmtpFactory = _default_factory,
         min_severity: int = 0,
@@ -71,6 +82,10 @@ class EmailSink(AlertSink):
             raise ValueError("email sink requires an SMTP host")
         if not recipients:
             raise ValueError("email sink requires at least one recipient")
+        if bool(username) != bool(password):
+            raise ValueError("SMTP username and password must be set together")
+        if username and not (use_starttls or implicit_tls):
+            raise ValueError("SMTP credentials require TLS (STARTTLS or implicit TLS)")
         self._host = host
         self._port = port
         self._sender = sender
@@ -78,6 +93,7 @@ class EmailSink(AlertSink):
         self._username = username
         self._password = password
         self._use_starttls = use_starttls
+        self._implicit_tls = implicit_tls
         self._timeout = timeout_seconds
         self._factory = smtp_factory
 
@@ -105,12 +121,17 @@ class EmailSink(AlertSink):
 
     def _send(self, message: EmailMessage) -> None:
         """Blocking SMTP send — runs in a worker thread."""
-        client = self._factory(self._host, self._port, self._timeout)
+        context = ssl.create_default_context()  # verifies the chain and the host name
+        implicit = context if self._implicit_tls else None
+        client = self._factory(self._host, self._port, self._timeout, implicit)
         try:
-            if self._use_starttls:
-                client.starttls()
+            if self._use_starttls and not self._implicit_tls:
+                client.starttls(context=context)
             if self._username and self._password:
                 client.login(self._username, self._password)
             client.send_message(message)
         finally:
-            client.quit()
+            # A failed quit (e.g. after a refused TLS handshake) must not mask
+            # the error that actually explains the failed delivery.
+            with contextlib.suppress(smtplib.SMTPException, OSError):
+                client.quit()

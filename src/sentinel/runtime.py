@@ -72,6 +72,7 @@ from sentinel.storage import Database, Repository
 
 _HOST_ROOT: Final[Path] = Path("/")
 _PROC: Final[Path] = Path("/proc")
+_SMTPS_PORT: Final[int] = 465
 # Cap on the retry backoff while the database is failing.
 _MAX_RETRY_BACKOFF_S: Final[float] = 30.0
 # SQLSTATE classes meaning "the database rejects this data", not "the database
@@ -161,8 +162,8 @@ def build_sinks(settings: Settings) -> list[AlertSink]:
         if not settings.email_from or not recipients:
             msg = "SENTINEL_SMTP_HOST requires SENTINEL_EMAIL_FROM and SENTINEL_EMAIL_RECIPIENTS"
             raise ConfigurationError(msg)
-        sinks.append(
-            EmailSink(
+        try:
+            email = EmailSink(
                 host=settings.smtp_host,
                 port=settings.smtp_port,
                 sender=settings.email_from,
@@ -172,8 +173,12 @@ def build_sinks(settings: Settings) -> list[AlertSink]:
                     settings.smtp_password.get_secret_value() if settings.smtp_password else None
                 ),
                 use_starttls=settings.smtp_starttls,
+                # Port 465 is SMTP submission over implicit TLS (RFC 8314).
+                implicit_tls=settings.smtp_port == _SMTPS_PORT,
             )
-        )
+        except ValueError as exc:
+            raise ConfigurationError(f"email sink: {exc}") from exc
+        sinks.append(email)
     return sinks
 
 
