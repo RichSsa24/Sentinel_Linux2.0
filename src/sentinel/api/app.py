@@ -37,6 +37,7 @@ from sentinel.api.security import (
     RateLimitMiddleware,
     RequestContextMiddleware,
     SecurityHeadersMiddleware,
+    error_response,
     require_api_key,
 )
 from sentinel.collectors.base import AbstractCollector
@@ -52,6 +53,8 @@ from sentinel.storage.repository import Repository
 
 _log = get_logger("sentinel.api")
 _DEFAULT_PAGE_SIZE = 50
+# Cursors are row ids: a signed 64-bit integer in SQLite and PostgreSQL alike.
+_MAX_CURSOR = 2**63 - 1
 
 
 def _package_version() -> str:
@@ -64,11 +67,7 @@ def _package_version() -> str:
 def _error(
     status_code: int, code: str, message: str, headers: dict[str, str] | None = None
 ) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"success": False, "error": {"code": code, "message": message}},
-        headers=headers,
-    )
+    return error_response(status_code, code, message, headers)
 
 
 def _runtime_lifespan(
@@ -164,8 +163,10 @@ def create_app(
     max_page = settings.api_max_page_size
     page_default = min(_DEFAULT_PAGE_SIZE, max_page)
 
-    # Middleware: added inner-first, so CORS/RequestContext end up outermost.
-    app.add_middleware(SecurityHeadersMiddleware)
+    # Middleware is added inner-first. From the outside in: security headers
+    # (so every response gets them, CORS preflights and 429s included), CORS,
+    # request context (request id, access log, unhandled-error containment),
+    # then the rate limiter.
     app.add_middleware(
         RateLimitMiddleware,
         limit=settings.api_rate_limit,
@@ -182,6 +183,7 @@ def create_app(
             allow_headers=["Authorization"],
             allow_credentials=False,
         )
+    app.add_middleware(SecurityHeadersMiddleware)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
@@ -217,7 +219,7 @@ def create_app(
     @app.get("/events", dependencies=[Depends(require_api_key)])
     async def list_events(
         limit: Annotated[int, Query(ge=1, le=max_page)] = page_default,
-        cursor: Annotated[int | None, Query(ge=1)] = None,
+        cursor: Annotated[int | None, Query(ge=1, le=_MAX_CURSOR)] = None,
     ) -> Page[EventOut]:
         async with database.session() as session:
             repo = Repository(session)
@@ -234,7 +236,7 @@ def create_app(
     @app.get("/alerts", dependencies=[Depends(require_api_key)])
     async def list_alerts(
         limit: Annotated[int, Query(ge=1, le=max_page)] = page_default,
-        cursor: Annotated[int | None, Query(ge=1)] = None,
+        cursor: Annotated[int | None, Query(ge=1, le=_MAX_CURSOR)] = None,
     ) -> Page[AlertOut]:
         async with database.session() as session:
             repo = Repository(session)

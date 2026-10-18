@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+import structlog
 
 from sentinel.api import create_app
 from sentinel.detection.schema import Rule
@@ -136,3 +137,80 @@ class TestCors:
         async with _client(database, rules, api_cors_origins="https://good.test") as client:
             resp = await client.get("/healthz", headers={"Origin": "https://evil.test"})
             assert resp.headers.get("access-control-allow-origin") != "https://evil.test"
+
+
+@pytest.mark.security
+class TestEveryResponseIsHardened:
+    """Regressions: some responses were produced outside the hardening middleware."""
+
+    @staticmethod
+    def _assert_hardened(response: httpx.Response) -> None:
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["Content-Security-Policy"].startswith("default-src 'none'")
+
+    async def test_rate_limited_responses(
+        self, database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        async with _client(database, rules, api_rate_limit=1) as client:
+            await client.get("/healthz")
+            limited = await client.get("/healthz")
+        assert limited.status_code == 429
+        self._assert_hardened(limited)
+        assert limited.headers["X-Request-ID"]
+
+    async def test_cors_preflight(self, database: Database, rules: tuple[Rule, ...]) -> None:
+        async with _client(database, rules, api_cors_origins="https://good.test") as client:
+            preflight = await client.options(
+                "/events",
+                headers={"Origin": "https://good.test", "Access-Control-Request-Method": "GET"},
+            )
+        assert preflight.status_code == 200
+        self._assert_hardened(preflight)
+
+    async def test_unhandled_errors_are_contained(
+        self, unreachable_database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        # Before, the error escaped every middleware: no request id, no headers,
+        # no access log, and the server printed the traceback outside the
+        # logging pipeline. The default transport re-raises such escapes.
+        capture = structlog.testing.capture_logs(
+            processors=[structlog.contextvars.merge_contextvars]
+        )
+        async with _client(unreachable_database, rules) as client:
+            with capture as logs:
+                response = await client.get("/events", headers=auth_header())
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "INTERNAL_ERROR"
+        self._assert_hardened(response)
+        request_id = response.headers["X-Request-ID"]
+        events = {entry["event"]: entry for entry in logs}
+        assert events["api.unhandled_error"]["request_id"] == request_id
+        assert events["api.request"]["status"] == 500
+
+
+@pytest.mark.security
+class TestRequestCorrelation:
+    async def test_lines_logged_during_a_request_carry_its_id(
+        self, api_client: httpx.AsyncClient
+    ) -> None:
+        capture = structlog.testing.capture_logs(
+            processors=[structlog.contextvars.merge_contextvars]
+        )
+        with capture as logs:
+            response = await api_client.get("/events", headers=auth_header("wrong-key"))
+        failure = next(entry for entry in logs if entry["event"] == "api.auth_failed")
+        assert failure["request_id"] == response.headers["X-Request-ID"]
+
+
+@pytest.mark.security
+class TestPaginationBounds:
+    @pytest.mark.parametrize("path", ["/events", "/alerts"])
+    async def test_cursor_beyond_a_64_bit_row_id_is_rejected(
+        self, api_client: httpx.AsyncClient, path: str
+    ) -> None:
+        # Regression: 2**63 overflowed SQLite's INTEGER and became a 500.
+        too_big = await api_client.get(f"{path}?cursor={2**63}", headers=auth_header())
+        largest = await api_client.get(f"{path}?cursor={2**63 - 1}", headers=auth_header())
+        assert too_big.status_code == 422
+        assert largest.status_code == 200

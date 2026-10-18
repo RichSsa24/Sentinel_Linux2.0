@@ -16,6 +16,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Final
 
+import structlog
 from fastapi import HTTPException, Request, status
 from pydantic import SecretStr
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -39,9 +40,26 @@ _SECURITY_HEADERS: Final[Mapping[str, str]] = {
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Cache-Control": "no-store",
+    # A JSON API loads nothing and is never framed.
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
 }
 
 _MAX_TRACKED_CLIENTS: Final[int] = 100_000
+
+
+def error_response(
+    status_code: int, code: str, message: str, headers: Mapping[str, str] | None = None
+) -> JSONResponse:
+    """The project error envelope, with the hardening headers already applied.
+
+    Carrying the headers itself keeps them on errors produced outside the
+    middleware that normally adds them (e.g. Starlette's outermost handler).
+    """
+    return JSONResponse(
+        status_code=status_code,
+        content={"success": False, "error": {"code": code, "message": message}},
+        headers={**_SECURITY_HEADERS, **(headers or {})},
+    )
 
 
 def _log_auth_failure(request: Request, *, reason: str) -> None:
@@ -112,19 +130,35 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Attach a request id and emit structured access logs."""
+    """Attach a request id, emit structured access logs, contain unhandled errors.
+
+    The request id is bound to the logging context, so every line logged while
+    serving the request carries it. An unhandled exception becomes a generic
+    500 here, inside the middleware stack: Starlette's own last-resort handler
+    sits outside every middleware, so its 500 had no request id, no hardening
+    headers and no access-log line, and it re-raised to the server, which
+    printed the traceback outside the logging pipeline.
+    """
 
     async def dispatch(self, request: Request, call_next: _Dispatch) -> Response:
         request_id = secrets.token_hex(8)
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        _log.info(
-            "api.request",
-            request_id=request_id,
-            method=request.method,
-            path=request.url.path,
-            status=response.status_code,
-        )
+        with structlog.contextvars.bound_contextvars(request_id=request_id):
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                _log.exception("api.unhandled_error", error=type(exc).__name__)
+                response = error_response(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "an unexpected error occurred",
+                )
+            response.headers["X-Request-ID"] = request_id
+            _log.info(
+                "api.request",
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+            )
         return response
 
 
@@ -166,12 +200,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         while window and window[0] < cutoff:
             window.popleft()
         if len(window) >= self._limit:
-            return JSONResponse(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                content={
-                    "success": False,
-                    "error": {"code": "RATE_LIMITED", "message": "rate limit exceeded"},
-                },
+            return error_response(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "rate limit exceeded",
                 headers={"Retry-After": str(int(self._window) or 1)},
             )
         window.append(now)
