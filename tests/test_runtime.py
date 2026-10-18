@@ -20,6 +20,7 @@ import pytest
 import structlog
 from prometheus_client.parser import text_string_to_metric_families
 from pydantic import SecretStr
+from sqlalchemy.exc import IntegrityError
 
 from sentinel.alerting import Alert, AlertSink, ConsoleSink, EmailSink, WebhookSink
 from sentinel.api import create_app
@@ -434,14 +435,56 @@ class TestWriteBehind:
         assert failures["left"] == 0
         assert runtime.snapshot().dropped["persist_error"] == 0
 
+    async def test_a_rejected_row_does_not_block_the_rest(
+        self,
+        database: Database,
+        rules: tuple[Rule, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Regression: with whole-batch retries, one row the database rejects
+        # (an integrity/data error) failed every attempt and stalled persistence
+        # until the buffer overflowed and dropped good records with it.
+        poison = _events(5)[2].event.id
+        original = Repository.save_batch
+
+        async def picky_save(self: Repository, **batch: Any) -> int:
+            if any(event.event.id == poison for event in batch.get("events", ())):
+                raise IntegrityError("INSERT INTO events", {}, Exception("check failed"))
+            return await original(self, **batch)
+
+        monkeypatch.setattr(Repository, "save_batch", picky_save)
+        runtime = Runtime(
+            make_api_settings(persist_batch_size=5, persist_flush_interval_seconds=0.01),
+            database=database,
+            metrics=Metrics(),
+            rules=rules,
+            collectors=[_Replay(_events(5))],
+            sinks=[],
+        )
+        with structlog.testing.capture_logs() as logs:
+            runtime.start()
+            written = 0
+            for _ in range(200):
+                written = await _count_events(database)
+                if written == 4:
+                    break
+                await asyncio.sleep(0.02)
+            await runtime.stop()
+        assert written == 4  # everything except the rejected row
+        assert runtime.snapshot().dropped["persist_error"] == 1
+        assert any(entry["event"] == "runtime.persist_rejected" for entry in logs)
+
     async def test_outage_buffer_is_bounded_and_losses_are_counted(
         self, tmp_path: Path, rules: tuple[Rule, ...]
     ) -> None:
         broken = Database(f"sqlite+aiosqlite:///{tmp_path / 'missing-dir' / 'x.db'}")
         metrics = Metrics()
         runtime = Runtime(
-            # batch 1 -> the buffer holds at most 16 records during the outage
-            make_api_settings(persist_batch_size=1, persist_flush_interval_seconds=0.01),
+            make_api_settings(
+                persist_batch_size=1,
+                persist_flush_interval_seconds=0.01,
+                persist_max_buffered=16,  # the buffer holds at most 16 records
+            ),
             database=broken,
             metrics=metrics,
             rules=rules,

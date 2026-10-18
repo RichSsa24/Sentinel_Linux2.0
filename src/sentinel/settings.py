@@ -194,6 +194,13 @@ class Settings(BaseSettings):
         le=60.0,
         description="Upper bound on how long a buffered event waits to be written.",
     )
+    persist_max_buffered: int = Field(
+        default=10_000,
+        ge=1,
+        le=1_000_000,
+        description="Records held for retry while the database is unavailable; beyond "
+        "this the oldest are dropped and counted. Must be >= persist_batch_size.",
+    )
 
     # --- Read API ------------------------------------------------------------
     api_key: SecretStr | None = Field(
@@ -272,6 +279,13 @@ class Settings(BaseSettings):
             msg = f"fim_paths entries must be absolute host paths; got {relative}"
             raise ValueError(msg)
         return value
+
+    @model_validator(mode="after")
+    def _check_buffer_holds_a_batch(self) -> Settings:
+        if self.persist_max_buffered < self.persist_batch_size:
+            msg = "persist_max_buffered must be >= persist_batch_size"
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _reject_unknown_prefixed_env(self) -> Settings:

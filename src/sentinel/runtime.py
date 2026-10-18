@@ -27,11 +27,14 @@ hundred events per second; batching is what lets persistence keep up.
 
 A failed write (a database restart, a lock timeout) is put back at the front of
 the buffer and retried with exponential backoff, so a transient outage loses
-nothing. The buffer is capped at ``_MAX_PENDING_BATCHES`` batches; beyond that
-the oldest records are dropped and counted, as is anything still unwritten at
-shutdown. The costs are bounded staleness in the read API (about one flush
-interval) and, on a hard kill, losing what was buffered — events that were only
-in memory anyway.
+nothing. A batch the database *rejects* (an integrity or data error) would fail
+every retry, so it is instead written row by row and only the offending rows
+are dropped. The buffer is capped at ``persist_max_buffered`` records; beyond
+that the oldest are dropped and counted, as is anything unwritten at shutdown.
+
+The costs are bounded staleness in the read API (about one flush interval) and,
+on a hard kill, losing what was buffered — events that were only in memory
+anyway.
 """
 
 from __future__ import annotations
@@ -43,6 +46,8 @@ import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Final
+
+from sqlalchemy.exc import DataError, IntegrityError
 
 from sentinel.alerting import (
     Alert,
@@ -67,10 +72,11 @@ from sentinel.storage import Database, Repository
 
 _HOST_ROOT: Final[Path] = Path("/")
 _PROC: Final[Path] = Path("/proc")
-# Write-behind buffer bound during a database outage, in batches, and the cap on
-# the retry backoff.
-_MAX_PENDING_BATCHES: Final[int] = 16
+# Cap on the retry backoff while the database is failing.
 _MAX_RETRY_BACKOFF_S: Final[float] = 30.0
+# Errors that mean "the database rejects this data", not "the database is
+# unavailable": retrying the same rows can never succeed.
+_REJECTED: Final[tuple[type[Exception], ...]] = (DataError, IntegrityError)
 
 
 class ConfigurationError(ValueError):
@@ -202,7 +208,7 @@ class Runtime:
         # flusher's writes with the final shutdown flush so commits stay ordered.
         self._batch_size = settings.persist_batch_size
         self._flush_interval = settings.persist_flush_interval_seconds
-        self._max_pending = settings.persist_batch_size * _MAX_PENDING_BATCHES
+        self._max_pending = settings.persist_max_buffered
         self._pending_events: list[Event] = []
         self._pending_alerts: list[Alert] = []
         self._flush_lock = asyncio.Lock()
@@ -302,6 +308,9 @@ class Runtime:
             try:
                 async with self._database.session() as session:
                     await Repository(session).save_batch(events=events, alerts=alerts)
+            except _REJECTED:
+                await self._write_row_by_row(events, alerts)
+                return True
             except Exception as exc:
                 self._pending_events[:0] = events
                 self._pending_alerts[:0] = alerts
@@ -315,6 +324,38 @@ class Runtime:
                 )
                 return False
             return True
+
+    async def _write_row_by_row(self, events: list[Event], alerts: list[Alert]) -> None:
+        """Isolate rows the database rejects so they cannot block the rest.
+
+        Each record gets its own transaction; one that still fails is dropped,
+        counted and logged (exception type only).
+        """
+        rejected_events = rejected_alerts = 0
+        error = ""
+        for event in events:
+            try:
+                async with self._database.session() as session:
+                    await Repository(session).save_batch(events=[event])
+            except Exception as exc:
+                rejected_events += 1
+                error = type(exc).__name__
+        for alert in alerts:
+            try:
+                async with self._database.session() as session:
+                    await Repository(session).save_batch(alerts=[alert])
+            except Exception as exc:
+                rejected_alerts += 1
+                error = type(exc).__name__
+        self._events_unpersisted += rejected_events
+        self._alerts_unpersisted += rejected_alerts
+        if rejected_events or rejected_alerts:
+            self._log.error(
+                "runtime.persist_rejected",
+                events=rejected_events,
+                alerts=rejected_alerts,
+                error=error,
+            )
 
     async def _flush_periodically(self) -> None:
         """Flush on a full batch or every interval; back off while writes fail."""

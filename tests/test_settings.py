@@ -180,6 +180,7 @@ class TestCollectorSettings:
             ("SENTINEL_FIM_PATHS", "/etc,relative/dir", "absolute"),
             ("SENTINEL_HOST_ROOT", "host", "absolute"),
             ("SENTINEL_AUTH_LOG_PATH", "auth.log", "absolute"),
+            ("SENTINEL_PERSIST_MAX_BUFFERED", "10", "persist_max_buffered"),
         ],
     )
     def test_invalid_values_fail_closed(
