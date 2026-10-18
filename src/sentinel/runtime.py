@@ -43,7 +43,7 @@ import asyncio
 import contextlib
 import socket
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Final
 
@@ -203,8 +203,10 @@ class Runtime:
         rules: Iterable[Rule],
         collectors: Iterable[AbstractCollector] | None = None,
         sinks: Sequence[AlertSink] | None = None,
+        on_fatal: Callable[[], None] | None = None,
     ) -> None:
         rule_list = tuple(rules)
+        self._on_fatal = on_fatal
         self._database = database
         self._metrics = metrics
         self._log = get_logger("sentinel.runtime")
@@ -284,9 +286,17 @@ class Runtime:
 
     def _on_pipeline_exit(self, task: asyncio.Task[None]) -> None:
         # A dead pipeline behind a healthy API is the worst failure mode for a
-        # detector — make it loud. /readyz reports it via `running`.
-        if not task.cancelled() and task.exception() is not None:
-            self._log.error("runtime.pipeline_crashed", error=type(task.exception()).__name__)
+        # detector. Collector failures are already contained (restarted), so
+        # this is a framework bug: log it with its traceback, report it via
+        # `running` (/readyz, sentinel_pipeline_up), and let on_fatal end the
+        # process so its supervisor (Docker, systemd) starts a fresh one —
+        # neither restarts a process merely for failing a health check.
+        if task.cancelled() or task.exception() is None:
+            return
+        error = task.exception()
+        self._log.error("runtime.pipeline_crashed", error=type(error).__name__, exc_info=error)
+        if self._on_fatal is not None:
+            self._on_fatal()
 
     # ------------------------------------------------------------------ per event
 
@@ -456,4 +466,6 @@ class Runtime:
             },
             sink_errors=alerts["sink_errors"],
             alerts_unpersisted=self._alerts_unpersisted,
+            pipeline_up=self.running,
+            collector_restarts=self._pipeline.collector_restarts,
         )

@@ -193,11 +193,13 @@ async def run_demo(rules: Sequence[Rule], *, stream: TextIO | None = None) -> De
         runtime.start()
         deadline = time.monotonic() + _DEMO_TIMEOUT_S
         try:
-            # Stop polling once every event is analyzed, the pipeline has died, or
-            # the deadline passes — the summary then reports what actually happened.
+            # Stop polling once every event is analyzed, the pipeline has died, the
+            # replay collector has failed (it would be restarted, but the story is
+            # over), or the deadline passes — the summary then reports what happened.
             while (  # noqa: ASYNC110 — polls a counter; no completion hook exists
                 metrics.events_ingested._value.get() < unique
                 and runtime.running
+                and not runtime.snapshot().collector_restarts
                 and time.monotonic() < deadline
             ):
                 await asyncio.sleep(0.01)

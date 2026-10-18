@@ -16,8 +16,11 @@ real:
 
 Failure isolation: a user-supplied consumer callback that raises does
 NOT crash the pipeline. The exception is logged with the offending
-`event.id` and processing continues. Producer crashes DO propagate —
-they are framework bugs and should fail loud.
+`event.id` and processing continues. A collector that raises is
+*supervised*: logged with its name and traceback, counted, and restarted
+with exponential backoff (1 s doubling to 60 s, reset after a stable run).
+Hostile host input or a parser bug must not leave a source unmonitored
+for good while everything else looks healthy.
 """
 
 from __future__ import annotations
@@ -38,6 +41,10 @@ EventConsumer = Callable[[Event], Awaitable[None]]
 
 _COLLECTOR_TASK_PREFIX: Final[str] = "sentinel.collector:"
 _CONSUMER_TASK_NAME: Final[str] = "sentinel.consumer"
+# Collector restart backoff; a run at least _STABLE_RUN_S long resets it.
+_RESTART_MIN_S: float = 1.0
+_RESTART_MAX_S: float = 60.0
+_STABLE_RUN_S: float = 60.0
 
 
 class Pipeline:
@@ -60,6 +67,7 @@ class Pipeline:
         self._processed = 0
         self._deduped = 0
         self._consumer_errors = 0
+        self._restarts: dict[str, int] = {}
         self._stop_requested = False
 
     # ------------------------------------------------------------------ wiring
@@ -101,7 +109,7 @@ class Pipeline:
         # Collector task names are prefixed so stop() can find them.
         for collector in self._collectors.values():
             task = asyncio.create_task(
-                collector.run(self._queue),
+                self._supervise(collector),
                 name=f"{_COLLECTOR_TASK_PREFIX}{collector.name}",
             )
             self._tasks.append(task)
@@ -115,12 +123,31 @@ class Pipeline:
             backpressure=str(self._queue.policy),
         )
 
-        # If a collector raises, the gather propagates it — we want loud
-        # failures for framework bugs. Consumer errors are caught inside
-        # `_consume`, so the consumer task itself only ends via cancel.
-        # `CancelledError` propagates naturally so callers using
+        # Collector failures are contained by _supervise and consumer errors
+        # inside _consume, so anything the gather propagates is a framework
+        # bug. `CancelledError` propagates naturally so callers using
         # `asyncio.run(pipeline.run())` see a clean exit after stop().
         await asyncio.gather(*self._tasks)
+
+    async def _supervise(self, collector: AbstractCollector) -> None:
+        """Run ``collector`` until it stops; restart it with backoff if it raises."""
+        loop = asyncio.get_running_loop()
+        delay = 0.0
+        while True:
+            started = loop.time()
+            try:
+                await collector.run(self._queue)
+            except Exception:
+                stable = loop.time() - started >= _STABLE_RUN_S
+                delay = _RESTART_MIN_S if stable or not delay else min(delay * 2, _RESTART_MAX_S)
+                self._restarts[collector.name] = self._restarts.get(collector.name, 0) + 1
+                self._log.exception(
+                    "pipeline.collector_crashed", collector=collector.name, restart_in_s=delay
+                )
+            else:
+                return
+            if await collector.wait_stop(timeout=delay):
+                return
 
     async def stop(self) -> None:
         """Graceful shutdown.
@@ -189,6 +216,11 @@ class Pipeline:
                 self._queue.task_done()
 
     # ----------------------------------------------------------------- introspection
+
+    @property
+    def collector_restarts(self) -> dict[str, int]:
+        """How many times each collector crashed and was restarted."""
+        return dict(self._restarts)
 
     @property
     def stats(self) -> dict[str, int]:

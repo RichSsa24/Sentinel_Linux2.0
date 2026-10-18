@@ -11,14 +11,18 @@ page size.
 The app's lifespan runs the detection system itself: it starts a
 :class:`~sentinel.runtime.Runtime` (built from the same ``Settings``) on startup
 and drains it on shutdown. ``/readyz`` reports *not ready* if the database is
-unreachable or the pipeline has died, so an orchestrator restarts a detector
-that has silently stopped detecting.
+unreachable or the pipeline has died. A crashed collector is restarted by the
+pipeline; if the pipeline itself dies, the production app shuts itself down
+gracefully so the process supervisor (Docker's restart policy, systemd) starts
+a fresh one — neither restarts a process merely for failing a health check.
 """
 
 # NOTE: no `from __future__ import annotations` here — FastAPI must evaluate the
 # `Annotated[int, Query(...)]` route-parameter annotations at runtime, which
 # stringified (PEP 563) annotations break.
 
+import os
+import signal
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
@@ -78,6 +82,7 @@ def _runtime_lifespan(
     rules: tuple[Rule, ...],
     collectors: Iterable[AbstractCollector] | None,
     sinks: Sequence[AlertSink] | None,
+    on_fatal: Callable[[], None] | None,
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     """Lifespan that runs the detection system for as long as the app serves."""
 
@@ -94,6 +99,7 @@ def _runtime_lifespan(
                 rules=rules,
                 collectors=collectors,
                 sinks=sinks,
+                on_fatal=on_fatal,
             )
             app.state.runtime = runtime
             runtime.start()
@@ -133,11 +139,13 @@ def create_app(
     rules: Iterable[Rule],
     collectors: Iterable[AbstractCollector] | None = None,
     sinks: Sequence[AlertSink] | None = None,
+    on_fatal: Callable[[], None] | None = None,
 ) -> FastAPI:
     """Build the read API around its injected dependencies.
 
     ``collectors`` and ``sinks`` default to what ``settings`` describes; tests
-    inject their own to drive the lifespan deterministically.
+    inject their own to drive the lifespan deterministically. ``on_fatal`` is
+    called if the detection pipeline dies (see :class:`Runtime`).
     """
     rule_list = tuple(rules)
     app = FastAPI(
@@ -153,6 +161,7 @@ def create_app(
             rules=rule_list,
             collectors=collectors,
             sinks=sinks,
+            on_fatal=on_fatal,
         ),
     )
     app.state.settings = settings
@@ -277,4 +286,21 @@ def get_app() -> FastAPI:
     configure_logging(settings)
     rules = load_rules(settings.rules_dir)
     database = Database(settings.database_url.get_secret_value())
-    return create_app(settings, database=database, metrics=Metrics(), rules=rules)
+    return create_app(
+        settings,
+        database=database,
+        metrics=Metrics(),
+        rules=rules,
+        on_fatal=_shut_down_for_restart,
+    )
+
+
+def _shut_down_for_restart() -> None:
+    """Gracefully stop the server so the process supervisor starts a fresh one.
+
+    A detector whose pipeline died must not keep serving a healthy-looking
+    API: Docker and systemd restart a process that exits, not one that merely
+    fails its health check. SIGTERM takes the normal graceful-shutdown path,
+    so buffered events are still flushed.
+    """
+    os.kill(os.getpid(), signal.SIGTERM)

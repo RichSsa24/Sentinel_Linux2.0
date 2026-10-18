@@ -10,6 +10,8 @@ visible through `/readyz` and its counters through `/metrics`.
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import socket
 from collections.abc import Callable
 from pathlib import Path
@@ -23,7 +25,7 @@ from pydantic import SecretStr
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
 from sentinel.alerting import Alert, AlertSink, ConsoleSink, EmailSink, WebhookSink
-from sentinel.api import create_app
+from sentinel.api import app as app_module, create_app
 from sentinel.api.app import get_app
 from sentinel.collectors.authlog import AuthLogCollector
 from sentinel.collectors.base import AbstractCollector
@@ -34,7 +36,9 @@ from sentinel.detection.schema import Rule
 from sentinel.events import Event
 from sentinel.logging import redact_sensitive_processor
 from sentinel.metrics import Metrics
+from sentinel.pipeline import runner
 from sentinel.pipeline.queue import BoundedEventQueue
+from sentinel.pipeline.runner import Pipeline
 from sentinel.runtime import (
     ConfigurationError,
     Runtime,
@@ -118,6 +122,25 @@ class _Crashing(AbstractCollector):
 
     async def run(self, queue: BoundedEventQueue) -> None:
         raise RuntimeError("collector bug")
+
+
+class _CrashingOnce(AbstractCollector):
+    """Raises on its first run; once restarted, emits its events and idles."""
+
+    name = "crashing-once"
+
+    def __init__(self, events: list[Event]) -> None:
+        super().__init__()
+        self._events = events
+        self.runs = 0
+
+    async def run(self, queue: BoundedEventQueue) -> None:
+        self.runs += 1
+        if self.runs == 1:
+            raise RuntimeError("collector bug")
+        for event in self._events:
+            await queue.put(event)
+        await self.wait_stop()
 
 
 class TestBuildCollectors:
@@ -289,22 +312,71 @@ class TestRuntimeEndToEnd:
             "persist_error",
         }
 
-    async def test_crashed_collector_is_reported_not_running(
+    async def test_a_crashed_collector_is_restarted(
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: a collector exception ended that collector for good, so
+        # one hostile input or parser bug left its source unmonitored while
+        # the API looked healthy. It is now supervised and restarted.
+        monkeypatch.setattr(runner, "_RESTART_MIN_S", 0.01)
+        collector = _CrashingOnce(_events(3))
+        metrics = Metrics()
+        runtime = Runtime(
+            make_api_settings(), database=database, metrics=metrics, rules=rules,
+            collectors=[collector], sinks=[],
+        )  # fmt: skip
+        with structlog.testing.capture_logs() as logs:
+            runtime.start()
+            assert await _wait_for(lambda: metrics.events_ingested._value.get() == 3)
+            assert runtime.running
+            await runtime.stop()
+
+        assert collector.runs == 2
+        assert runtime.snapshot().collector_restarts == {"crashing-once": 1}
+        crash = next(entry for entry in logs if entry["event"] == "pipeline.collector_crashed")
+        assert crash["collector"] == "crashing-once"
+        assert crash["exc_info"] is True  # the traceback is logged, not just the type
+        exposition = metrics.render().decode()
+        assert 'sentinel_collector_restarts_total{collector="crashing-once"} 1.0' in exposition
+
+    async def test_stop_interrupts_a_restart_backoff(
         self, database: Database, rules: tuple[Rule, ...]
     ) -> None:
         runtime = Runtime(
-            make_api_settings(),
-            database=database,
-            metrics=Metrics(),
-            rules=rules,
-            collectors=[_Crashing()],
-            sinks=[],
-        )
+            make_api_settings(), database=database, metrics=Metrics(), rules=rules,
+            collectors=[_Crashing()], sinks=[],
+        )  # fmt: skip
+        runtime.start()
+        assert await _wait_for(lambda: bool(runtime.snapshot().collector_restarts))
+        started = asyncio.get_running_loop().time()
+        await runtime.stop()
+        assert asyncio.get_running_loop().time() - started < 0.5  # not the full backoff
+
+    async def test_a_dead_pipeline_ends_the_process_for_a_restart(
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: Docker's restart policy ignores health checks, so a dead
+        # pipeline left an unhealthy container serving forever.
+        async def broken_pipeline(self: Pipeline) -> None:
+            raise RuntimeError("framework bug")
+
+        monkeypatch.setattr(Pipeline, "run", broken_pipeline)
+        fatal: list[bool] = []
+        metrics = Metrics()
+        runtime = Runtime(
+            make_api_settings(), database=database, metrics=metrics, rules=rules,
+            collectors=[_Replay([])], sinks=[], on_fatal=lambda: fatal.append(True),
+        )  # fmt: skip
         with structlog.testing.capture_logs() as logs:
             runtime.start()
-            assert await _wait_for(lambda: not runtime.running)
-        assert any(entry["event"] == "runtime.pipeline_crashed" for entry in logs)
-        await runtime.stop()  # must not raise the collector's exception
+            assert await _wait_for(lambda: bool(fatal))
+        await runtime.stop()  # must not raise the pipeline's exception
+
+        assert fatal == [True]
+        assert not runtime.running
+        assert "sentinel_pipeline_up 0.0" in metrics.render().decode()
+        crashed = next(entry for entry in logs if entry["event"] == "runtime.pipeline_crashed")
+        assert crashed["exc_info"] is not None
 
     async def test_start_twice_is_rejected(
         self, tmp_path: Path, database: Database, rules: tuple[Rule, ...]
@@ -641,15 +713,21 @@ class TestWriteBehind:
 @pytest.mark.integration
 class TestAppLifespan:
     async def test_readyz_tracks_pipeline_health(
-        self, database: Database, rules: tuple[Rule, ...]
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        async def broken_pipeline(self: Pipeline) -> None:
+            raise RuntimeError("framework bug")
+
+        monkeypatch.setattr(Pipeline, "run", broken_pipeline)
+        fatal: list[bool] = []
         app = create_app(
             make_api_settings(),
             database=database,
             metrics=Metrics(),
             rules=rules,
-            collectors=[_Crashing()],
+            collectors=[_Replay([])],
             sinks=[],
+            on_fatal=lambda: fatal.append(True),
         )
         transport = httpx.ASGITransport(app=app)
         async with (
@@ -661,6 +739,7 @@ class TestAppLifespan:
             resp = await client.get("/readyz")
             assert resp.status_code == 503
             assert resp.json()["error"]["message"] == "detection pipeline is not running"
+            assert fatal == [True]
 
     async def test_metrics_endpoint_exposes_runtime_series(
         self, tmp_path: Path, database: Database, rules: tuple[Rule, ...]
@@ -737,3 +816,12 @@ class TestGetApp:
             assert len(app.state.rules) == len(list(rules_dir.glob("*.yml")))
         finally:
             structlog.reset_defaults()
+
+
+def test_the_production_app_shuts_down_gracefully_when_the_pipeline_dies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    app_module._shut_down_for_restart()
+    assert sent == [(os.getpid(), signal.SIGTERM)]  # uvicorn's graceful-shutdown path

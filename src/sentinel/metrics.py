@@ -45,6 +45,8 @@ class RuntimeSnapshot:
     alerts_suppressed: Mapping[str, int] = field(default_factory=dict)
     sink_errors: int = 0
     alerts_unpersisted: int = 0
+    pipeline_up: bool = False
+    collector_restarts: Mapping[str, int] = field(default_factory=dict)
 
 
 class _RuntimeCollector(Collector):
@@ -55,6 +57,17 @@ class _RuntimeCollector(Collector):
 
     def collect(self) -> Iterable[Metric]:
         snap = self._source()
+        yield GaugeMetricFamily(
+            "sentinel_pipeline_up",
+            "1 while the detection pipeline runs; 0 means nothing is being analyzed.",
+            value=int(snap.pipeline_up),
+        )
+        yield _labelled_counter(
+            "sentinel_collector_restarts",
+            "Collectors that crashed and were restarted, by collector.",
+            "collector",
+            snap.collector_restarts,
+        )
         yield GaugeMetricFamily(
             "sentinel_queue_depth",
             "Current depth of the bounded pipeline queue.",
