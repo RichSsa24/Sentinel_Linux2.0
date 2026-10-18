@@ -223,13 +223,18 @@ class ProcessCollector(AbstractCollector):
             # Seen and confirmed before. ppid comes fresh from stat (orphans are
             # re-parented); the image details were captured and confirmed.
             return known if known.ppid == ppid else known._replace(ppid=ppid)
+        cmdline, executable = self._read_cmdline(base), self._read_exe(base)
+        if known is not None and same_instance and cmdline is None and executable is None:
+            # Exiting (a zombie has neither) or unreadable for the moment: an
+            # empty re-read confirms nothing, so the first reading stands.
+            cmdline, executable = known.cmdline, known.executable
         return _ProcState(
             pid=pid,
             ppid=ppid,
             starttime=starttime,
             comm=self._read_comm(base, stat_content),
-            cmdline=self._read_cmdline(base),
-            executable=self._read_exe(base),
+            cmdline=cmdline,
+            executable=executable,
             settled=same_instance,  # second sighting of this instance: confirmed
         )
 

@@ -385,6 +385,34 @@ class TestExecVisibility:
         assert events[0].event.id != started[0].event.id
 
     @pytest.mark.asyncio
+    async def test_a_process_exiting_before_confirmation_keeps_its_details(
+        self, tmp_path: Path
+    ) -> None:
+        # Regression: a zombie has an empty cmdline and no exe. Re-read at the
+        # confirming poll, that looked like a new image: a fake process_started
+        # with no command line, and the stop event lost the command line too.
+        collector = _collector(tmp_path)
+        await _drain(collector)
+        _mkproc(tmp_path, 99, comm="sleep", cmdline="sleep 0.5")
+        assert [e.event.action for e in await _drain(collector)] == ["process_started"]
+
+        (tmp_path / "99" / "cmdline").write_bytes(b"")  # exited, not yet reaped
+        assert await _drain(collector) == []
+        shutil.rmtree(tmp_path / "99")  # reaped
+        stopped = await _drain(collector)
+
+        assert [(e.event.action, e.process.command_line) for e in stopped] == [
+            ("process_stopped", "sleep 0.5")
+        ]
+
+    def test_kernel_threads_still_settle(self, tmp_path: Path) -> None:
+        # Kernel threads never have a cmdline or exe; they must still be confirmed
+        # on the second sighting, or every poll would re-read hundreds of them.
+        _mkproc(tmp_path, 2, comm="kthreadd", cmdline=None)
+        collector = _collector(tmp_path)
+        assert collector._scan(collector._scan())[2].settled
+
+    @pytest.mark.asyncio
     async def test_settled_processes_are_not_reread(self, tmp_path: Path) -> None:
         collector = _collector(tmp_path)
         await _drain(collector)
