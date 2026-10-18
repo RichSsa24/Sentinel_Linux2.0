@@ -11,7 +11,6 @@ scan). Every query is built with SQLAlchemy expressions and bound parameters
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import UTC, datetime
 
 from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,11 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sentinel.alerting.model import Alert
 from sentinel.events import Event
 from sentinel.storage.models import AlertRow, EventRow
-
-
-def _as_utc(moment: datetime) -> datetime:
-    """Reattach UTC to a tz-naive value (SQLite drops tzinfo on round-trip)."""
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
 def _event_values(event: Event) -> dict[str, object]:
@@ -101,20 +95,14 @@ class Repository:
         if before_id is not None:
             stmt = stmt.where(EventRow.id < before_id)
         result = await self._session.execute(stmt)
-        rows = list(result.scalars().all())
-        for row in rows:
-            row.occurred_at = _as_utc(row.occurred_at)
-        return rows
+        return list(result.scalars().all())
 
     async def list_alerts(self, *, limit: int, before_id: int | None = None) -> list[AlertRow]:
         stmt = select(AlertRow).order_by(AlertRow.id.desc()).limit(limit)
         if before_id is not None:
             stmt = stmt.where(AlertRow.id < before_id)
         result = await self._session.execute(stmt)
-        rows = list(result.scalars().all())
-        for row in rows:
-            row.occurred_at = _as_utc(row.occurred_at)
-        return rows
+        return list(result.scalars().all())
 
     async def count_events(self) -> int:
         result = await self._session.execute(select(func.count()).select_from(EventRow))

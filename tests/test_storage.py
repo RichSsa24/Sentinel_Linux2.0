@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import event
 
 from sentinel.storage import Database, Repository
 from tests.conftest import make_alert, make_event
@@ -134,3 +135,36 @@ class TestSqliteTuning:
         assert journal == "wal"
         assert sync == 1  # NORMAL
         assert busy == 5000
+
+
+@pytest.mark.security
+class TestReadsDoNotWrite:
+    async def test_listing_then_counting_issues_no_write(self, database: Database) -> None:
+        # Regression: list_* reassigned occurred_at on the loaded rows, so the
+        # next query's autoflush sent an UPDATE (an "append-only" table written
+        # by the read API, holding SQLite's write lock against the event writer).
+        async with database.session() as session:
+            repo = Repository(session)
+            await repo.save_event(make_event())
+            await repo.save_alert(make_alert())
+
+        statements: list[str] = []
+
+        def record(_conn: object, _cursor: object, statement: str, *_args: object) -> None:
+            statements.append(statement.lstrip().split()[0].upper())
+
+        event.listen(database.engine.sync_engine, "before_cursor_execute", record)
+        try:
+            async with database.session() as session:
+                repo = Repository(session)
+                events = await repo.list_events(limit=10)
+                await repo.count_events()
+                alerts = await repo.list_alerts(limit=10)
+                await repo.count_alerts()
+                assert not session.dirty
+        finally:
+            event.remove(database.engine.sync_engine, "before_cursor_execute", record)
+
+        assert set(statements) == {"SELECT"}
+        assert events[0].occurred_at.tzinfo is not None  # still UTC-aware on SQLite
+        assert alerts[0].occurred_at.tzinfo is not None
