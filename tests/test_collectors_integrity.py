@@ -214,9 +214,61 @@ class TestFingerprint:
         assert [r.action for r in first + second] == ["file_modified", "file_modified"]
         assert first[0].id_seed != second[0].id_seed
 
-    def test_hashable_fingerprint_is_the_digest(self, tmp_path: Path) -> None:
+    def test_hashable_fingerprint_leads_with_the_digest(self, tmp_path: Path) -> None:
         records = _collector(tmp_path)._diff({}, {"/etc/x": _state(H1)._replace(ctime_ns=5)})
-        assert records[0].id_seed == H1
+        assert records[0].id_seed.startswith(H1)
+
+
+@pytest.mark.security
+class TestReturningToAnEarlierState:
+    """Regression: ids derived from content or mode alone repeated on A -> B -> A.
+
+    The repeat got the id of the event already reported for A, and the dedup
+    window (60 s by default) dropped it: re-adding a reverted backdoor line, or
+    setting setuid again, went unreported.
+    """
+
+    def test_re_applied_content_gets_a_new_id(self, tmp_path: Path) -> None:
+        collector = _collector(tmp_path)
+        clean = _state(H1)._replace(ctime_ns=100, inode=7)
+        backdoor = _state(H2)._replace(ctime_ns=200, inode=7)
+        reverted = clean._replace(ctime_ns=300)
+        again = backdoor._replace(ctime_ns=400)
+        first = collector._diff({"/etc/sudoers": clean}, {"/etc/sudoers": backdoor})
+        collector._diff({"/etc/sudoers": backdoor}, {"/etc/sudoers": reverted})
+        second = collector._diff({"/etc/sudoers": reverted}, {"/etc/sudoers": again})
+        assert [r.action for r in first + second] == ["file_modified", "file_modified"]
+        assert first[0].id_seed != second[0].id_seed
+
+    def test_re_applied_setuid_gets_a_new_id(self, tmp_path: Path) -> None:
+        collector = _collector(tmp_path)
+        plain = _state(H1, mode=0o755)._replace(ctime_ns=100)
+        setuid = _state(H1, mode=0o4755)._replace(ctime_ns=200)
+        first = collector._diff({"/usr/bin/x": plain}, {"/usr/bin/x": setuid})
+        collector._diff({"/usr/bin/x": setuid}, {"/usr/bin/x": plain._replace(ctime_ns=300)})
+        second = collector._diff(
+            {"/usr/bin/x": plain._replace(ctime_ns=300)},
+            {"/usr/bin/x": setuid._replace(ctime_ns=400)},
+        )
+        assert first[0].id_seed != second[0].id_seed
+
+    def test_recreating_the_same_bytes_gets_a_new_id(self, tmp_path: Path) -> None:
+        # Copy a binary 0755, delete it, recreate the same bytes 4755: the new
+        # file has another inode and ctime, so its creation is a new event.
+        collector = _collector(tmp_path)
+        benign = _state(H1, mode=0o755)._replace(ctime_ns=100, inode=7)
+        setuid = _state(H1, mode=0o4755)._replace(ctime_ns=200, inode=8)
+        first = collector._diff({}, {"/usr/local/bin/x": benign})
+        second = collector._diff({}, {"/usr/local/bin/x": setuid})
+        assert first[0].id_seed != second[0].id_seed
+
+    def test_re_observing_one_transition_keeps_its_id(self, tmp_path: Path) -> None:
+        collector = _collector(tmp_path)
+        before = _state(H1)._replace(ctime_ns=100, inode=7)
+        after = _state(H2)._replace(ctime_ns=200, inode=7)
+        once = collector._diff({"/etc/x": before}, {"/etc/x": after})
+        twice = collector._diff({"/etc/x": before}, {"/etc/x": after})
+        assert once[0].id_seed == twice[0].id_seed  # the dedup still collapses this
 
 
 async def _drain(collector: FileIntegrityCollector) -> list[Event]:

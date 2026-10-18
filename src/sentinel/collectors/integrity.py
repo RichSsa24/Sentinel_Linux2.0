@@ -337,7 +337,8 @@ class FileIntegrityCollector(AbstractCollector):
         return self._raw(path, state, _ACTION_MODIFIED, _SEV_MODIFIED, _fingerprint(state))
 
     def _attrs_modified(self, path: str, state: _FileState) -> RawFileEvent | None:
-        seed = f"{state.mode:04o}:{state.uid}:{state.gid}"
+        # ctime for the same reason as in _fingerprint: chmod u+s, u-s, u+s again.
+        seed = f"{state.mode:04o}:{state.uid}:{state.gid}:{state.ctime_ns}"
         return self._raw(path, state, _ACTION_ATTRS, _SEV_ATTRS, seed)
 
     def _deleted(self, path: str, state: _FileState) -> RawFileEvent | None:
@@ -373,14 +374,19 @@ class FileIntegrityCollector(AbstractCollector):
 
 
 def _fingerprint(state: _FileState) -> str:
-    """The content fingerprint an event id derives from.
+    """What a content event's id derives from: the content, plus *when* and *which*.
 
-    The digest when there is one. For an unhashable file it is size, mtime *and*
-    ctime: two forged edits that restore the same size and mtime still differ in
-    ctime, so the second is not mistaken for a re-observation of the first and
-    dropped by the dedup window. Re-observing one transition yields one value.
+    The content is the digest, or size and mtime for an unhashable file. ctime
+    and the inode are always added: content alone repeats when a file goes
+    back to an earlier state (a backdoor line re-added after a revert, the
+    same bytes recreated with a setuid mode), and the repeat would hash to the
+    earlier event's id and be dropped by the dedup window. Every write,
+    chmod, chown and recreation moves ctime (userspace cannot set it), while
+    re-observing one transition yields the same value, so true duplicates
+    still collapse.
     """
-    return state.sha256 or f"{state.size}:{state.mtime_ns}:{state.ctime_ns}"
+    content = state.sha256 or f"{state.size}:{state.mtime_ns}"
+    return f"{content}:{state.ctime_ns}:{state.inode}"
 
 
 def _content_changed(old: _FileState, new: _FileState) -> bool:
