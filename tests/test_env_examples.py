@@ -15,7 +15,11 @@ import pytest
 from sentinel.settings import ENV_PREFIX, Settings
 
 _ROOT = Path(__file__).resolve().parent.parent
-_TEMPLATES = (_ROOT / ".env.example", _ROOT / "deploy" / ".env.example")
+_TEMPLATES = (
+    _ROOT / ".env.example",
+    _ROOT / "deploy" / ".env.example",
+    _ROOT / "deploy" / "systemd" / "sentinel.env.example",
+)
 # Matches both active (`KEY=`) and documented-but-commented (`# KEY=`) entries.
 _KEY_RE = re.compile(rf"^#?\s*({ENV_PREFIX}[A-Z0-9_]+)=", re.MULTILINE)
 _VALID_KEYS = frozenset(f"{ENV_PREFIX}{name.upper()}" for name in Settings.model_fields)

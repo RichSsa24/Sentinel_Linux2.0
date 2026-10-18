@@ -28,7 +28,7 @@ Group=sentinel
 SupplementaryGroups=adm
 WorkingDirectory=/opt/sentinel
 # Defaults; /etc/sentinel/sentinel.env overrides them (SENTINEL_ENV and
-# SENTINEL_API_KEY are required there).
+# SENTINEL_API_KEY are required there; start from deploy/systemd/sentinel.env.example).
 Environment=SENTINEL_RULES_DIR=/opt/sentinel/rules
 Environment=SENTINEL_DATABASE_URL=sqlite+aiosqlite:////var/lib/sentinel/sentinel.db
 EnvironmentFile=/etc/sentinel/sentinel.env

@@ -79,3 +79,18 @@ def test_third_party_images_are_pinned_by_tag_and_digest() -> None:
     assert len(bases) == 3
     unpinned = [ref for ref in [*pulled.values(), *bases] if not _DIGEST_PINNED.search(ref)]
     assert unpinned == []
+
+
+def test_the_systemd_env_template_keeps_the_units_paths() -> None:
+    # Regression: the documented install copied the repository's .env.example,
+    # whose relative SQLite URL overrode the unit's (EnvironmentFile wins over
+    # Environment=) and pointed into the read-only /opt/sentinel: the schema
+    # migration failed and the unit never started.
+    template = (_DEPLOY / "systemd" / "sentinel.env.example").read_text("utf-8")
+    active = {line.split("=", 1)[0] for line in template.splitlines() if re.match(r"[A-Z]", line)}
+    assert active == {"SENTINEL_ENV", "SENTINEL_API_KEY", "SENTINEL_LOG_FORMAT"}
+    runbook = (_DEPLOY.parent / "docs" / "OPERATIONS.md").read_text("utf-8")
+    assert (
+        "install -m 0600 deploy/systemd/sentinel.env.example /etc/sentinel/sentinel.env" in runbook
+    )
+    assert "install -m 0600 .env.example /etc/sentinel" not in runbook

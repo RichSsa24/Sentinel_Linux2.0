@@ -66,16 +66,18 @@ sudo useradd --system --home-dir /var/lib/sentinel --no-create-home \
 sudo git clone https://github.com/RichSsa24/Sentinel_Linux2.0.git /opt/sentinel
 cd /opt/sentinel && sudo uv sync --frozen --no-dev --no-editable
 sudo install -d -m 0700 /etc/sentinel
-sudo install -m 0600 .env.example /etc/sentinel/sentinel.env
-sudoedit /etc/sentinel/sentinel.env     # SENTINEL_ENV=production, SENTINEL_API_KEY=...
+sudo install -m 0600 deploy/systemd/sentinel.env.example /etc/sentinel/sentinel.env
+sudoedit /etc/sentinel/sentinel.env     # set SENTINEL_API_KEY
 sudo install -m 0644 deploy/systemd/sentinel.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now sentinel
 curl -s http://127.0.0.1:8000/readyz
 ```
 
 The unit stores SQLite at `/var/lib/sentinel/sentinel.db` (created 0600; the
-directory is 0700). Set `SENTINEL_DATABASE_URL` in the env file to use
-PostgreSQL instead.
+directory is 0700). Values in `/etc/sentinel/sentinel.env` override the unit's,
+so the template leaves `SENTINEL_DATABASE_URL` unset; set it only to use
+PostgreSQL. (The repository's `.env.example` is for running from a checkout:
+its relative SQLite path would point into the read-only `/opt/sentinel`.)
 
 **Visibility versus privilege.** As shipped, the service reads what group `adm`
 may read and tracks root-only files (e.g. `/etc/shadow`) by metadata, not by
