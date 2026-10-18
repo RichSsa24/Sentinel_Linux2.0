@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -23,15 +24,22 @@ import uvicorn
 from sentinel.alerting import severity_label
 from sentinel.demo import run_demo, summarize
 from sentinel.detection import RuleLoadError, load_rules
+from sentinel.logging import build_processors
+from sentinel.settings import LogFormat
 
 _DEFAULT_RULES = Path("rules")
 
 
 def _quiet_logs() -> None:
-    """Keep interactive commands readable: only warnings and errors are logged."""
+    """Keep interactive commands readable: only warnings and errors, on stderr.
+
+    Uses the service's processor chain, so control characters are stripped and
+    secrets redacted here too.
+    """
     structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(30),
-        processors=[structlog.processors.add_log_level, structlog.dev.ConsoleRenderer()],
+        processors=build_processors(LogFormat.CONSOLE),
+        wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
+        logger_factory=structlog.PrintLoggerFactory(sys.stderr),
     )
 
 
@@ -50,11 +58,16 @@ def _cmd_rules(rules_dir: Path, out: TextIO) -> int:
 
 
 def _cmd_demo(rules_dir: Path, out: TextIO) -> int:
+    try:
+        rules = load_rules(rules_dir)
+    except RuleLoadError as exc:
+        out.write(f"rule library is invalid: {exc}\n")
+        return 1
     out.write(
         "Sentinel-Linux demo: replaying a scripted intrusion through the real pipeline\n"
         "(normalizer -> bounded queue -> dedup -> rules -> alert manager -> SQLite)\n\n"
     )
-    result = asyncio.run(run_demo(rules_dir, stream=out))
+    result = asyncio.run(run_demo(rules, stream=out))
     out.write(summarize(result) + "\n")
     return 0
 

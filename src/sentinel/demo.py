@@ -26,7 +26,7 @@ from typing import TextIO
 
 from sentinel.alerting import Alert, ConsoleSink
 from sentinel.collectors.base import AbstractCollector
-from sentinel.detection import load_rules
+from sentinel.detection import Rule
 from sentinel.metrics import Metrics
 from sentinel.normalizer import (
     Normalizer,
@@ -38,7 +38,7 @@ from sentinel.normalizer import (
 )
 from sentinel.pipeline import BoundedEventQueue
 from sentinel.runtime import Runtime
-from sentinel.settings import BackpressurePolicy, Settings
+from sentinel.settings import BackpressurePolicy, Environment, Settings
 from sentinel.storage import Database, Repository
 
 _HOST = "web01"
@@ -164,8 +164,8 @@ class _Collecting(ConsoleSink):
         await super().emit(alert)
 
 
-async def run_demo(rules_dir: Path, *, stream: TextIO | None = None) -> DemoResult:
-    """Replay the scenario end to end and return what was detected and stored."""
+async def run_demo(rules: Sequence[Rule], *, stream: TextIO | None = None) -> DemoResult:
+    """Replay the scenario through `rules` end to end; return what was detected and stored."""
     script = scenario(datetime.now(tz=UTC).replace(microsecond=0))
     unique = len(_event_ids(script.records))
     benign_ids = _event_ids(script.benign)
@@ -175,18 +175,18 @@ async def run_demo(rules_dir: Path, *, stream: TextIO | None = None) -> DemoResu
         database = Database(f"sqlite+aiosqlite:///{Path(tmp) / 'demo.db'}")
         await database.create_all()
         runtime = Runtime(
-            # Self-contained: ignore any local .env and pin the pipeline knobs the
-            # replay depends on, so a caller's environment cannot change the story.
-            Settings(
-                _env_file=None,
-                env="development",
+            # Self-contained: model_construct reads neither the environment nor a
+            # .env file, so a service's exported SENTINEL_* variables (an alert
+            # floor, a dropping queue, a typo) cannot change or break the story.
+            Settings.model_construct(
+                env=Environment.DEVELOPMENT,
                 queue_maxsize=10_000,
                 queue_backpressure=BackpressurePolicy.BLOCK,
                 persist_flush_interval_seconds=0.05,
             ),
             database=database,
             metrics=metrics,
-            rules=load_rules(rules_dir),
+            rules=rules,
             collectors=[ScenarioCollector(script.records)],
             sinks=[sink],
         )
