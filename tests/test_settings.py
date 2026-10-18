@@ -18,6 +18,8 @@ from sentinel import BackpressurePolicy, Environment, LogFormat, LogLevel
 from sentinel.settings import API_KEY_PLACEHOLDER, Settings
 from tests.conftest import settings_no_env_file
 
+_PORT_LEAK_URL = "postgresql+asyncpg://u:p@ss:dbsecret@db:5432/x"  # pragma: allowlist secret
+
 
 class TestSettingsValidation:
     def test_rejects_missing_required_env(self) -> None:
@@ -95,6 +97,9 @@ class TestSettingsValidation:
             ("postgresql://u:dbsecret@db/x", "postgresql://"),  # pragma: allowlist secret
             ("sqlite:///./sentinel.db", "sqlite://"),
             ("not a url ://dbsecret", "not a valid SQLAlchemy URL"),
+            # An unencoded "@" then ":" in the password: parsing the port failed
+            # with a ValueError that quoted the rest of the URL.
+            (_PORT_LEAK_URL, "not a valid SQLAlchemy URL"),
         ],
     )
     def test_requires_an_async_database_driver(

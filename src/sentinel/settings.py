@@ -305,7 +305,7 @@ class Settings(BaseSettings):
         # Never echo the URL: it may carry the database password.
         try:
             driver = make_url(value.get_secret_value()).drivername
-        except ArgumentError:
+        except (ArgumentError, ValueError):  # ValueError (a bad port) quotes the URL
             msg = "database_url is not a valid SQLAlchemy URL"
             raise ValueError(msg) from None
         if driver not in ASYNC_DATABASE_DRIVERS:
