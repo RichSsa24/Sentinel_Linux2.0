@@ -94,7 +94,9 @@ groups:
           runbook: docs/OPERATIONS.md#sentinelqueuesaturated
 
       - alert: SentinelPersistenceFailing
-        expr: increase(sentinel_persist_failures_total[10m]) > 0
+        # The current state, not a count: one transient failure followed by
+        # successful writes must not page for the next ten minutes.
+        expr: sentinel_persist_healthy == 0
         for: 5m
         labels:
           severity: critical

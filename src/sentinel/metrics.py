@@ -51,6 +51,7 @@ class RuntimeSnapshot:
     alerts_unpersisted: int = 0
     persist_buffered: Mapping[str, int] = field(default_factory=dict)
     persist_failures: int = 0
+    persist_healthy: bool = True
     retention_deleted: Mapping[str, int] = field(default_factory=dict)
     pipeline_up: bool = False
     collector_restarts: Mapping[str, int] = field(default_factory=dict)
@@ -143,6 +144,11 @@ class _RuntimeCollector(Collector):
         )
         failures.add_metric([], snap.persist_failures)
         yield failures
+        yield GaugeMetricFamily(
+            "sentinel_persist_healthy",
+            "1 while the latest database write succeeded; 0 while writes are failing.",
+            value=int(snap.persist_healthy),
+        )
         yield _labelled_counter(
             "sentinel_retention_deleted",
             "Events and alerts deleted because they outlived SENTINEL_RETENTION_DAYS, by kind.",

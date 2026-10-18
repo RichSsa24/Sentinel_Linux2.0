@@ -140,9 +140,20 @@ tests:
         runbook: docs/OPERATIONS.md#sentinelqueuesaturated
 - interval: 1m
   input_series:
-  - series: sentinel_persist_failures_total
-    values: 0 1 2 3 4 5 6 7
+  - series: sentinel_persist_healthy{instance="flapped"}
+    values: 1 0 1 1 1 1 1 1 1 1
   alert_rule_test:
+  - eval_time: 9m
+    alertname: SentinelPersistenceFailing
+    exp_alerts: []  # one failed write, then healthy: no page
+- interval: 1m
+  input_series:
+  - series: sentinel_persist_healthy
+    values: 1 0 0 0 0 0 0 0
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: SentinelPersistenceFailing
+    exp_alerts: []  # failing for 3 minutes: still within for: 5m
   - eval_time: 7m
     alertname: SentinelPersistenceFailing
     exp_alerts:

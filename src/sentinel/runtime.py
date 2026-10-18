@@ -665,6 +665,7 @@ class Runtime:
                 "alerts": len(self._pending_alerts),
             },
             persist_failures=self._persist_failures,
+            persist_healthy=self.persisting,
             retention_deleted=dict(self._pruned),
             pipeline_up=self.running,
             collector_restarts=self._pipeline.collector_restarts,

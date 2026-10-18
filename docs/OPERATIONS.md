@@ -171,6 +171,7 @@ check. A crashed collector is restarted in-process with exponential backoff.
 | `sentinel_alert_latency_seconds` | histogram | detection to delivery |
 | `sentinel_alerts_unpersisted_total` | counter | alerts that could not be stored |
 | `sentinel_persist_buffered{kind}` | gauge | events/alerts waiting to be written |
+| `sentinel_persist_healthy` | gauge | 1 while the latest database write succeeded |
 | `sentinel_persist_failures_total` | counter | failed (retried) database writes |
 | `sentinel_retention_deleted_total{kind}` | counter | rows deleted by retention |
 
@@ -232,7 +233,9 @@ bomb), raise `SENTINEL_QUEUE_MAXSIZE`, or give the service more CPU.
 
 ### SentinelPersistenceFailing
 
-Database writes keep failing. Events and alerts are held in memory and retried
+Database writes have been failing for 5 minutes (`sentinel_persist_healthy`
+is 0; a single failed write that is followed by a successful one does not
+page). Events and alerts are held in memory and retried
 with backoff, up to `SENTINEL_PERSIST_MAX_BUFFERED` (then the oldest are
 dropped and counted); `/readyz` says `database writes failing`.
 `runtime.persist_failed` gives the error type: `OperationalError` (database

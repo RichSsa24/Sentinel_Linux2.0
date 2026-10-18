@@ -982,10 +982,13 @@ class TestAppLifespan:
             body = (await client.get("/metrics", headers=auth_header())).text
             assert 'sentinel_persist_buffered{kind="events"} 1.0' in body
             assert "sentinel_persist_failures_total" in body
+            assert "sentinel_persist_healthy 0.0" in body
 
             full["disk"] = False
             assert await _wait_for(lambda: runtime.persisting)
             assert (await client.get("/readyz")).status_code == 200
+            body = (await client.get("/metrics", headers=auth_header())).text
+            assert "sentinel_persist_healthy 1.0" in body
 
     async def test_readyz_answers_while_the_database_hangs(
         self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
