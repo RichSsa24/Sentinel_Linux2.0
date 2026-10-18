@@ -530,9 +530,9 @@ class TestWriteBehind:
         assert runtime.snapshot().dropped["persist_error"] == 1  # only the poison row
 
     async def test_outage_buffer_is_bounded_and_losses_are_counted(
-        self, tmp_path: Path, rules: tuple[Rule, ...]
+        self, unreachable_database: Database, rules: tuple[Rule, ...]
     ) -> None:
-        broken = Database(f"sqlite+aiosqlite:///{tmp_path / 'missing-dir' / 'x.db'}")
+        broken = unreachable_database
         metrics = Metrics()
         runtime = Runtime(
             make_api_settings(
@@ -550,7 +550,6 @@ class TestWriteBehind:
         assert await _wait_for(lambda: metrics.events_ingested._value.get() == 40)
         assert len(runtime._pending_events) <= 16
         await runtime.stop()
-        await broken.dispose()
         snapshot = runtime.snapshot()
         # Everything is accounted for: dropped by the cap, or unwritten at shutdown.
         assert snapshot.dropped["persist_error"] == 40
@@ -580,9 +579,9 @@ class TestWriteBehind:
             await runtime.stop()
 
     async def test_database_outage_does_not_stall_detection(
-        self, tmp_path: Path, rules: tuple[Rule, ...]
+        self, unreachable_database: Database, rules: tuple[Rule, ...]
     ) -> None:
-        broken = Database(f"sqlite+aiosqlite:///{tmp_path / 'missing-dir' / 'x.db'}")
+        broken = unreachable_database
         metrics = Metrics()
         runtime = Runtime(
             make_api_settings(persist_batch_size=1),
@@ -596,7 +595,6 @@ class TestWriteBehind:
             runtime.start()
             assert await _wait_for(lambda: metrics.events_ingested._value.get() == 3)
             await runtime.stop()
-        await broken.dispose()
         assert runtime.snapshot().dropped["persist_error"] == 3
         failures = [entry for entry in logs if entry["event"] == "runtime.persist_failed"]
         assert failures

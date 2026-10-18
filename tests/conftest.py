@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -138,6 +140,26 @@ async def database(tmp_path: Path) -> AsyncIterator[Database]:
     await db.create_all()
     yield db
     await db.dispose()
+
+
+@pytest.fixture
+async def unreachable_database(tmp_path: Path) -> AsyncIterator[Database]:
+    """A database that can never open: its directory does not exist.
+
+    aiosqlite (0.22) does not await its own cleanup when a connection fails to
+    open; the worker thread resolves a future on this test's event loop later.
+    If the loop has closed by then (likely on a loaded machine), the thread
+    raises "Event loop is closed" and pytest reports it against whichever test
+    runs next. Teardown therefore waits, while the loop still runs, for the
+    worker threads started during the test.
+    """
+    before = set(threading.enumerate())
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'missing-dir' / 'x.db'}")
+    yield db
+    await db.dispose()
+    for thread in set(threading.enumerate()) - before:
+        if thread.name.endswith("(_connection_worker_thread)"):
+            await asyncio.to_thread(thread.join, 5.0)
 
 
 @pytest.fixture

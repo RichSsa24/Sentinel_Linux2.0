@@ -131,29 +131,28 @@ class TestErrorHandling:
 
     @pytest.mark.security
     async def test_readyz_reports_503_when_db_unreachable(
-        self, tmp_path: object, rules: tuple[Rule, ...]
+        self, unreachable_database: Database, rules: tuple[Rule, ...]
     ) -> None:
-        # A database whose file lives under a non-existent directory cannot open.
-        broken = Database(f"sqlite+aiosqlite:///{tmp_path}/missing-dir/x.db")
-        app = create_app(make_api_settings(), database=broken, metrics=Metrics(), rules=rules)
+        app = create_app(
+            make_api_settings(), database=unreachable_database, metrics=Metrics(), rules=rules
+        )
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             resp = await client.get("/readyz")
-        await broken.dispose()
         assert resp.status_code == 503
         assert resp.json()["error"]["code"] == "NOT_READY"
 
     @pytest.mark.security
     async def test_unhandled_error_is_generic_500(
-        self, tmp_path: object, rules: tuple[Rule, ...]
+        self, unreachable_database: Database, rules: tuple[Rule, ...]
     ) -> None:
-        broken = Database(f"sqlite+aiosqlite:///{tmp_path}/missing-dir/x.db")
-        app = create_app(make_api_settings(), database=broken, metrics=Metrics(), rules=rules)
+        app = create_app(
+            make_api_settings(), database=unreachable_database, metrics=Metrics(), rules=rules
+        )
         # raise_app_exceptions=False so the transport returns the 500 the handler produced.
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             resp = await client.get("/events", headers=auth_header())
-        await broken.dispose()
         assert resp.status_code == 500
         body = resp.json()
         assert body["error"]["code"] == "INTERNAL_ERROR"
