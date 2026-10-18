@@ -47,8 +47,14 @@ ENV PYTHONUNBUFFERED=1 \
     SENTINEL_ENV=production \
     SENTINEL_LOG_FORMAT=json
 
-RUN groupadd --system sentinel \
- && useradd --system --gid sentinel --no-create-home --shell /usr/sbin/nologin sentinel
+# A fixed uid/gid far above the ids hosts hand out (system accounts count
+# down from 999, login users up from 1000). The collectors see the host
+# through /host, so sharing a uid with a host account (999 is often
+# systemd-coredump or a database user) would grant this process that
+# account's access to its own files and /proc/<pid> entries.
+RUN groupadd --system --gid 10001 sentinel \
+ && useradd --system --uid 10001 --gid sentinel --no-create-home \
+      --shell /usr/sbin/nologin sentinel
 
 WORKDIR /app
 
