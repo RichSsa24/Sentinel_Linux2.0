@@ -17,10 +17,14 @@ garbage mapping fails closed instead of shipping a mislabelled detection.
 from __future__ import annotations
 
 import re
+import types
 from enum import StrEnum
-from typing import Final
+from functools import cache
+from typing import Final, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from sentinel.events import Event
 
 # Frozen + extra-forbid: a rule is immutable once loaded, and an unknown key
 # (a typo, an injected field) is rejected rather than silently ignored (§3.3).
@@ -60,6 +64,16 @@ class Operator(StrEnum):
     IN = "in"
     NOT_IN = "not_in"
 
+
+_NUMERIC_OPS: Final[frozenset[Operator]] = frozenset(
+    {Operator.GT, Operator.GTE, Operator.LT, Operator.LTE}
+)
+_TEXT_OPS: Final[frozenset[Operator]] = frozenset(
+    {
+        Operator.CONTAINS, Operator.NOT_CONTAINS, Operator.STARTSWITH, Operator.ENDSWITH,
+        Operator.REGEX,
+    }
+)  # fmt: skip
 
 _SCALAR_OPS: Final[frozenset[Operator]] = frozenset(
     {
@@ -149,6 +163,93 @@ class Condition(BaseModel):
             raise ValueError(msg)
 
 
+def _leaf_kinds(annotation: object) -> set[str]:
+    """JSON kinds ('str', 'int', 'float', 'bool') a field annotation can hold."""
+    if get_origin(annotation) in (Union, types.UnionType):
+        return set().union(*(_leaf_kinds(arg) for arg in get_args(annotation)))
+    if annotation is type(None):
+        return set()
+    if annotation is bool:
+        return {"bool"}
+    if annotation is int:
+        return {"int"}
+    if annotation is float:
+        return {"float"}
+    return {"str"}  # str, StrEnum, datetime: all strings in the evaluated view
+
+
+def _model_fields(model: type[BaseModel], prefix: str = "") -> dict[str, frozenset[str]]:
+    fields: dict[str, frozenset[str]] = {}
+    for name, info in model.model_fields.items():
+        nested = [
+            arg
+            for arg in (get_args(info.annotation) or (info.annotation,))
+            if isinstance(arg, type) and issubclass(arg, BaseModel)
+        ]
+        if nested:
+            for sub in nested:
+                fields.update(_model_fields(sub, f"{prefix}{name}."))
+        else:
+            fields[f"{prefix}{name}"] = frozenset(_leaf_kinds(info.annotation))
+    return fields
+
+
+@cache
+def event_fields() -> dict[str, frozenset[str]]:
+    """Every dotted field path a rule can reference, with the kinds it can hold."""
+    return _model_fields(Event)
+
+
+def _kind_of(value: object) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    return "float" if isinstance(value, float) else "str"
+
+
+def _check_field(condition: Condition) -> None:
+    """A field condition must name a real field and compare it with a value it can hold."""
+    path, op, value = condition.field, condition.op, condition.value
+    kinds = event_fields().get(path or "")
+    if kinds is None:
+        msg = f"unknown field {path!r}; a rule can only match fields of the event model"
+        raise ValueError(msg)
+    numeric = kinds & {"int", "float"}
+    if op in _NUMERIC_OPS and not numeric:
+        msg = f"operator '{op}' needs a numeric field; {path!r} is not one"
+        raise ValueError(msg)
+    if op in _TEXT_OPS and "str" not in kinds:
+        msg = f"operator '{op}' needs a text field; {path!r} is not one"
+        raise ValueError(msg)
+    values = value if isinstance(value, list) else [value]
+    for item in values:
+        kind = _kind_of(item)
+        compatible = kind in kinds or (kind in {"int", "float"} and bool(numeric))
+        if not compatible:
+            msg = f"{path!r} never holds a {kind} value like {item!r}; the rule could not fire"
+            raise ValueError(msg)
+
+
+def _check_condition(condition: Condition, *, root: bool) -> None:
+    """Walk a condition tree: real fields, compatible values, thresholds only at the root."""
+    if condition.threshold is not None:
+        if not root:
+            msg = "'threshold' is only valid as a rule's top-level condition"
+            raise ValueError(msg)
+        if condition.threshold.group_by not in event_fields():
+            msg = f"unknown group_by field {condition.threshold.group_by!r}"
+            raise ValueError(msg)
+        _check_condition(condition.threshold.match, root=False)
+    elif condition.all_ is not None or condition.any_ is not None:
+        for child in condition.all_ or condition.any_ or []:
+            _check_condition(child, root=False)
+    elif condition.not_ is not None:
+        _check_condition(condition.not_, root=False)
+    else:
+        _check_field(condition)
+
+
 class Rule(BaseModel):
     """A single detection rule, mapped to ATT&CK and NIST CSF."""
 
@@ -176,6 +277,12 @@ class Rule(BaseModel):
         _check_all(self.attack, _ATTACK_RE, "ATT&CK technique")
         _check_all(self.nist_csf, _NIST_RE, "NIST CSF category")
         _check_all(self.d3fend, _D3FEND_RE, "D3FEND id")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_condition(self) -> Rule:
+        # A rule that can never fire is a silent gap in coverage, not a valid rule.
+        _check_condition(self.condition, root=True)
         return self
 
 

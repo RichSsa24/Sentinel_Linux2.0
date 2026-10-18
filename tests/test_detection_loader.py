@@ -47,16 +47,60 @@ class TestLoadHappyPath:
             "id: combo-rule\ntitle: Combo\ndescription: d\nseverity: 4\n"
             "attack: [T1059]\nnist_csf: [DE.CM]\n"
             "condition:\n"
-            "  all:\n"
-            "    - {not: {field: process.command_line, op: regex, value: 'a.*b'}}\n"
-            "    - threshold:\n"
-            "        match: {field: event.action, op: equals, value: process_started}\n"
-            "        window_seconds: 60\n"
-            "        count: 3\n"
-            "        group_by: host.name\n"
+            "  threshold:\n"
+            "    match:\n"
+            "      all:\n"
+            "        - {not: {field: process.command_line, op: regex, value: 'a.*b'}}\n"
+            "        - {field: event.action, op: equals, value: process_started}\n"
+            "    window_seconds: 60\n"
+            "    count: 3\n"
+            "    group_by: host.name\n"
         )
         _write(tmp_path, "combo.yml", content)
         assert [r.id for r in load_rules(tmp_path)] == ["combo-rule"]
+
+
+@pytest.mark.security
+class TestRulesThatCouldNeverFire:
+    """Regression: these loaded fine and silently never fired (or misfired)."""
+
+    @pytest.mark.parametrize(
+        ("condition", "reason"),
+        [
+            ("{field: process.cmdline, op: contains, value: nc}", "unknown field"),
+            ("{field: destination.port, op: equals, value: '4444'}", "never holds a str"),
+            ("{field: destination.port, op: in, value: [4444, '5555']}", "never holds a str"),
+            ("{field: process.command_line, op: gt, value: 3}", "numeric field"),
+            ("{field: file.size, op: regex, value: '^0$'}", "text field"),
+            (
+                "{all: [{threshold: {match: {field: event.action, op: equals, value: x},"
+                " window_seconds: 60, count: 3, group_by: source.ip}}]}",
+                "top-level",
+            ),
+            (
+                "{threshold: {match: {field: event.action, op: equals, value: x},"
+                " window_seconds: 60, count: 3, group_by: source.address}}",
+                "group_by",
+            ),
+        ],
+        ids=[
+            "typo-field",
+            "string-for-port",
+            "string-in-port-list",
+            "gt-on-text",
+            "regex-on-number",
+            "nested-threshold",
+            "unknown-group-by",
+        ],
+    )
+    def test_the_library_fails_to_load(self, tmp_path: Path, condition: str, reason: str) -> None:
+        content = (
+            "id: broken\ntitle: t\ndescription: d\nseverity: 4\n"
+            f"attack: [T1059]\nnist_csf: [DE.CM]\ncondition: {condition}\n"
+        )
+        _write(tmp_path, "broken.yml", content)
+        with pytest.raises(RuleLoadError, match=reason):
+            load_rules(tmp_path)
 
 
 class TestFailClosed:

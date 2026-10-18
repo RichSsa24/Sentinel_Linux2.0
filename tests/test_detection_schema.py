@@ -94,8 +94,8 @@ class TestRuleValidation:
                 **_VALID_RULE,
                 "condition": {
                     "all": [
-                        {"any": [{"field": "a", "op": "equals", "value": 1}]},
-                        {"not": {"field": "b", "op": "equals", "value": 2}},
+                        {"any": [{"field": "source.port", "op": "equals", "value": 1}]},
+                        {"not": {"field": "destination.port", "op": "equals", "value": 2}},
                     ]
                 },
             }
