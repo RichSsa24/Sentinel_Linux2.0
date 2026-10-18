@@ -9,12 +9,20 @@
 
 name: sentinel
 
+# Bounded container logs: json-file grows without limit by default.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 x-hardened: &hardened
   read_only: true
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
   restart: unless-stopped
   networks: [sentinel-net]
+  logging: *logging
 
 services:
   sentinel:
@@ -24,6 +32,16 @@ services:
       dockerfile: deploy/docker/Dockerfile
     image: sentinel-linux:local
     container_name: sentinel
+    # Group adm (gid 4 on Debian and Ubuntu) reads /var/log/auth.log
+    # (root:adm 0640) — the log-reader group, and nothing more. Without it the
+    # auth-log collector cannot open the file. RHEL keeps /var/log/secure
+    # root-only: see docs/OPERATIONS.md.
+    group_add: ["4"]
+    # A runaway (or attacked) process is contained instead of starving the
+    # host it protects. Measured idle: ~86 MiB and 5 tasks; the outage buffer
+    # (SENTINEL_PERSIST_MAX_BUFFERED) and the queue are bounded.
+    mem_limit: 512m
+    pids_limit: 128
     # Drain the queue and flush buffered events before Docker sends SIGKILL.
     # Worst case (database hung): the write in flight and a final write, each
     # bounded by SENTINEL_PERSIST_WRITE_TIMEOUT_SECONDS (10 s), plus up to
@@ -35,6 +53,11 @@ services:
       # The host is visible read-only under /host (see volumes); collectors
       # read beneath it and report host-native paths and the host's name.
       SENTINEL_HOST_ROOT: /host
+      # File integrity watches what is mounted below. User crontabs
+      # (/var/spool/cron) are root-only on every distribution, so this
+      # unprivileged container cannot watch them; /etc/crontab and /etc/cron.*
+      # are covered. Add a path here only together with its mount.
+      SENTINEL_FIM_PATHS: ${SENTINEL_FIM_PATHS:-/etc}
     # Optional tuning (webhook/email sinks, alert gates, FIM paths ...).
     env_file:
       - path: sentinel.env
@@ -53,6 +76,9 @@ services:
     image: postgres:16-alpine
     container_name: sentinel_db
     restart: unless-stopped
+    logging: *logging
+    mem_limit: 512m
+    pids_limit: 256
     # The official entrypoint needs to chown/initdb as root before dropping to
     # the postgres user, so the capability set is trimmed rather than dropped.
     cap_drop: [ALL]
@@ -75,6 +101,8 @@ services:
     <<: *hardened
     image: prom/prometheus:v2.54.1
     container_name: sentinel_prometheus
+    mem_limit: 1g
+    pids_limit: 128
     # One API key, two consumers: Sentinel checks it, Prometheus presents it.
     # Prometheus can only read a bearer token from a file, and Compose cannot
     # inject environment-sourced secrets into a read-only container, so the
@@ -102,9 +130,10 @@ services:
     <<: *hardened
     image: grafana/grafana:11.2.0
     container_name: sentinel_grafana
+    mem_limit: 256m
+    pids_limit: 128
     tmpfs:
       - /tmp
-      - /var/lib/grafana
       - /var/log/grafana
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/.env}
@@ -113,6 +142,9 @@ services:
       GF_ANALYTICS_REPORTING_ENABLED: "false"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # Users, the changed admin password and saved dashboards survive restarts
+      # (on a tmpfs they were lost with every container restart).
+      - sentinel-grafana-data:/var/lib/grafana
     ports:
       - "127.0.0.1:3000:3000"
     depends_on: [prometheus]
@@ -124,3 +156,4 @@ networks:
 volumes:
   sentinel-db-data:
   sentinel-prom-data:
+  sentinel-grafana-data:
