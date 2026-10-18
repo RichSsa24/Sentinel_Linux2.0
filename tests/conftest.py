@@ -34,7 +34,7 @@ from sentinel.storage import Database
 _FIXED_TS = datetime(2026, 6, 22, 12, 0, 0, tzinfo=UTC)
 
 # Fixed bearer key for API tests (not a real credential).
-TEST_API_KEY = "test-api-key-0123456789"  # pragma: allowlist secret
+TEST_API_KEY = "test-api-key-0123456789abcdef0123456789"  # pragma: allowlist secret
 
 
 def make_event(

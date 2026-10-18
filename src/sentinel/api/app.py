@@ -273,6 +273,5 @@ def get_app() -> FastAPI:
     settings = Settings()
     configure_logging(settings)
     rules = load_rules(settings.rules_dir)
-    return create_app(
-        settings, database=Database(settings.database_url), metrics=Metrics(), rules=rules
-    )
+    database = Database(settings.database_url.get_secret_value())
+    return create_app(settings, database=database, metrics=Metrics(), rules=rules)

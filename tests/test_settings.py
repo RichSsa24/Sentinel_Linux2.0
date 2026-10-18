@@ -9,10 +9,13 @@ Covers the §3.3 invariants:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from sentinel import BackpressurePolicy, Environment, LogFormat, LogLevel
+from sentinel.settings import API_KEY_PLACEHOLDER, Settings
 from tests.conftest import settings_no_env_file
 
 
@@ -42,6 +45,48 @@ class TestSettingsValidation:
             "SENTINEL_NOT_A_REAL_FIELD" in str(err.get("msg", ""))
             for err in exc_info.value.errors()
         )
+
+    @pytest.mark.security
+    def test_validation_errors_never_echo_secret_values(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Regression: pydantic printed the offending input, so a misspelled
+        # variable next to a secret, or any model-level error (which shows the
+        # whole input), wrote the secret to the startup log.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "SENTINEL_ENV=production\n"
+            "SENTINEL_SMTP_PASSWRD=typo-smtp-secret-value\n",  # pragma: allowlist secret
+            encoding="utf-8",
+        )
+        with pytest.raises(ValidationError) as from_file:
+            Settings()
+        assert "typo-smtp-secret-value" not in str(from_file.value)
+
+        monkeypatch.setenv("SENTINEL_API_KEY", "a-real-looking-api-key-0123456789-abcdef")
+        monkeypatch.setenv("SENTINEL_LOG_LEVL", "DEBUG")  # typo -> model-level error
+        with pytest.raises(ValidationError) as from_env:
+            settings_no_env_file()
+        assert "0123456789-abcdef" not in str(from_env.value)
+
+    @pytest.mark.security
+    @pytest.mark.parametrize(
+        "key",
+        ["short-key", API_KEY_PLACEHOLDER],
+        ids=["shorter-than-32", "env-example-placeholder"],
+    )
+    def test_rejects_weak_api_keys(self, monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "production")
+        monkeypatch.setenv("SENTINEL_API_KEY", key)
+        with pytest.raises(ValidationError):
+            settings_no_env_file()
+
+    @pytest.mark.security
+    def test_rejects_a_wildcard_cors_origin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "production")
+        monkeypatch.setenv("SENTINEL_API_CORS_ORIGINS", "https://a.test, *")
+        with pytest.raises(ValidationError):
+            settings_no_env_file()
 
 
 class TestSettingsDefaults:
@@ -144,6 +189,23 @@ class TestAlertingSettings:
         # SecretStr must mask the value in any string/repr rendering.
         assert "hmac-shhh" not in repr(s)
         assert "smtp-shhh" not in str(s.smtp_password)
+
+    @pytest.mark.security
+    def test_urls_that_can_carry_credentials_are_masked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A Slack/Teams webhook URL is the credential; a PostgreSQL URL embeds one.
+        monkeypatch.setenv("SENTINEL_ENV", "production")
+        monkeypatch.setenv("SENTINEL_WEBHOOK_URL", "https://hooks.example.com/T0/B0/hooksecret")
+        monkeypatch.setenv(
+            "SENTINEL_DATABASE_URL",
+            "postgresql+asyncpg://sentinel:dbsecret@db/sentinel",  # pragma: allowlist secret
+        )
+        s = settings_no_env_file()
+
+        assert "hooksecret" not in repr(s)
+        assert "dbsecret" not in repr(s)
+        assert s.database_url.get_secret_value().endswith("@db/sentinel")
 
     def test_alerting_overrides_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SENTINEL_ENV", "production")

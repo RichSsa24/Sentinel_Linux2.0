@@ -151,7 +151,7 @@ def build_sinks(settings: Settings) -> list[AlertSink]:
             raise ConfigurationError(msg)
         sinks.append(
             WebhookSink(
-                settings.webhook_url,
+                settings.webhook_url.get_secret_value(),
                 settings.webhook_hmac_secret.get_secret_value(),
                 allow_private=settings.webhook_allow_private,
             )

@@ -20,7 +20,7 @@ target_metadata = Base.metadata
 
 def _sync_url() -> str:
     configured = context.config.get_main_option("sqlalchemy.url")
-    url = configured if configured else Settings().database_url
+    url = configured if configured else Settings().database_url.get_secret_value()
     return url.replace("+aiosqlite", "").replace("+asyncpg", "+psycopg")
 
 

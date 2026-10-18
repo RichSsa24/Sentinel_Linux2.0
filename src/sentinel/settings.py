@@ -60,6 +60,10 @@ class BackpressurePolicy(StrEnum):
 
 ENV_PREFIX: Final[str] = "SENTINEL_"
 
+# The placeholder shipped in .env.example; a key equal to it is no secret.
+API_KEY_PLACEHOLDER: Final[str] = "replace-with-a-long-random-token"  # pragma: allowlist secret
+API_KEY_MIN_LENGTH: Final[int] = 32
+
 # Collector names accepted by `SENTINEL_COLLECTORS` (each is a collector's `name`).
 KNOWN_COLLECTORS: Final[tuple[str, ...]] = ("auth-log", "file-integrity", "process", "network")
 
@@ -84,6 +88,10 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="forbid",
         frozen=True,
+        # Validation errors must not echo input values: a typo next to a secret
+        # (or the whole environment, for a model-level error) would otherwise be
+        # printed in full to the startup log.
+        hide_input_in_errors=True,
     )
 
     env: Environment = Field(
@@ -149,8 +157,10 @@ class Settings(BaseSettings):
     alert_throttle_window_seconds: float = Field(default=60.0, gt=0.0, le=86_400.0)
 
     # --- Webhook sink (optional; secret from env only, never a default) ------
-    webhook_url: str | None = Field(
-        default=None, description="HTTPS webhook endpoint. None disables the sink."
+    webhook_url: SecretStr | None = Field(
+        default=None,
+        description="HTTPS webhook endpoint. None disables the sink. Secret: for many "
+        "services (Slack, Teams, Discord) the URL itself is the credential.",
     )
     webhook_hmac_secret: SecretStr | None = Field(
         default=None, description="Shared secret for HMAC-signing webhook payloads."
@@ -177,10 +187,11 @@ class Settings(BaseSettings):
     smtp_starttls: bool = True
 
     # --- Persistence ---------------------------------------------------------
-    database_url: str = Field(
-        default="sqlite+aiosqlite:///./sentinel.db",
+    database_url: SecretStr = Field(
+        default=SecretStr("sqlite+aiosqlite:///./sentinel.db"),
         min_length=1,
-        description="Async SQLAlchemy URL. SQLite by default; PostgreSQL via env.",
+        description="Async SQLAlchemy URL. SQLite by default; PostgreSQL via env. "
+        "Secret: it may embed the database password.",
     )
     persist_batch_size: int = Field(
         default=256,
@@ -205,8 +216,9 @@ class Settings(BaseSettings):
     # --- Read API ------------------------------------------------------------
     api_key: SecretStr | None = Field(
         default=None,
-        description="Bearer key for the read API. Unset = the API denies every "
-        "request (default-deny / fail-closed).",
+        min_length=API_KEY_MIN_LENGTH,
+        description="Bearer key for the read API, at least 32 characters. Unset = the "
+        "API denies every request (default-deny / fail-closed).",
     )
     api_cors_origins: str = Field(
         default="",
@@ -255,6 +267,22 @@ class Settings(BaseSettings):
     def _require_absolute(cls, value: Path) -> Path:
         if not value.is_absolute():
             msg = f"must be an absolute path; got {str(value)!r}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("api_key")
+    @classmethod
+    def _reject_placeholder_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and value.get_secret_value() == API_KEY_PLACEHOLDER:
+            msg = "api_key is still the .env.example placeholder; generate a random key"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("api_cors_origins")
+    @classmethod
+    def _reject_wildcard_origin(cls, value: str) -> str:
+        if "*" in split_csv(value):
+            msg = "api_cors_origins must list exact origins; '*' is not allowed"
             raise ValueError(msg)
         return value
 
