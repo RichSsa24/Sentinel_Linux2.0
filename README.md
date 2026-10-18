@@ -289,8 +289,9 @@ Stated plainly, because a detector's blind spots matter as much as its rules:
   last transactions can roll back on power loss. Use PostgreSQL in production.
 - **No retention policy yet** — the events table grows until pruned externally.
 - **Auth-log parsing targets OpenSSH syslog lines** (`/var/log/auth.log`,
-  `/var/log/secure` via `SENTINEL_AUTH_LOG_PATH`); journald-only hosts are not
-  covered.
+  `/var/log/secure` via `SENTINEL_AUTH_LOG_PATH`) — `sshd` and OpenSSH 9.8+'s
+  `sshd-session`, BSD or RFC 3339 timestamps, rsyslog's repeat summaries;
+  journald-only hosts are not covered.
 
 ## Roadmap
 

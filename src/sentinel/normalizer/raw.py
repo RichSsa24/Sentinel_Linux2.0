@@ -78,6 +78,11 @@ class RawAuthEvent(_RawBase):
     user: str = Field(min_length=1, max_length=256)
     ip: str = Field(min_length=1, max_length=64)
     port: int = Field(ge=0, le=_MAX_PORT)
+    occurrence: int = Field(
+        default=0,
+        ge=0,
+        description="Index among identical lines in the same second; part of the id.",
+    )
     message: str = Field(min_length=1, max_length=10_000)
 
 

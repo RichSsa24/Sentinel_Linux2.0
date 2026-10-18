@@ -53,7 +53,14 @@ def _map_auth(raw: RawAuthEvent) -> Event:
         timestamp=raw.occurred_at,
         event=EventMeta(
             id=Event.compute_id(
-                raw.syslog_ts, raw.host, raw.pid, raw.action, raw.user, raw.ip, raw.port
+                raw.syslog_ts,
+                raw.host,
+                raw.pid,
+                raw.action,
+                raw.user,
+                raw.ip,
+                raw.port,
+                raw.occurrence,
             ),
             kind=EventKind.EVENT,
             category=EventCategory.AUTHENTICATION,

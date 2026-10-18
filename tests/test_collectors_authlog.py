@@ -24,9 +24,9 @@ from pathlib import Path
 
 import pytest
 
-from sentinel.collectors.authlog import AuthLogCollector, parse_auth_line
+from sentinel.collectors.authlog import AuthLogCollector, parse_auth_line, parse_auth_records
 from sentinel.events import Event
-from sentinel.normalizer import Normalizer, RawSource
+from sentinel.normalizer import Normalizer, RawAuthEvent, RawSource
 from sentinel.pipeline.queue import BoundedEventQueue
 from sentinel.pipeline.runner import Pipeline
 from tests.conftest import DeadLetterNormalizer, settings_no_env_file
@@ -220,6 +220,7 @@ class TestDeadLetter:
         queue = BoundedEventQueue(maxsize=4)
 
         await collector._drain_once(queue)
+        collector._close()  # run() closes the tailed file; this test bypasses it
 
         assert queue.empty()
         assert collector.stats["parsed"] == 0
@@ -358,3 +359,162 @@ class TestRotationReReadExactlyOnce:
         assert len(set(received)) == 5
         assert pipeline.stats["processed"] == 5
         assert pipeline.stats["deduped"] == 5
+
+
+async def _drain_events(collector: AuthLogCollector) -> list[Event]:
+    """One poll's worth of events (the test closes the tailed file afterwards)."""
+    queue = BoundedEventQueue(maxsize=4096)
+    await collector._drain_once(queue)
+    events: list[Event] = []
+    while not queue.empty():
+        events.append(await queue.get())
+        queue.task_done()
+    return events
+
+
+class TestModernSshdFormats:
+    """Regressions: lines the parser silently skipped on current distributions."""
+
+    def test_sshd_session_process_name(self) -> None:
+        # OpenSSH 9.8+ logs per-connection events as sshd-session.
+        raw = parse_auth_line(_line(proc="sshd-session"), year=YEAR)
+        assert raw is not None
+        assert raw.ip == "10.0.0.9"
+
+    def test_rfc3339_timestamp(self) -> None:
+        line = "2026-06-16T14:00:00.123456+02:00 testhost sshd[1001]: " + _FAILED
+        raw = parse_auth_line(line)
+        assert raw is not None
+        assert raw.occurred_at == datetime(2026, 6, 16, 12, 0, 0, 123456, tzinfo=UTC)
+        assert raw.syslog_ts == "2026-06-16T14:00:00.123456+02:00"
+
+    def test_rsyslog_repeat_summary_counts_every_attempt(self) -> None:
+        line = _line("message repeated 3 times: [ " + _FAILED + "]")
+        records = parse_auth_records(line, year=YEAR)
+        assert [r.occurrence for r in records] == [0, 1, 2]
+        assert {r.message for r in records} == {_FAILED}
+        assert len({_event_id(r) for r in records}) == 3
+
+    @pytest.mark.parametrize(
+        "method", ["keyboard-interactive/pam", "keyboard-interactive", "hostbased"]
+    )
+    def test_other_authentication_methods(self, method: str) -> None:
+        body = f"Accepted {method} for alice from 192.168.1.5 port 51000 ssh2"
+        raw = parse_auth_line(_line(body), year=YEAR)
+        assert raw is not None
+        assert raw.action == "ssh_login_succeeded"
+
+    def test_the_none_probe_is_not_a_failed_login(self) -> None:
+        # Clients try "none" before every real method; counting it would
+        # double every brute-force tally.
+        body = "Failed none for invalid user x from 10.0.0.9 port 4242 ssh2"
+        assert parse_auth_line(_line(body), year=YEAR) is None
+
+
+@pytest.mark.security
+class TestHostileUserNames:
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "Invalid user a from 6.6.6.6 port 1 from 203.0.113.9 port 2222",
+            "Failed password for invalid user a from 6.6.6.6 port 1"
+            " from 203.0.113.9 port 2222 ssh2",
+        ],
+    )
+    def test_a_user_name_cannot_choose_the_source_address(self, body: str) -> None:
+        # Regression: the user name is client-chosen and sshd logs it verbatim;
+        # a lazy match took the attacker's "from 6.6.6.6" as the source.
+        raw = parse_auth_line(_line(body), year=YEAR)
+        assert raw is not None
+        assert (raw.ip, raw.port) == ("203.0.113.9", 2222)
+
+
+class TestYearInference:
+    def test_a_december_line_read_in_january_is_last_year(self) -> None:
+        # Regression: the year was fixed when the collector started.
+        now = datetime(2027, 1, 1, 0, 5, tzinfo=UTC)
+        raw = parse_auth_line(_line(month="Dec", day="31", clock="23:59:00"), now=now)
+        assert raw is not None
+        assert raw.occurred_at.year == 2026
+
+    def test_a_current_line_is_this_year(self) -> None:
+        now = datetime(2027, 6, 16, 12, 5, tzinfo=UTC)
+        raw = parse_auth_line(_line(), now=now)
+        assert raw is not None
+        assert raw.occurred_at.year == 2027
+
+
+@pytest.mark.security
+class TestIdenticalFailures:
+    async def test_repeated_identical_failures_are_distinct_events(self, tmp_path: Path) -> None:
+        # Regression: sshd logs one identical line per attempt on a connection
+        # (same second, pid and port); their ids collided and the dedup window
+        # kept one, so six attempts never reached the brute-force threshold.
+        log = tmp_path / "auth.log"
+        log.write_text("\n".join([_line()] * 6) + "\n", encoding="utf-8")
+        collector = AuthLogCollector(log, year=YEAR)
+        first = await _drain_events(collector)
+        # A truncation and re-read of the same lines reproduces the same ids,
+        # so the dedup window still collapses a post-rotation re-read.
+        log.write_text("", encoding="utf-8")
+        await _drain_events(collector)
+        log.write_text("\n".join([_line()] * 6) + "\n", encoding="utf-8")
+        second = await _drain_events(collector)
+        collector._close()
+
+        assert len({e.event.id for e in first}) == 6
+        assert {e.event.id for e in second} == {e.event.id for e in first}
+
+
+class TestRotationAndBounds:
+    async def test_rename_rotation_loses_no_line_and_cuts_none(self, tmp_path: Path) -> None:
+        # Regression: rotation was detected only by a shrinking size. When the
+        # new file had already grown past the old offset, its start was skipped
+        # (a fragment came out as a line), and lines written to the old file
+        # after the last poll were never read.
+        log = tmp_path / "auth.log"
+        log.write_text(_line(pid="1") + "\n", encoding="utf-8")
+        collector = AuthLogCollector(log, year=YEAR)
+        assert len(await _drain_events(collector)) == 1
+
+        with log.open("a", encoding="utf-8") as old:
+            old.write(_line(pid="2") + "\n")  # lands after the last poll
+        log.rename(tmp_path / "auth.log.1")
+        log.write_text("\n".join(_line(pid=str(p)) for p in range(3, 6)) + "\n", encoding="utf-8")
+        events = await _drain_events(collector)
+        collector._close()
+
+        assert [e.message for e in events] == [_FAILED] * 4
+        assert collector.stats["skipped"] == 0
+
+    async def test_a_poll_reads_a_bounded_amount(self, tmp_path: Path) -> None:
+        log = tmp_path / "auth.log"
+        noise = (_line("Connection closed by 10.0.0.9 port 4242") + "\n") * 40_000  # ~3 MiB
+        log.write_text(noise + _line() + "\n", encoding="utf-8")
+        collector = AuthLogCollector(log, year=YEAR)
+
+        await _drain_events(collector)
+        assert collector.stats["position"] <= 1 << 20
+        events: list[Event] = []
+        for _ in range(5):
+            events += await _drain_events(collector)
+        collector._close()
+        assert len(events) == 1
+
+    async def test_a_line_without_newline_cannot_grow_the_buffer(self, tmp_path: Path) -> None:
+        log = tmp_path / "auth.log"
+        log.write_bytes(b"A" * 100_000)
+        collector = AuthLogCollector(log, year=YEAR)
+        await _drain_events(collector)
+        assert len(collector._buf) <= 8_192
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("tail of the long line\n" + _line() + "\n")
+        events = await _drain_events(collector)
+        collector._close()
+        assert len(events) == 1
+
+
+def _event_id(raw: RawAuthEvent) -> str:
+    event = Normalizer().normalize(raw)
+    assert event is not None
+    return event.event.id
