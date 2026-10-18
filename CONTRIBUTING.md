@@ -44,11 +44,16 @@ uv run ruff check .            # lint + import order + common bug patterns
 uv run ruff format --check .   # formatting
 uv run mypy                    # strict typing (src + tests, pydantic plugin)
 uv run bandit -r src/ -c pyproject.toml
-uv export --quiet --format requirements-txt --no-emit-project --no-hashes \
-  -o requirements-audit.txt && uv run pip-audit -r requirements-audit.txt --strict
+uv export --quiet --format requirements-txt --no-emit-project \
+  -o requirements-audit.txt && uv run pip-audit -r requirements-audit.txt --strict --disable-pip
 uv run pytest --cov=src/sentinel --cov-report=term-missing   # fails below 95%
 uv run pre-commit run --all-files
 ```
+
+The PostgreSQL integration tests run when `SENTINEL_TEST_POSTGRES_URL` points
+at a disposable database (CI provides one); changes to
+`deploy/prometheus/alerts.yml` must keep `promtool test rules alerts.test.yml`
+passing (see the `alerting` job in `ci.yml` for the command).
 
 Performance changes ship with numbers: run `uv run python scripts/benchmark.py`
 before and after, and quote both in the commit message. Changes to the

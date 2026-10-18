@@ -112,7 +112,10 @@ producers through shared duplicates and asserts each id reaches the consumer onc
 **Rules are data, never code.** Rules are strict YAML parsed with `safe_load`
 into a closed grammar of comparison operators; the evaluator is an allow-listed
 interpreter with no `eval`. Rule regexes run on the `regex` engine with a hard
-timeout and bounded input (ReDoS). A bad rule fails the whole library at load.
+timeout over bounded windows (ReDoS), and fail safe: a timeout fires the rule
+rather than reading as "no match", so padding a command line cannot buy a miss.
+A rule that could never fire (an unknown field, a value of the wrong type) fails
+the whole library at load.
 Every rule has a positive and a negative test, plus structural tests — e.g. no
 process rule may fire twice for one process ([`test_detection_rules.py`](tests/test_detection_rules.py)).
 
@@ -140,34 +143,48 @@ Verified end to end: a cron drop, a `useradd` command line and a listener on
 **Security of the detector itself.**
 - Default-deny bearer auth on every data endpoint, constant-time comparison, and
   a regression test that a failed login never logs the presented or configured
-  key ([`security.py`](src/sentinel/api/security.py)).
-- Log-injection defence (control characters stripped) and secret redaction in
-  the logging pipeline, configured before anything else can log.
+  key; `X-Forwarded-For` is not trusted, and key holders have their own
+  rate-limit budget ([`security.py`](src/sentinel/api/security.py)).
+- Log-injection defence and secret redaction for every logger, libraries
+  included, configured before anything else can log; console alerts escape
+  terminal control sequences.
 - Webhook sink: HTTPS only, HMAC-SHA256 signed, SSRF guard re-checked on every
-  send (blocks loopback, private, link-local and metadata addresses).
-- Half-configured alert channels fail closed at startup rather than silently
-  not alerting; unknown `SENTINEL_*` variables are a startup error.
-- Container: non-root, read-only root filesystem, no capabilities,
-  `no-new-privileges`, code and rules root-owned, secrets mandatory, ports bound
-  to loopback. Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+  send and the connection pinned to the address it checked (DNS rebinding).
+  Email: verified TLS only. Each sink has its own queue and deadline, so a hung
+  channel delays nothing else.
+- The throttle withholds notifications, never evidence: throttled alerts are
+  stored and announced, so decoys cannot hide the real attack.
+- Half-configured alert channels and weak or placeholder keys fail at startup;
+  unknown `SENTINEL_*` variables are a startup error.
+- Least privilege end to end: the container runs as uid 10001 with no
+  capabilities on a read-only root filesystem; PostgreSQL gives Sentinel a
+  non-superuser role; the systemd unit is sandboxed (`systemd-analyze
+  security` exposure 1.8). Images are pinned by digest and scanned weekly.
+  Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 ## Performance
 
-Measured with [`scripts/benchmark.py`](scripts/benchmark.py) (median of repeated
-runs) on a 4-vCPU Xeon @ 2.8 GHz VM, Python 3.13 — re-run it on your hardware.
-"Before" is commit `24bb9e7`, where the benchmark was introduced.
+Measured with [`scripts/benchmark.py`](scripts/benchmark.py) on a 4-vCPU
+x86-64 VM, Python 3.13: each figure is the median of three runs, each itself a
+median of five repetitions; "before" (commit `24bb9e7`, where the benchmark was
+introduced) and "after" were run alternately on the same machine. Re-run it on
+your hardware.
 
 | Hot path | Before | After | Change |
 | --- | --- | --- | --- |
-| End to end: collector → dedup → 17 rules → alerts → SQLite | ~500 events/s | ~20,000 events/s | **~40×** — write-behind flusher off the detection path, bulk insert, SQLite WAL |
-| Rule engine | ~18,000 events/s | ~30,000 events/s | ~1.7× — action index, cached field paths |
-| FIM poll, 2,000 unchanged files (31 MiB) | ~210 ms | ~50 ms | ~4× — stat cache |
-| Process poll, per process | ~125 µs | ~60 µs | ~2× — read only `stat` for known processes |
-| Dedup pipeline alone (80% duplicates) | ~350,000 events/s | unchanged | already not the bottleneck |
+| End to end: collector → dedup → 17 rules → alerts → SQLite | one commit per event: ~200 events/s | ~12,600 events/s | **~60×** — write-behind flusher off the detection path, bulk insert, SQLite WAL |
+| Persistence, batches of 256 | ~1,800 events/s | ~27,600 events/s | ~15× — bulk insert, no per-row refresh |
+| Rule engine | ~18,700 events/s | ~22,200 events/s | ~1.2× — action index, cached field paths (see below) |
+| FIM poll, 2,000 unchanged files (31 MiB) | ~174 ms | ~49 ms | ~3.5× — stat cache |
+| Process poll, per process | ~123 µs | ~46 µs | ~2.7× — read only `stat` for known processes |
+| Dedup pipeline alone (80% duplicates) | ~396,000 events/s | unchanged | already not the bottleneck |
 
 Each optimization landed as its own commit with its measurement, and none
 trades away a detection: the stat cache and rule index each have tests that fail
-if they hide an event.
+if they hide an event. The rule engine was ~1.6× faster before the security
+review closed the rule evasions: the hardened rules run twice as many regex
+searches per event (and each search costs less, being bounded). Detection
+coverage came first.
 
 ## Detection coverage
 
@@ -204,16 +221,25 @@ condition:
 ### Docker Compose: Sentinel + PostgreSQL + Prometheus + Grafana
 
 ```bash
-install -m 600 deploy/.env.example deploy/.env   # owner-only; set the secrets (Compose refuses to start without them)
+install -m 600 deploy/.env.example deploy/.env   # owner-only; set the four secrets
 docker compose -f deploy/docker-compose.yml up -d --build
 sudo scripts/demo.sh                    # harmless host activity -> alerts (cleans up after itself)
 ```
 
-- API on `127.0.0.1:8000`, Grafana on `127.0.0.1:3000` (dashboard provisioned).
-- Prometheus scrapes `/metrics` with the same API key — no token file to sync.
-- Optional tuning (webhook/email sinks, alert gates, FIM paths): `deploy/sentinel.env`.
+- API on `127.0.0.1:8000`, Grafana on `127.0.0.1:3000` (dashboard provisioned
+  and persisted). Prometheus scrapes `/metrics` with the same API key and loads
+  [alert rules](deploy/prometheus/alerts.yml) for a blind, data-losing or
+  silent detector.
+- Verified end to end on the running stack: an SSH brute force written to the
+  host's `/var/log/auth.log` becomes a stored alert, every dashboard panel
+  returns data, and every alert rule loads.
 
 ### Bare metal
+
+A sandboxed [systemd unit](deploy/systemd/sentinel.service) runs the service as
+an unprivileged user and migrates the schema before each start; the steps are
+in [docs/OPERATIONS.md](docs/OPERATIONS.md#bare-metal-systemd). To try it in a
+shell instead:
 
 ```bash
 export SENTINEL_ENV=production SENTINEL_API_KEY="$(openssl rand -base64 32)"
@@ -221,27 +247,26 @@ uv run alembic upgrade head        # create/upgrade the schema (SQLite by defaul
 uv run sentinel serve --host 127.0.0.1 --port 8000
 ```
 
-`/readyz` stays at 503 until the schema exists, so a missed migration is
-visible rather than silent.
-
 Every setting is documented in [`.env.example`](.env.example) (kept in sync with
-the code by a test).
+the code by a test). Deployment, health, metrics, the alert runbook, backup,
+upgrade and troubleshooting: **[docs/OPERATIONS.md](docs/OPERATIONS.md)**.
 
 ### API
 
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |
 | `GET /healthz` | — | liveness |
-| `GET /readyz` | — | readiness: database reachable **and** pipeline running |
-| `GET /events?limit=&cursor=` | bearer | normalized events, keyset-paginated |
+| `GET /readyz` | — | readiness: pipeline running, database answering within 2 s, schema present, writes succeeding |
+| `GET /events?limit=&cursor=` | bearer | normalized events, keyset-paginated (`total` on the first page) |
 | `GET /alerts?limit=&cursor=` | bearer | persisted alerts with ATT&CK / NIST mappings |
 | `GET /rules` | bearer | the loaded rule library |
 | `GET /metrics` | bearer | Prometheus exposition |
 
-Metrics include `sentinel_events_ingested_total`, `sentinel_detections_fired_total{rule_id,severity}`,
-`sentinel_alerts_emitted_total{sink}`, `sentinel_alerts_suppressed_total{reason}`,
-`sentinel_events_dropped_total{reason}`, `sentinel_queue_depth` and
-`sentinel_alert_latency_seconds`.
+The probes are not rate limited. Metrics cover the pipeline (`sentinel_pipeline_up`,
+ingestion, drops by reason, queue depth), each collector's source
+(`sentinel_collector_source_up`, restarts), detections, alert delivery and
+latency, persistence (buffered records, failed writes) and retention — the full
+list is in [docs/OPERATIONS.md](docs/OPERATIONS.md#metrics).
 
 ## Quality gates
 
@@ -249,7 +274,9 @@ Every push runs ([`ci.yml`](.github/workflows/ci.yml)), on Python 3.12 and 3.13:
 
 | Gate | Tool |
 | --- | --- |
-| 600+ tests, branch coverage ≥ 95% enforced (98.7% at time of writing) | pytest, Hypothesis |
+| 890+ tests, branch coverage ≥ 95% enforced (98.3% at time of writing) | pytest, Hypothesis |
+| Storage paths against PostgreSQL 16 (migrations, rejected rows, retention) | pytest + service container |
+| Alert rules fire on their failure and stay quiet otherwise | promtool |
 | Strict typing | mypy `--strict` + pydantic plugin |
 | Lint and format | ruff |
 | Security lint, secret scanning | bandit, detect-secrets |
@@ -258,8 +285,11 @@ Every push runs ([`ci.yml`](.github/workflows/ci.yml)), on Python 3.12 and 3.13:
 | Fixable HIGH/CRITICAL image vulnerabilities | Trivy |
 | Runtime SBOM | CycloneDX artifact |
 
-Actions are pinned by commit SHA and Dependabot keeps them, the lockfile and the
-base image current.
+Actions are pinned by commit SHA, images by digest; Dependabot keeps them, the
+lockfile, the base image and the Compose images current, and a weekly workflow
+re-scans every deployed image. Tests that guard a security property were
+checked by mutation: the guarded code was broken on purpose and the test had to
+fail.
 
 ```bash
 uv sync
@@ -287,7 +317,18 @@ Stated plainly, because a detector's blind spots matter as much as its rules:
   never a miss). Grant read access for content-accurate monitoring.
 - **SQLite trades durability for speed** (`synchronous=NORMAL` in WAL mode): the
   last transactions can roll back on power loss. Use PostgreSQL in production.
-- **No retention policy yet** — the events table grows until pruned externally.
+- **Restarts are a short blind spot.** The auth log is read from its end at
+  start-up (so a restart does not re-alert history) and the other collectors
+  baseline what they find, so activity while the service is stopped is not
+  analyzed; `SENTINEL_AUTH_LOG_BACKFILL=true` reads the whole log instead.
+- **The unprivileged container cannot read root-only sources** — user crontabs,
+  and `/var/log/secure` on RHEL. Granting `CAP_DAC_READ_SEARCH` covers them at
+  the cost of letting a compromised service read every host file
+  ([docs/OPERATIONS.md](docs/OPERATIONS.md#bare-metal-systemd)).
+- **Third-party images carry upstream advisories.** The newest PostgreSQL,
+  Prometheus and Grafana releases include Go standard-library advisories that
+  only upstream rebuilds fix; the weekly scan reports them. Sentinel's own image
+  has no fixable HIGH or CRITICAL finding.
 - **Auth-log parsing targets OpenSSH syslog lines** (`/var/log/auth.log`,
   `/var/log/secure` via `SENTINEL_AUTH_LOG_PATH`) — `sshd` and OpenSSH 9.8+'s
   `sshd-session`, BSD or RFC 3339 timestamps, rsyslog's repeat summaries;
@@ -295,14 +336,16 @@ Stated plainly, because a detector's blind spots matter as much as its rules:
 
 ## Roadmap
 
-eBPF process/network collector · journald source · event retention · Sigma rule
-import · per-rule false-positive allow-lists · multi-host aggregation.
+eBPF process/network collector · journald source · Sigma rule import ·
+per-rule false-positive allow-lists · multi-host aggregation.
 
 ## Documentation
 
 - [ADR 0001 — Architecture](docs/adr/0001-architecture-overview.md) ·
   [ADR 0002 — Tooling](docs/adr/0002-tooling-choices.md) ·
-  [ADR 0003 — Runtime & performance](docs/adr/0003-runtime-and-performance.md)
+  [ADR 0003 — Runtime & performance](docs/adr/0003-runtime-and-performance.md) ·
+  [ADR 0004 — Operating safely](docs/adr/0004-operating-safely.md)
+- [Operations runbook](docs/OPERATIONS.md) · [Changelog](CHANGELOG.md)
 - [Threat model (STRIDE)](docs/THREAT_MODEL.md) · [Detection coverage](docs/COVERAGE.md)
 - [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)
 

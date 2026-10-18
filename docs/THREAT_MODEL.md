@@ -28,9 +28,9 @@ the way. Residual risks are listed explicitly at the end.
 
 | Boundary | Treated as | Control |
 | --- | --- | --- |
-| Host → collectors | hostile bytes | length caps, strict parsers that reject rather than coerce, file and executable names that are not valid UTF-8 escaped as `\xNN` (not a crash), dead-lettering (`collectors/`, `normalizer/`) |
+| Host → collectors | hostile bytes | length caps, strict parsers that reject rather than coerce, file and executable names that are not valid UTF-8 escaped as `\xNN` (not a crash), dead-lettering, a crashed collector restarted with backoff (`collectors/`, `normalizer/`, `pipeline/`) |
 | Rule files → engine | untrusted configuration | `yaml.safe_load`, strict schema, closed operator set, regex timeout, fail-closed loader (`detection/`) |
-| Network → API | untrusted clients | default-deny bearer auth, rate limit, generic errors, no OpenAPI/docs surface (`api/`) |
+| Network → API | untrusted clients | default-deny bearer auth, rate limit keyed on the TCP peer (`X-Forwarded-For` ignored), generic errors with a request id, security headers on every response, no OpenAPI/docs surface (`api/`) |
 | Sentinel → webhook/SMTP | hostile network | verified TLS only (webhook and SMTP), HMAC signing, SSRF guard with the connection pinned to the checked address, per-sink queues and deadlines (`alerting/`) |
 | Environment → settings | untrusted configuration | strict validation, unknown `SENTINEL_*` keys rejected, secrets as `SecretStr` (`settings.py`) |
 
@@ -42,16 +42,16 @@ the way. Residual risks are listed explicitly at the end.
 | **Spoofing** | Event sources | A local attacker writes forged lines into `auth.log`. | Auth events are only one signal; process, file and socket collectors read kernel-maintained state. With `/var/log` in `SENTINEL_FIM_PATHS`, deleting or truncating a log fires `log-tampering` (it is not watched by default because every append is a change; the service warns at startup about any rule whose paths are not watched). Root-level forgery is a residual risk (below). |
 | **Tampering** | Rule library | An attacker edits YAML rules to blind detection. | Rules load once at startup through a fail-closed loader. In the container the rules and code are root-owned on a read-only root filesystem, and the service runs as an unprivileged user. |
 | **Tampering** | Watched files | An attacker edits `/etc/sudoers` with the same length and restores `mtime` (`touch -d`). | FIM compares SHA-256 digests; its stat cache and its fallback for unreadable files both key on `ctime`, which userspace cannot set, and a metadata change made alongside an edit cannot mask it. Content and permission/ownership changes are reported independently (a rewrite plus `chmod u+s` yields both). Tested explicitly. |
-| **Tampering** | Log output | Attacker-controlled bytes (usernames, command lines) inject fake log lines or terminal escapes. | The logging pipeline replaces control characters before rendering (CWE-117) and emits structured JSON in production. |
-| **Repudiation** | Persistence | An attacker erases evidence through the application. | The API and repository expose no update or delete operations; rows carry insertion timestamps. Direct database access is out of scope for the application (see residual risks). |
+| **Tampering** | Log output | Attacker-controlled bytes (usernames, command lines, a syslog host field sent over the network) inject fake log lines or terminal escapes. | The logging pipeline replaces control characters before rendering, for library loggers too (CWE-117), and emits structured JSON in production; console alerts escape C0/C1 controls in text mode and are JSON-encoded in JSON mode (CWE-150). |
+| **Repudiation** | Persistence | An attacker erases evidence through the application, or forges an old timestamp so retention deletes it early. | The API exposes no update or delete operations, and reading never writes. Retention (opt-in) deletes by insertion time, which Sentinel sets, never by the event's own host-supplied timestamp. Direct database access is out of scope for the application (see residual risks). |
 | **Information disclosure** | Logs | Secrets end up in logs or alerts. | Sensitive keys (`password`, `token`, `secret`, `authorization`, …) are redacted recursively by the logging pipeline, which is configured before any other component logs. Sink failures log the exception type only. |
-| **Information disclosure** | Database | SQL injection dumps stored telemetry. | All queries are SQLAlchemy expressions with bound parameters; bandit runs in CI. |
+| **Information disclosure** | Database | SQL injection dumps stored telemetry; a local user reads the SQLite file. | All queries are SQLAlchemy expressions with bound parameters; bandit runs in CI. SQLite files are created 0600 (with their WAL); in Compose, Sentinel connects to PostgreSQL as a role that owns its database and nothing else. Retention bounds how long personal data (user names, addresses) is kept. |
 | **Information disclosure** | Outbound alerts | A crafted or mistyped webhook URL pivots to cloud metadata or internal services (SSRF). | HTTPS only, no redirects followed, proxy variables ignored. Before every send the host is resolved and every address must be globally routable unicast (loopback, private, link-local, CGNAT, reserved, documentation, multicast and IPv4-mapped forms refused); the request then connects to the address that was checked, with TLS verifying the configured name, so a DNS answer that changes after the check (rebinding) cannot redirect it. |
-| **Denial of service** | Rule evaluator | A hostile string triggers catastrophic regex backtracking (ReDoS). | Rule regexes run on the `regex` engine with a 100 ms timeout and an 8 KiB input cap; a timeout degrades to "no match" and is logged. |
+| **Denial of service** | Rule evaluator | A hostile string triggers catastrophic regex backtracking (ReDoS) — or pads a command line until the rule gives up. | Rule regexes are bounded and run on the `regex` engine with a 100 ms timeout. Values up to 16 KiB are scanned whole, longer ones by their head and tail, so padding on one side cannot push a payload out of reach. A timeout fires the rule (fail-safe) and is logged: running out of time is never a miss. |
 | **Denial of service** | Pipeline | An event flood exhausts memory. | Bounded queue with explicit backpressure; dedup window, threshold groups and rate-limit client tables are all size-capped with oldest-first eviction. |
-| **Denial of service** | Alert channels | A detection storm floods email/webhook receivers — or decoys exhaust a rule's throttle to hide the real attack. | Alert dedup per rule+event, per-rule throttles (from the rule YAML) and a global throttle. The throttle only withholds *notifications*: throttled alerts are stored (`notified: false`), the first one per window is logged, and the rule's next notification states how many were withheld. |
-| **Denial of service** | API | Credential stuffing or scraping. | Per-client sliding-window rate limit (in-process middleware) with a bounded client table. |
-| **Elevation of privilege** | Container | A bug in Sentinel or a dependency is exploited for host access. | Non-root user, read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, host mounted read-only, ports bound to loopback. Dependencies are lock-pinned and audited (pip-audit), the image is scanned (Trivy), and GitHub Actions are pinned by SHA. |
+| **Denial of service** | Alert channels | A detection storm floods email/webhook receivers; decoys exhaust a rule's throttle to hide the real attack; a hung receiver stalls everything. | Alert dedup per rule+event, per-rule throttles (from the rule YAML) and a global throttle. The throttle only withholds *notifications*: throttled alerts are stored (`notified: false`), the first one per window is logged, and the rule's next notification states how many were withheld. Each sink has its own bounded queue and per-delivery deadline, so a slow channel delays neither detection nor the others; drops are counted. |
+| **Denial of service** | API | Credential stuffing or scraping; exhausting the anonymous budget to fail the healthcheck. | Per-client sliding-window rate limit (in-process middleware) with a bounded client table and a separate budget for key holders. The health probes are exempt, and the database half of readiness runs at most once a second whoever asks. |
+| **Elevation of privilege** | Container | A bug in Sentinel or a dependency is exploited for host access. | uid 10001 (no host account shares it), read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, host mounted read-only, ports bound to loopback, memory and PID limits; group `adm` only, to read the auth log. In PostgreSQL a non-superuser role (no `COPY … PROGRAM`, no other databases). On bare metal, a sandboxed systemd unit. Dependencies and images are pinned (lockfile hashes, image digests) and audited (pip-audit, Trivy, weekly re-scan); GitHub Actions are pinned by SHA. |
 | **Elevation of privilege** | Configuration | A deployment runs with a well-known default credential. | Compose refuses to start without the API key and passwords; there are no default secrets in code. Half-configured alert sinks fail at startup. |
 
 ## Residual risks
@@ -70,6 +70,17 @@ the way. Residual risks are listed explicitly at the end.
   `ctime` (`chmod`, `chown`, a hard link, ACL, xattr, SELinux label) is also
   reported as a possible modification, so it cannot mask a forged edit:
   fail-safe, at the cost of false positives.
+- **Restart window.** While the service is stopped nothing is analyzed: at
+  start-up the auth log is read from its end and the other collectors take a
+  new baseline. An attacker who can restart Sentinel can time activity for that
+  window; the restart itself is visible (process exit, `runtime.started`, the
+  `SentinelDown` alert).
+- **Root-only sources.** Unprivileged, Sentinel cannot read user crontabs or
+  RHEL's `/var/log/secure`; granting `CAP_DAC_READ_SEARCH` closes that gap but
+  lets a compromised service read every host file.
+- **Third-party images.** PostgreSQL, Prometheus and Grafana images carry
+  upstream Go standard-library advisories until upstream rebuilds; none of
+  those services is exposed beyond the host's loopback or the internal network.
 - **Database custody.** Whoever holds the database credentials can delete rows.
   Ship events to an external SIEM (via the webhook sink or log forwarding) when
   tamper-evidence matters.

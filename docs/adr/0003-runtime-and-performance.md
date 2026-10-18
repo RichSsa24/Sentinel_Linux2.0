@@ -109,3 +109,14 @@ namespace.
 - Operators gained explicit knobs (`SENTINEL_COLLECTORS`, `SENTINEL_HOST_ROOT`,
   `SENTINEL_PERSIST_*`, ...), all validated at startup and documented in
   `.env.example`, which a test keeps in sync with `Settings`.
+
+## Re-measurement (2026-10-18)
+
+After the security review ([ADR 0004](0004-operating-safely.md)) the benchmark
+was re-run, alternating this ADR's starting commit (`24bb9e7`) and the result,
+three runs each on one 4-vCPU VM: end to end ~12,600 events/s (the starting
+point committed per event, which bounds it at ~200 events/s on that machine);
+batched persistence ~1,800 → ~27,600 events/s; FIM polls ~3.5× and process
+polls ~2.7× cheaper. The rule engine is ~1.2× faster than at the start, down
+from ~1.6×: the hardened rules close evasions with twice as many regex searches
+per event. The README's table carries the current figures.

@@ -63,9 +63,11 @@ of these is in-scope at High severity by default:
 - **OWASP ASVS / API Security Top 10** for the FastAPI surface.
 - **NIST SP 800-207 (Zero Trust)** for inter-component trust: every API call
   is authenticated; no implicit network trust; fail-closed on policy errors.
-- **CIS Docker Benchmark** for container hardening (non-root, read-only root
-  filesystem, dropped capabilities, `no-new-privileges`, version-pinned base
-  images scanned by Trivy in CI).
+- **CIS Docker Benchmark** for container hardening (a dedicated non-root uid,
+  read-only root filesystem, dropped capabilities, `no-new-privileges`, images
+  pinned by digest and scanned by Trivy in CI and weekly).
+- **Least privilege beyond the container** — a non-superuser PostgreSQL role,
+  a sandboxed systemd unit, owner-only data files.
 - **No code execution from rule files** — rule YAML is parsed with
   `yaml.safe_load` and evaluated against an allowlisted operator grammar.
 - **No string-interpolated SQL** — parameterized queries only.
