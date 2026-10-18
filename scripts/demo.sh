@@ -8,7 +8,8 @@
 # For a self-contained replay that needs no stack and no root: `sentinel demo`.
 set -euo pipefail
 
-API="${SENTINEL_API:-http://127.0.0.1:8000}"
+# Not SENTINEL_*: Sentinel refuses to start when an unknown SENTINEL_ variable is set.
+API="${DEMO_API_URL:-http://127.0.0.1:8000}"
 ENV_FILE="$(dirname "$0")/../deploy/.env"
 KEY="${SENTINEL_API_KEY:-$(sed -n 's/^SENTINEL_API_KEY=//p' "$ENV_FILE" 2>/dev/null || true)}"
 CRON_FILE=/etc/cron.d/sentinel-demo

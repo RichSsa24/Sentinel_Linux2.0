@@ -31,6 +31,20 @@ def test_template_only_documents_real_settings(template: Path) -> None:
     assert not unknown, f"{template.name} documents keys Settings would reject: {sorted(unknown)}"
 
 
+@pytest.mark.parametrize(
+    "path",
+    [*sorted((_ROOT / "scripts").glob("*.sh")), _ROOT / "deploy" / "docker-compose.yml"],
+    ids=lambda p: str(p.relative_to(_ROOT)),
+)
+def test_scripts_only_use_real_settings(path: Path) -> None:
+    # A helper script that reads e.g. SENTINEL_API would invite users to export
+    # it, after which every `sentinel` command refuses to start.
+    names = set(re.findall(rf"\b({ENV_PREFIX}[A-Z0-9_]+)\b", path.read_text(encoding="utf-8")))
+    assert not names - _VALID_KEYS, (
+        f"{path.name} uses unknown settings: {sorted(names - _VALID_KEYS)}"
+    )
+
+
 def test_root_template_documents_every_setting() -> None:
     missing = _VALID_KEYS - _documented_keys(_ROOT / ".env.example")
     assert not missing, f".env.example is missing: {sorted(missing)}"

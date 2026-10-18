@@ -16,9 +16,15 @@ BASE="http://127.0.0.1:${PORT}"
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# The service account's ids are allocated at build time (useradd --system), so
+# ask the image rather than assuming them; the tmpfs must be writable by it.
+OWNER=$(docker run --rm --entrypoint sh "$IMAGE" -c 'printf "%s:%s" "$(id -u)" "$(id -g)"')
+SVC_UID=${OWNER%%:*}
+SVC_GID=${OWNER##*:}
+
 docker run -d --name "$NAME" \
     --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-    --tmpfs /data:uid=999,gid=999,mode=0700 \
+    --tmpfs "/data:uid=${SVC_UID},gid=${SVC_GID},mode=0700" \
     -v /etc:/host/etc:ro -v /proc:/host/proc:ro \
     -e SENTINEL_HOST_ROOT=/host \
     -e SENTINEL_API_KEY="$KEY" \
