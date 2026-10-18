@@ -188,15 +188,17 @@ jobs:
       postgres:
         image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
-          POSTGRES_USER: sentinel
+          POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ci-throwaway  # pragma: allowlist secret
-          POSTGRES_DB: sentinel_test
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U sentinel -d sentinel_test"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
           --health-interval 5s --health-timeout 5s --health-retries 12
     env:
-      SENTINEL_TEST_POSTGRES_URL: postgresql+asyncpg://sentinel:ci-throwaway@127.0.0.1:5432/sentinel_test  # pragma: allowlist secret
+      # The tests run as Sentinel's least-privilege role, created below by the
+      # same script Compose runs: migrations and writes must work without a
+      # superuser.
+      SENTINEL_TEST_POSTGRES_URL: postgresql+asyncpg://sentinel:ci-app-throwaway@127.0.0.1:5432/sentinel  # pragma: allowlist secret
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -215,6 +217,14 @@ jobs:
 
       - name: Sync dependencies (frozen)
         run: uv sync --frozen
+
+      - name: Create Sentinel's role (deploy/postgres/initdb)
+        env:
+          SERVICE: ${{ job.services.postgres.id }}
+          POSTGRES_APP_PASSWORD: ci-app-throwaway  # pragma: allowlist secret
+        run: >-
+          docker exec -i -e POSTGRES_USER=postgres -e POSTGRES_APP_PASSWORD "$SERVICE"
+          sh < deploy/postgres/initdb/10-sentinel-role.sh
 
       - name: Pytest — PostgreSQL integration (a skip fails the job)
         run: |

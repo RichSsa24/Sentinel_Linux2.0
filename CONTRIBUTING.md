@@ -51,7 +51,9 @@ uv run pre-commit run --all-files
 ```
 
 The PostgreSQL integration tests run when `SENTINEL_TEST_POSTGRES_URL` points
-at a disposable database (CI provides one); changes to
+at a disposable database. CI provides one and connects as Sentinel's own
+non-superuser role, created by `deploy/postgres/initdb/10-sentinel-role.sh` as
+in Compose, so nothing passes there that needs more privilege. Changes to
 `deploy/prometheus/alerts.yml` must keep `promtool test rules alerts.test.yml`
 passing (see the `alerting` job in `ci.yml` for the command).
 

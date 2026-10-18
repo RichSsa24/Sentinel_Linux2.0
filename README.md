@@ -282,7 +282,7 @@ Every push runs ([`ci.yml`](.github/workflows/ci.yml)), on Python 3.12 and 3.13:
 | Gate | Tool |
 | --- | --- |
 | 890+ tests, branch coverage ≥ 95% enforced (98.3% at time of writing) | pytest, Hypothesis |
-| Storage paths against PostgreSQL 16 (migrations, rejected rows, retention) | pytest + service container |
+| Storage paths against PostgreSQL 16 as Sentinel's non-superuser role (migrations, rejected rows, retention, a partition, a lost `COMMIT` reply) | pytest + service container |
 | Alert rules fire on their failure and stay quiet otherwise | promtool |
 | Strict typing | mypy `--strict` + pydantic plugin |
 | Lint and format | ruff |
