@@ -21,6 +21,7 @@ import contextlib
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from structlog.testing import capture_logs
@@ -494,6 +495,44 @@ class TestRotationAndBounds:
 
         assert [e.message for e in events] == [_FAILED] * 4
         assert collector.stats["skipped"] == 0
+
+    @pytest.mark.security
+    async def test_an_unreadable_successor_does_not_lose_the_old_files_last_lines(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: the old file's last lines were read, then opening the
+        # rotated-in file failed (created root-only, say) and the error threw
+        # them away with the rest of the poll: the last attempts before a
+        # rotation were never analyzed.
+        log = tmp_path / "auth.log"
+        log.write_text(_line(host="h1") + "\n", encoding="utf-8")
+        collector = AuthLogCollector(log, year=YEAR)
+        assert len(await _drain_events(collector)) == 1
+
+        with log.open("a", encoding="utf-8") as old:
+            old.write(_line(host="h2") + "\n" + _line(host="h2b"))  # its last, unterminated
+        log.rename(tmp_path / "auth.log.1")
+        log.write_text(_line(host="h3") + "\n", encoding="utf-8")
+        real_open = Path.open
+
+        def denied(path: Path, *args: Any, **kwargs: Any) -> Any:
+            if path == log:  # tests may run as root, which file modes do not stop
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", denied)
+        with capture_logs() as logs:
+            during = await _drain_events(collector)
+        unavailable = not collector.source_available
+        monkeypatch.undo()
+        after = await _drain_events(collector)
+        collector._close()
+
+        assert [e.host.name for e in during] == ["h2", "h2b"]
+        assert unavailable
+        assert [e["event"] for e in logs] == ["collector.source_unavailable"]
+        assert [e.host.name for e in after] == ["h3"]  # read from its start once readable
+        assert collector.source_available
 
     async def test_a_poll_reads_a_bounded_amount(self, tmp_path: Path) -> None:
         log = tmp_path / "auth.log"

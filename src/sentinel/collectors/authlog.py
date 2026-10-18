@@ -411,7 +411,13 @@ class AuthLogCollector(AbstractCollector):
             tail = self._flush_partial()
             self._close()
             self._pos = 0
-            return tail + self._read_new_lines()  # the new file, from its start
+            try:
+                return tail + self._read_new_lines()  # the new file, from its start
+            except OSError as exc:
+                # Unreadable for now (e.g. created root-only): keep what the
+                # old file gave this poll; the next poll retries the new one.
+                self._mark_source(False, path=str(self._path), error=type(exc).__name__)
+                return tail
         if current.st_size < self._pos:
             handle.seek(0)
             self._pos = 0

@@ -96,6 +96,10 @@ before deploying over an earlier version.
   cannot mask an edit.
 - The Compose stack's container could not read `/var/log/auth.log` (root:adm),
   and watched an unmounted path.
+- When the auth log's rotated-in file could not be opened yet (created
+  root-only, say), the old file's last lines, read in the same poll, were
+  discarded; they are now analyzed, and the new file is retried and reported
+  unavailable until it can be read.
 - `sentinel demo` no longer warns about a rule it then fires.
 
 ### Upgrade notes
