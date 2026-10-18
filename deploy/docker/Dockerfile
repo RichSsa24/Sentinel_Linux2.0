@@ -2,19 +2,17 @@
 # Sentinel-Linux 2.0 — production image (CIS Docker Benchmark aligned).
 #
 # - Multi-stage: the toolchain (uv) never reaches the runtime image.
-# - Base and tool images pinned by version tag (Dependabot keeps them current).
+# - Base and tool images pinned by tag *and* digest: a tag can be re-pointed,
+#   a digest cannot. Literal FROM lines (no ARG) so Dependabot can update them.
 # - The project is installed into the venv as a regular, non-editable package,
 #   so the runtime image needs no source tree and no PYTHONPATH.
 # - Non-root user, no shell login, read-only-root-filesystem friendly.
 # - The server is PID 1 (`exec`), so `docker stop`'s SIGTERM reaches uvicorn and
 #   the pipeline drains its queue and flushes buffered events before exit.
 
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.32
+FROM ghcr.io/astral-sh/uv:0.11.32@sha256:df4cae8f3a96d175e2e5f992e597550000edbe78fdc2594d5cd8de1a217f504c AS uv
 
-FROM ${UV_IMAGE} AS uv
-
-FROM ${PYTHON_IMAGE} AS builder
+FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS builder
 
 COPY --from=uv /uv /bin/uv
 
@@ -34,7 +32,7 @@ RUN uv sync --frozen --no-dev --no-editable
 
 # ---------------------------------------------------------------------------
 
-FROM ${PYTHON_IMAGE}
+FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
 
 LABEL org.opencontainers.image.title="Sentinel-Linux" \
       org.opencontainers.image.description="Host-based intrusion detection for Linux: collectors, ATT&CK-mapped YAML rules, hardened alerting and API." \

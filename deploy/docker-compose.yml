@@ -9,6 +9,10 @@
 
 name: sentinel
 
+# Third-party images are pinned by tag and digest (Dependabot's
+# docker-compose ecosystem keeps both current; the scheduled scan workflow
+# checks them for known vulnerabilities).
+
 # Bounded container logs: json-file grows without limit by default.
 x-logging: &logging
   driver: json-file
@@ -73,7 +77,7 @@ services:
         condition: service_healthy
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     container_name: sentinel_db
     restart: unless-stopped
     logging: *logging
@@ -99,7 +103,7 @@ services:
 
   prometheus:
     <<: *hardened
-    image: prom/prometheus:v2.54.1
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
     container_name: sentinel_prometheus
     mem_limit: 1g
     pids_limit: 128
@@ -128,10 +132,12 @@ services:
 
   grafana:
     <<: *hardened
-    image: grafana/grafana:11.2.0
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
     container_name: sentinel_grafana
-    mem_limit: 256m
-    pids_limit: 128
+    # Grafana 13 measured ~235 MiB and ~125 tasks (Go threads, plugins) once
+    # the dashboard is in use: limits leave room for that, not for runaways.
+    mem_limit: 512m
+    pids_limit: 512
     tmpfs:
       - /tmp
       - /var/log/grafana

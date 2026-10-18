@@ -162,7 +162,9 @@ jobs:
         run: |
           promtool() {
             docker run --rm --entrypoint promtool -w /rules \
-              -v "$PWD/deploy/prometheus:/rules:ro" prom/prometheus:v2.54.1 "$@"
+              -v "$PWD/deploy/prometheus:/rules:ro" \
+              prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e \
+              "$@"
           }
           promtool check rules alerts.yml
           promtool test rules alerts.test.yml
@@ -172,7 +174,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
           POSTGRES_USER: sentinel
           POSTGRES_PASSWORD: ci-throwaway  # pragma: allowlist secret

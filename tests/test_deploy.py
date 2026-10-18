@@ -56,3 +56,23 @@ def test_the_unit_runs_the_hardened_server_and_restarts_it() -> None:
     assert service["NoNewPrivileges"] == "yes"
     assert service["CapabilityBoundingSet"] == ""
     assert service["UMask"] == "0077"
+
+
+_DIGEST_PINNED = re.compile(r":[\w.-]+@sha256:[0-9a-f]{64}$")
+
+
+def test_third_party_images_are_pinned_by_tag_and_digest() -> None:
+    # A tag can be re-pointed at different content; a digest cannot. The
+    # tag stays for humans and for Dependabot.
+    compose = yaml.safe_load((_DEPLOY / "docker-compose.yml").read_text("utf-8"))
+    pulled = {
+        name: service["image"]
+        for name, service in compose["services"].items()
+        if "build" not in service
+    }
+    dockerfile = (_DEPLOY / "docker" / "Dockerfile").read_text("utf-8")
+    bases = [line.split()[1] for line in dockerfile.splitlines() if line.startswith("FROM ")]
+    assert set(pulled) == {"postgres", "prometheus", "grafana"}
+    assert len(bases) == 3
+    unpinned = [ref for ref in [*pulled.values(), *bases] if not _DIGEST_PINNED.search(ref)]
+    assert unpinned == []
