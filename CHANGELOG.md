@@ -88,7 +88,9 @@ before deploying over an earlier version.
 - Reading the API no longer issues an `UPDATE` (a write lock against the
   event writer); rows the database rejects are isolated instead of blocking
   every write; a database outage never drops rows, and a hung one cannot hang
-  shutdown.
+  shutdown. A write that committed but whose acknowledgement was lost (a
+  deadline, a dropped connection) was retried and stored twice; records now
+  carry a write id and the retry skips what is already stored.
 - File integrity: a return to an earlier state is a new event, not a duplicate;
   permission and content changes are reported independently; `chmod`/`chown`
   cannot mask an edit.
@@ -110,9 +112,10 @@ Settings are validated strictly; each of these was accepted before:
 
 Data and deployment:
 
-- Migrations 0002 (`alerts.notified`) and 0003 (`created_at` indexes) run
-  automatically in Docker and under the systemd unit; on other bare-metal
-  setups run `alembic upgrade head`.
+- Migrations 0002 (`alerts.notified`), 0003 (`created_at` indexes) and 0004
+  (`write_id`, unique) run automatically in Docker and under the systemd unit;
+  on other bare-metal setups run `alembic upgrade head`. Rows stored before
+  0004 keep a NULL write id.
 - Compose needs a fourth secret, `POSTGRES_APP_PASSWORD`. An existing database
   volume keeps Sentinel's old superuser role; move it to the least-privilege
   role with the dump-and-restore steps in

@@ -107,7 +107,12 @@ deterministic SHA-256 `event.id` derived from its content, and a single consumer
 owns a TTL- and size-bounded dedup window — so a log re-read after rotation or a
 double poll cannot produce a duplicate alert. A keystone test races eight
 producers through shared duplicates and asserts each id reaches the consumer once
-([`test_pipeline_keystone.py`](tests/test_pipeline_keystone.py)).
+([`test_pipeline_keystone.py`](tests/test_pipeline_keystone.py)). Storage holds
+the same line: a write can commit while its acknowledgement is lost, and the
+retry must not store it again. Each buffered record carries a write id, unique
+in the database, so the retry skips what already landed — tested against
+PostgreSQL behind a proxy that withholds the reply to `COMMIT`
+([`test_postgres.py`](tests/test_postgres.py)).
 
 **Rules are data, never code.** Rules are strict YAML parsed with `safe_load`
 into a closed grammar of comparison operators; the evaluator is an allow-listed
@@ -184,7 +189,9 @@ trades away a detection: the stat cache and rule index each have tests that fail
 if they hide an event. The rule engine was ~1.6× faster before the security
 review closed the rule evasions: the hardened rules run twice as many regex
 searches per event (and each search costs less, being bounded). Detection
-coverage came first.
+coverage came first. Likewise, making retried writes idempotent (ADR 0004)
+cost batched persistence alone 10–25% in alternating runs; end to end the
+difference stayed within run-to-run noise.
 
 ## Detection coverage
 

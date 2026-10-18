@@ -4,6 +4,6 @@ from __future__ import annotations
 
 from sentinel.storage.database import Database
 from sentinel.storage.models import AlertRow, Base, EventRow
-from sentinel.storage.repository import Repository
+from sentinel.storage.repository import Pending, Repository, write_ids
 
-__all__ = ["AlertRow", "Base", "Database", "EventRow", "Repository"]
+__all__ = ["AlertRow", "Base", "Database", "EventRow", "Pending", "Repository", "write_ids"]

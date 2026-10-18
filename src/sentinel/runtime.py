@@ -27,7 +27,12 @@ hundred events per second; batching is what lets persistence keep up.
 
 A failed write (a database restart, a lock timeout, a write that outlives
 ``persist_write_timeout_seconds``) is put back at the front of the buffer and
-retried with exponential backoff, so a transient outage loses nothing. While
+retried with exponential backoff, so a transient outage loses nothing. A
+write can also commit and still fail for its caller, its acknowledgement lost
+to the deadline or a dropped connection; the retry then must not store it
+again. Each record gets a write id as it enters the buffer, kept across
+retries, and the database skips ids it already holds (see
+:class:`~sentinel.storage.repository.Pending`). While
 the latest write has failed, :attr:`Runtime.persisting` is False and
 ``/readyz`` says so: a database that answers reads but refuses writes (a full
 disk) must not look healthy. The buffer depth and the failed attempts are
@@ -80,7 +85,7 @@ from sentinel.logging import get_logger
 from sentinel.metrics import Metrics, RuntimeSnapshot
 from sentinel.pipeline import Pipeline
 from sentinel.settings import LogFormat, Settings
-from sentinel.storage import Database, Repository
+from sentinel.storage import Database, Pending, Repository, write_ids
 
 _HOST_ROOT: Final[Path] = Path("/")
 _PROC: Final[Path] = Path("/proc")
@@ -337,8 +342,9 @@ class Runtime:
         self._flush_interval = settings.persist_flush_interval_seconds
         self._max_pending = settings.persist_max_buffered
         self._write_timeout = settings.persist_write_timeout_seconds
-        self._pending_events: list[Event] = []
-        self._pending_alerts: list[Alert] = []
+        self._pending_events: list[Pending[Event]] = []
+        self._pending_alerts: list[Pending[Alert]] = []
+        self._write_ids = write_ids()
         self._flush_lock = asyncio.Lock()
         self._flush_wanted = asyncio.Event()
         self._stop_flushing = asyncio.Event()
@@ -449,8 +455,8 @@ class Runtime:
             # Notifications are queued per sink; latency is observed on delivery.
             alert = await self._alerts.process(detection)
             if alert is not None:  # notified or throttled: stored either way
-                self._pending_alerts.append(alert)
-        self._pending_events.append(event)
+                self._pending_alerts.append(Pending(next(self._write_ids), alert))
+        self._pending_events.append(Pending(next(self._write_ids), event))
         self._metrics.events_ingested.inc()
         if len(self._pending_events) > self._max_pending:
             self._trim_pending()
@@ -482,7 +488,7 @@ class Runtime:
             return written
 
     async def _save(
-        self, *, events: Sequence[Event] = (), alerts: Sequence[Alert] = ()
+        self, *, events: Sequence[Pending[Event]] = (), alerts: Sequence[Pending[Alert]] = ()
     ) -> Exception | None:
         """Write records in one transaction; return the failure instead of raising.
 
@@ -499,7 +505,9 @@ class Runtime:
             return exc
         return None
 
-    async def _write_row_by_row(self, events: list[Event], alerts: list[Alert]) -> bool:
+    async def _write_row_by_row(
+        self, events: list[Pending[Event]], alerts: list[Pending[Alert]]
+    ) -> bool:
         """Isolate rows the database rejects so they cannot block the rest.
 
         Each record gets its own transaction; one the database rejects is
@@ -509,7 +517,7 @@ class Runtime:
         """
         rejected_events = rejected_alerts = 0
         error = ""
-        outage: tuple[list[Event], list[Alert], Exception] | None = None
+        outage: tuple[list[Pending[Event]], list[Pending[Alert]], Exception] | None = None
         for i, event in enumerate(events):
             failure = await self._save(events=[event])
             if failure is not None and not _is_rejection(failure):
@@ -541,7 +549,9 @@ class Runtime:
             return False
         return True
 
-    def _requeue(self, events: list[Event], alerts: list[Alert], failure: Exception) -> None:
+    def _requeue(
+        self, events: list[Pending[Event]], alerts: list[Pending[Alert]], failure: Exception
+    ) -> None:
         """Put unwritten records back at the front of the buffer (order kept)."""
         self._persist_failures += 1
         self._pending_events[:0] = events

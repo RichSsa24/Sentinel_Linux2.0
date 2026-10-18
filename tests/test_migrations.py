@@ -11,7 +11,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
 from sentinel.storage.models import Base
 
@@ -69,3 +69,30 @@ class TestMigrations:
             drift = compare_metadata(context, Base.metadata)
         engine.dispose()
         assert drift == []
+
+    def test_write_ids_keep_existing_rows_both_ways(self, tmp_path: Path) -> None:
+        # 0004 adds a unique write_id to tables that already hold rows: they
+        # keep a NULL write id (NULLs never conflict) and survive a downgrade.
+        url = f"sqlite:///{tmp_path / 'm.db'}"
+        cfg = _config(url)
+        command.upgrade(cfg, "0003")
+        engine = create_engine(url)
+        row = (
+            "INSERT INTO events (event_id, occurred_at, category, action, outcome, severity,"
+            " host, message, created_at) VALUES (:id, '2026-01-01', 'network', 'a', 'success',"
+            " 1, 'h', 'm', '2026-01-01')"
+        )
+        with engine.begin() as connection:
+            for event_id in ("a" * 64, "b" * 64):
+                connection.execute(text(row), {"id": event_id})
+        command.upgrade(cfg, "head")
+        with engine.connect() as connection:
+            write_ids = connection.execute(text("SELECT write_id FROM events")).scalars().all()
+        command.downgrade(cfg, "0003")
+        with engine.connect() as connection:
+            remaining = connection.execute(text("SELECT count(*) FROM events")).scalar_one()
+        columns = {column["name"] for column in inspect(engine).get_columns("events")}
+        engine.dispose()
+        assert write_ids == [None, None]
+        assert remaining == 2
+        assert "write_id" not in columns

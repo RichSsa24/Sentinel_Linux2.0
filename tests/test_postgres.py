@@ -136,7 +136,9 @@ class _FreezableProxy:
 
     Frozen, it holds every byte without resetting a connection — what a
     network partition (a dropped route, a firewall that drops) looks like to
-    the client, as opposed to a refused or reset connection.
+    the client, as opposed to a refused or reset connection. It can also hold
+    only the replies on the connection that sends a given message, after the
+    server has received it.
     """
 
     def __init__(self, host: str, port: int) -> None:
@@ -145,9 +147,14 @@ class _FreezableProxy:
         self._flowing.set()
         self._server: asyncio.Server | None = None
         self._writers: list[asyncio.StreamWriter] = []
+        self._hold_replies_after: bytes | None = None
 
     def freeze(self) -> None:
         self._flowing.clear()
+
+    def hold_replies_after(self, message: bytes) -> None:
+        """Partition, once sent upstream, the next connection that sends ``message``."""
+        self._hold_replies_after = message
 
     def thaw(self) -> None:
         self._flowing.set()
@@ -165,14 +172,32 @@ class _FreezableProxy:
     async def _handle(self, client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter) -> None:
         server_r, server_w = await asyncio.open_connection(*self._upstream)
         self._writers += [client_w, server_w]
-        await asyncio.gather(self._pipe(client_r, server_w), self._pipe(server_r, client_w))
+        replies = asyncio.Event()  # this connection's server-to-client direction
+        replies.set()
+        await asyncio.gather(
+            self._pipe(client_r, server_w, upstream_of=replies),
+            self._pipe(server_r, client_w, gate=replies),
+        )
 
-    async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _pipe(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        gate: asyncio.Event | None = None,
+        upstream_of: asyncio.Event | None = None,
+    ) -> None:
         with contextlib.suppress(Exception):
             while data := await reader.read(65536):
                 await self._flowing.wait()
+                if gate is not None:
+                    await gate.wait()
                 writer.write(data)
                 await writer.drain()
+                marker = self._hold_replies_after
+                if upstream_of is not None and marker is not None and marker in data:
+                    self._hold_replies_after = None
+                    upstream_of.clear()
 
 
 async def test_a_network_partition_cannot_hold_writes_readiness_or_shutdown(
@@ -213,4 +238,45 @@ async def test_a_network_partition_cannot_hold_writes_readiness_or_shutdown(
         assert loop.time() - started < 5
     finally:
         proxy.thaw()
+        await proxy.close()
+
+
+@pytest.mark.security
+async def test_a_commit_whose_reply_is_lost_is_not_stored_twice(
+    migrated: None, rules: tuple[Rule, ...]
+) -> None:
+    # Regression: PostgreSQL committed the batch, the reply never arrived, the
+    # write hit its deadline and was retried — storing every row twice.
+    target = make_url(_URL)
+    proxy = _FreezableProxy(target.host or "127.0.0.1", target.port or 5432)
+    port = await proxy.start()
+    proxied = target.set(host="127.0.0.1", port=port).render_as_string(hide_password=False)
+    database = Database(proxied)
+    runtime = Runtime(
+        make_api_settings(database_url=proxied, persist_write_timeout_seconds=1.0),
+        database=database,
+        metrics=Metrics(),
+        rules=rules,
+        sinks=[],
+    )
+    try:
+        for i in range(3):
+            await runtime._consume(make_event(event_id=f"{i:064d}"))
+        alerts = runtime.snapshot().persist_buffered["alerts"]
+        assert alerts > 0
+
+        proxy.hold_replies_after(b"COMMIT;\x00")  # asyncpg's COMMIT (simple query)
+        assert await runtime.flush() is False  # outcome unknown: kept for the retry
+        assert await runtime.flush() is True  # a fresh connection; the old one is held
+        direct = Database(_URL)
+        async with direct.session() as session:
+            repo = Repository(session)
+            stored = (await repo.count_events(), await repo.count_alerts())
+        await direct.dispose()
+        assert stored == (3, alerts)
+        assert runtime.snapshot().dropped["persist_error"] == 0
+    finally:
+        proxy.thaw()
+        await runtime.stop()
+        await database.dispose(max_wait=1)
         await proxy.close()

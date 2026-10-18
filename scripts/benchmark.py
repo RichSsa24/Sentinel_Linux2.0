@@ -56,7 +56,7 @@ from sentinel.metrics import Metrics
 from sentinel.pipeline import BoundedEventQueue, Pipeline
 from sentinel.runtime import Runtime
 from sentinel.settings import Settings
-from sentinel.storage import Database, Repository
+from sentinel.storage import Database, Pending, Repository, write_ids
 
 _ROOT = Path(__file__).resolve().parent.parent
 _REPEATS = 5
@@ -163,10 +163,13 @@ def bench_persist() -> str:
             async with db.session() as session:
                 await Repository(session).save_event(event)
 
+    ids = write_ids()
+    pending = [Pending(next(ids), event) for event in events]  # as the runtime buffers them
+
     async def batched(db: Database, batch: int) -> None:
-        for start in range(0, len(events), batch):
+        for start in range(0, len(pending), batch):
             async with db.session() as session:
-                await Repository(session).save_batch(events=events[start : start + batch])
+                await Repository(session).save_batch(events=pending[start : start + batch])
 
     async def measure(write: Callable[[Database], object]) -> float:
         with tempfile.TemporaryDirectory() as tmp:

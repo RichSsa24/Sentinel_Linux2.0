@@ -47,6 +47,21 @@ pipeline itself dies, the process exits so that Docker or systemd starts a
 fresh one — neither restarts a process for failing a health check. Database
 writes have a deadline, so a hung database cannot hang shutdown.
 
+A deadline makes some failures ambiguous: the write may have committed with
+only its acknowledgement lost. Retrying is the only safe response (dropping
+loses evidence), so retries must be idempotent. Each record gets a write id
+when it is buffered (a random per-process prefix and a sequence number, as in
+Kafka's idempotent producer); a unique index on it lets the insert skip rows
+already stored (`ON CONFLICT DO NOTHING`). *Cost accepted:* in alternating
+benchmark runs, batched persistence alone lost 10–25% of its throughput (still
+above 35,000 events/s on SQLite); end to end, where the rule engine dominates,
+the difference stayed within run-to-run noise.
+
+*Alternative rejected:* a unique index on `event.id`. That id identifies
+content only within the pipeline's dedup window; outside it the same content
+is a real second event (a repeated login failure, a pid and start time seen
+again after a reboot), and the index would silently discard it.
+
 ### 3. Make blindness visible
 
 Readiness covers what the service needs to do its job: the pipeline running,

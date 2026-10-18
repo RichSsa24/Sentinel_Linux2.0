@@ -591,7 +591,7 @@ class TestWriteBehind:
         original = Repository.save_batch
 
         async def picky_save(self: Repository, **batch: Any) -> int:
-            if any(event.event.id == poison for event in batch.get("events", ())):
+            if any(p.record.event.id == poison for p in batch.get("events", ())):
                 raise rejection
             return await original(self, **batch)
 
@@ -632,7 +632,7 @@ class TestWriteBehind:
         outages = [OperationalError("INSERT INTO events", {}, Exception("connection lost"))]
 
         async def flaky_save(self: Repository, **batch: Any) -> int:
-            ids = [event.event.id for event in batch.get("events", ())]
+            ids = [p.record.event.id for p in batch.get("events", ())]
             if poison in ids:
                 raise IntegrityError("INSERT INTO events", {}, Exception("check failed"))
             if ids == [interrupted] and outages:
@@ -652,6 +652,39 @@ class TestWriteBehind:
         assert await runtime.flush() is True
         assert await _count_events(database) == 4
         assert runtime.snapshot().dropped["persist_error"] == 1  # only the poison row
+
+    async def test_a_write_that_committed_but_failed_is_not_stored_twice(
+        self,
+        database: Database,
+        rules: tuple[Rule, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Regression: a write can commit and still fail for its caller (the
+        # acknowledgement lost to the deadline or a dropped connection). It is
+        # retried, which stored every event and alert of the batch twice.
+        original = Repository.save_batch
+        lost_acks = [ConnectionResetError("connection reset by peer")]
+
+        async def save(self: Repository, **batch: Any) -> int:
+            written = await original(self, **batch)  # committed...
+            if lost_acks:
+                raise lost_acks.pop()  # ...but the caller never hears so
+            return written
+
+        monkeypatch.setattr(Repository, "save_batch", save)
+        runtime = Runtime(
+            make_api_settings(), database=database, metrics=Metrics(), rules=rules, sinks=[]
+        )
+        for event in _events(3):
+            await runtime._consume(event)
+        alerts = len(runtime._pending_alerts)
+        assert alerts > 0  # the batch carries alerts too
+
+        assert await runtime.flush() is False  # outcome unknown: kept for the retry
+        assert await runtime.flush() is True
+        assert (await _count_events(database), await _count_alerts(database)) == (3, alerts)
+        assert runtime.snapshot().dropped["persist_error"] == 0  # skipped, not "rejected"
+        assert runtime.persisting
 
     async def test_outage_buffer_is_bounded_and_losses_are_counted(
         self, unreachable_database: Database, rules: tuple[Rule, ...]
@@ -693,7 +726,7 @@ class TestWriteBehind:
         )
         for event in _events(5):
             await runtime._consume(event)
-        assert [e.message for e in runtime._pending_events] == ["e3", "e4"]
+        assert [p.record.message for p in runtime._pending_events] == ["e3", "e4"]
         assert runtime.snapshot().dropped["persist_error"] == 3
 
     async def test_flush_interval_bounds_staleness(

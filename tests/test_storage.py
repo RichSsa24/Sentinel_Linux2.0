@@ -13,7 +13,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from sentinel.storage import Database, Repository
+from sentinel.storage import Database, Pending, Repository, write_ids
 from sentinel.storage.database import create_private_sqlite_file
 from tests.conftest import make_alert, make_event
 
@@ -132,6 +132,52 @@ class TestBatchPersistence:
         assert event_row.id >= 1
         assert event_row.created_at is not None
         assert alert_row.created_at is not None
+
+
+class TestIdempotentWrites:
+    async def test_saving_a_pending_batch_again_stores_nothing(self, database: Database) -> None:
+        ids = write_ids()
+        events = [Pending(next(ids), make_event(event_id=f"{i:064d}")) for i in range(3)]
+        alerts = [Pending(next(ids), make_alert())]
+        for _ in range(2):  # the retry of a write whose acknowledgement was lost
+            async with database.session() as session:
+                await Repository(session).save_batch(events=events, alerts=alerts)
+        async with database.session() as session:
+            repo = Repository(session)
+            assert (await repo.count_events(), await repo.count_alerts()) == (3, 1)
+
+    async def test_a_partly_stored_batch_stores_only_what_is_missing(
+        self, database: Database
+    ) -> None:
+        ids = write_ids()
+        events = [Pending(next(ids), make_event(message=f"e{i}")) for i in range(3)]
+        async with database.session() as session:
+            await Repository(session).save_batch(events=events[:1])
+        async with database.session() as session:
+            repo = Repository(session)
+            await repo.save_batch(events=events)
+            stored = [row.message for row in await repo.list_events(limit=10)]
+        assert sorted(stored) == ["e0", "e1", "e2"]
+
+    @pytest.mark.security
+    async def test_a_repeat_of_the_same_event_id_is_still_stored(self, database: Database) -> None:
+        # event.id identifies content only within the dedup window; the same
+        # content later (a repeated login failure) is real evidence, so the
+        # database must not treat it as a duplicate.
+        ids = write_ids()
+        repeat = [Pending(next(ids), make_event()), Pending(next(ids), make_event())]
+        async with database.session() as session:
+            repo = Repository(session)
+            await repo.save_batch(events=repeat)
+            assert await repo.count_events() == 2
+
+    def test_write_ids_are_unique_and_ascend_per_writer(self) -> None:
+        first, second = write_ids(), write_ids()
+        batch = [next(first) for _ in range(1000)]
+        assert len(set(batch)) == 1000
+        assert batch == sorted(batch)
+        assert all(len(write_id) == 32 for write_id in batch)
+        assert next(second)[:16] != batch[0][:16]  # another writer, another prefix
 
 
 class TestSqliteTuning:

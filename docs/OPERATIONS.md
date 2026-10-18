@@ -325,8 +325,9 @@ or checkout); if the release you leave added migrations, downgrade the schema
 to the revision the older version expects before starting it — e.g.
 `uv run alembic downgrade 0002` (bare metal) or
 `docker compose run --rm sentinel python -m alembic downgrade 0002`. The
-migrations so far (0002: `alerts.notified`; 0003: `created_at` indexes) are
-reversible without data loss.
+migrations so far (0002: `alerts.notified`; 0003: `created_at` indexes; 0004:
+`write_id`, which makes a retried write idempotent) are reversible without
+losing events or alerts.
 
 ### Upgrading a Compose deployment from an earlier release
 
