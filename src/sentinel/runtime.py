@@ -25,9 +25,13 @@ or ``persist_flush_interval_seconds`` has elapsed, whichever comes first; the
 buffer is always flushed on shutdown. One commit per event caps SQLite at a few
 hundred events per second; batching is what lets persistence keep up.
 
-A failed write (a database restart, a lock timeout) is put back at the front of
-the buffer and retried with exponential backoff, so a transient outage loses
-nothing. A batch the database *rejects* (an integrity or data error) would fail
+A failed write (a database restart, a lock timeout, a write that outlives
+``persist_write_timeout_seconds``) is put back at the front of the buffer and
+retried with exponential backoff, so a transient outage loses nothing. While
+the latest write has failed, :attr:`Runtime.persisting` is False and
+``/readyz`` says so: a database that answers reads but refuses writes (a full
+disk) must not look healthy. The buffer depth and the failed attempts are
+exported as metrics. A batch the database *rejects* (an integrity or data error) would fail
 every retry, so it is instead written row by row and only the offending rows
 are dropped. The buffer is capped at ``persist_max_buffered`` records; beyond
 that the oldest are dropped and counted, as is anything unwritten at shutdown.
@@ -317,6 +321,7 @@ class Runtime:
         self._batch_size = settings.persist_batch_size
         self._flush_interval = settings.persist_flush_interval_seconds
         self._max_pending = settings.persist_max_buffered
+        self._write_timeout = settings.persist_write_timeout_seconds
         self._pending_events: list[Event] = []
         self._pending_alerts: list[Alert] = []
         self._flush_lock = asyncio.Lock()
@@ -325,6 +330,8 @@ class Runtime:
         self._flusher: asyncio.Task[None] | None = None
         self._events_unpersisted = 0
         self._alerts_unpersisted = 0
+        self._persist_failures = 0
+        self._persist_failing = False
         # Last: a registry may call snapshot() during registration.
         metrics.observe_runtime(self.snapshot)
 
@@ -360,6 +367,11 @@ class Runtime:
         """True while the pipeline task is alive (drives the readiness probe)."""
         return self._task is not None and not self._task.done()
 
+    @property
+    def persisting(self) -> bool:
+        """False while the latest database write has failed (drives the readiness probe)."""
+        return not self._persist_failing
+
     async def stop(self) -> None:
         """Drain the pipeline, then release sink resources. Idempotent.
 
@@ -368,6 +380,9 @@ class Runtime:
         rather than awaiting the task so that the pipeline's own cancellation —
         or an exception already reported by :meth:`_on_pipeline_exit` — is not
         re-raised into the caller's shutdown path.
+
+        Shutdown is bounded even if the database hangs: the write in flight
+        and the final one each end at ``persist_write_timeout_seconds``.
         """
         if self._task is not None:
             await self._pipeline.stop()
@@ -430,18 +445,25 @@ class Runtime:
                 return True
             failure = await self._save(events=events, alerts=alerts)
             if failure is None:
-                return True
-            if _is_rejection(failure):
-                return await self._write_row_by_row(events, alerts)
-            self._requeue(events, alerts, failure)
-            return False
+                written = True
+            elif _is_rejection(failure):
+                written = await self._write_row_by_row(events, alerts)
+            else:
+                self._requeue(events, alerts, failure)
+                written = False
+            self._persist_failing = not written
+            return written
 
     async def _save(
         self, *, events: Sequence[Event] = (), alerts: Sequence[Alert] = ()
     ) -> Exception | None:
-        """Write records in one transaction; return the failure instead of raising."""
+        """Write records in one transaction; return the failure instead of raising.
+
+        The deadline turns a database that stops answering into an ordinary
+        failure (TimeoutError), retried like any outage.
+        """
         try:
-            async with self._database.session() as session:
+            async with asyncio.timeout(self._write_timeout), self._database.session() as session:
                 await Repository(session).save_batch(events=events, alerts=alerts)
         except Exception as exc:
             return exc
@@ -491,6 +513,7 @@ class Runtime:
 
     def _requeue(self, events: list[Event], alerts: list[Alert], failure: Exception) -> None:
         """Put unwritten records back at the front of the buffer (order kept)."""
+        self._persist_failures += 1
         self._pending_events[:0] = events
         self._pending_alerts[:0] = alerts
         self._trim_pending()
@@ -564,6 +587,11 @@ class Runtime:
             sink_errors=alerts["sink_errors"],
             alert_deliveries_dropped=self._alerts.dropped_by_sink,
             alerts_unpersisted=self._alerts_unpersisted,
+            persist_buffered={
+                "events": len(self._pending_events),
+                "alerts": len(self._pending_alerts),
+            },
+            persist_failures=self._persist_failures,
             pipeline_up=self.running,
             collector_restarts=self._pipeline.collector_restarts,
         )

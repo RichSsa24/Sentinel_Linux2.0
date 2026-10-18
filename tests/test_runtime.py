@@ -10,10 +10,11 @@ visible through `/readyz` and its counters through `/metrics`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import socket
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +118,18 @@ def _events(count: int) -> list[Event]:
 async def _count_events(database: Database) -> int:
     async with database.session() as session:
         return await Repository(session).count_events()
+
+
+class _HungDatabase:
+    """A database that accepts a connection and then never answers (a partition)."""
+
+    @contextlib.asynccontextmanager
+    async def session(self) -> AsyncIterator[Any]:
+        await asyncio.Event().wait()
+        yield None  # pragma: no cover - never reached
+
+    async def dispose(self) -> None:
+        return None
 
 
 class _Crashing(AbstractCollector):
@@ -693,6 +706,74 @@ class TestWriteBehind:
         assert failures
         assert all(entry["error"] == "OperationalError" for entry in failures)
 
+    async def test_a_hung_database_bounds_writes_and_shutdown(
+        self,
+        database: Database,
+        rules: tuple[Rule, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Regression: a database that stopped answering (no RST, as in a
+        # network partition) held the write forever; stop() then never
+        # returned and the supervisor's SIGKILL lost the whole buffer.
+        async def hung_save(self: Repository, **batch: Any) -> int:
+            await asyncio.Event().wait()
+            return 0  # pragma: no cover - never reached
+
+        monkeypatch.setattr(Repository, "save_batch", hung_save)
+        metrics = Metrics()
+        runtime = Runtime(
+            make_api_settings(
+                persist_batch_size=1,
+                persist_flush_interval_seconds=0.01,
+                persist_write_timeout_seconds=0.05,
+            ),
+            database=database,
+            metrics=metrics,
+            rules=rules,
+            collectors=[_Replay(_events(3))],
+            sinks=[],
+        )
+        with structlog.testing.capture_logs() as logs:
+            runtime.start()
+            assert await _wait_for(lambda: not runtime.persisting)
+            assert await _wait_for(lambda: metrics.events_ingested._value.get() == 3)
+            snapshot = runtime.snapshot()
+            assert snapshot.persist_failures >= 1
+            assert snapshot.persist_buffered["events"] == 3  # kept for the retry
+            await asyncio.wait_for(runtime.stop(), timeout=2)
+        assert runtime.snapshot().dropped["persist_error"] == 3  # lost, and counted
+        failures = [entry for entry in logs if entry["event"] == "runtime.persist_failed"]
+        assert {entry["error"] for entry in failures} == {"TimeoutError"}
+
+    async def test_persistence_health_recovers_with_the_database(
+        self,
+        database: Database,
+        rules: tuple[Rule, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        full = {"disk": True}
+        original = Repository.save_batch
+
+        async def save(self: Repository, **batch: Any) -> int:
+            if full["disk"]:
+                raise OperationalError("INSERT", {}, Exception("database or disk is full"))
+            return await original(self, **batch)
+
+        monkeypatch.setattr(Repository, "save_batch", save)
+        runtime = Runtime(
+            make_api_settings(), database=database, metrics=Metrics(), rules=rules, sinks=[]
+        )
+        healthy: list[bool] = [runtime.persisting]
+        await runtime._consume(_events(1)[0])
+        assert await runtime.flush() is False
+        healthy.append(runtime.persisting)
+        assert runtime.snapshot().persist_failures == 1
+        full["disk"] = False
+        assert await runtime.flush() is True
+        healthy.append(runtime.persisting)
+        assert healthy == [True, False, True]
+        assert runtime.snapshot().persist_buffered == {"events": 0, "alerts": 0}
+
     async def test_stop_never_cancels_a_flush_in_flight(
         self,
         database: Database,
@@ -804,6 +885,60 @@ class TestAppLifespan:
             async with app.router.lifespan_context(app):
                 pass
         assert disposed == [True]
+
+    async def test_readyz_reports_failing_writes(
+        self, database: Database, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: with a full disk, reads (and so the probe) still worked
+        # while every write failed — the service reported ready and lost data.
+        full = {"disk": True}
+        original = Repository.save_batch
+
+        async def save(self: Repository, **batch: Any) -> int:
+            if full["disk"]:
+                raise OperationalError("INSERT", {}, Exception("database or disk is full"))
+            return await original(self, **batch)
+
+        monkeypatch.setattr(Repository, "save_batch", save)
+        app = create_app(
+            make_api_settings(persist_batch_size=1, persist_flush_interval_seconds=0.01),
+            database=database,
+            metrics=Metrics(),
+            rules=rules,
+            collectors=[_Replay(_events(1))],
+            sinks=[],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        ):
+            runtime = app.state.runtime
+            assert await _wait_for(lambda: not runtime.persisting)
+            resp = await client.get("/readyz")
+            assert resp.status_code == 503
+            assert resp.json()["error"]["message"] == "database writes failing"
+            body = (await client.get("/metrics", headers=auth_header())).text
+            assert 'sentinel_persist_buffered{kind="events"} 1.0' in body
+            assert "sentinel_persist_failures_total" in body
+
+            full["disk"] = False
+            assert await _wait_for(lambda: runtime.persisting)
+            assert (await client.get("/readyz")).status_code == 200
+
+    async def test_readyz_answers_while_the_database_hangs(
+        self, rules: tuple[Rule, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: the probe waited on a hung database for as long as the
+        # driver did (asyncpg: 60 s), far past the healthcheck's own timeout.
+        monkeypatch.setattr(app_module, "_READY_TIMEOUT_S", 0.05)
+        hung: Any = _HungDatabase()
+        app = create_app(make_api_settings(), database=hung, metrics=Metrics(), rules=rules)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            resp = await asyncio.wait_for(client.get("/readyz"), timeout=2)
+        assert resp.status_code == 503
+        assert resp.json()["error"]["message"] == "database not responding"
 
     async def test_readyz_reports_a_missing_schema(
         self, tmp_path: Path, rules: tuple[Rule, ...]

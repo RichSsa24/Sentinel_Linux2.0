@@ -25,7 +25,10 @@ services:
     image: sentinel-linux:local
     container_name: sentinel
     # Drain the queue and flush buffered events before Docker sends SIGKILL.
-    stop_grace_period: 30s
+    # Worst case (database hung): the write in flight and a final write, each
+    # bounded by SENTINEL_PERSIST_WRITE_TIMEOUT_SECONDS (10 s), plus up to
+    # 10 s draining alert notifications.
+    stop_grace_period: 45s
     environment:
       SENTINEL_API_KEY: ${SENTINEL_API_KEY:?set SENTINEL_API_KEY in deploy/.env}
       SENTINEL_DATABASE_URL: postgresql+asyncpg://sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/sentinel

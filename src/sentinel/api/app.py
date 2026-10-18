@@ -10,8 +10,9 @@ page size.
 
 The app's lifespan runs the detection system itself: it starts a
 :class:`~sentinel.runtime.Runtime` (built from the same ``Settings``) on startup
-and drains it on shutdown. ``/readyz`` reports *not ready* if the database is
-unreachable or the pipeline has died. A crashed collector is restarted by the
+and drains it on shutdown. ``/readyz`` reports *not ready* if the pipeline has
+died, or the database is unreachable, slow to answer, unmigrated or failing
+writes. A crashed collector is restarted by the
 pipeline; if the pipeline itself dies, the production app shuts itself down
 gracefully so the process supervisor (Docker's restart policy, systemd) starts
 a fresh one — neither restarts a process merely for failing a health check.
@@ -21,6 +22,7 @@ a fresh one — neither restarts a process merely for failing a health check.
 # `Annotated[int, Query(...)]` route-parameter annotations at runtime, which
 # stringified (PEP 563) annotations break.
 
+import asyncio
 import os
 import signal
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
@@ -59,6 +61,9 @@ _log = get_logger("sentinel.api")
 _DEFAULT_PAGE_SIZE = 50
 # Cursors are row ids: a signed 64-bit integer in SQLite and PostgreSQL alike.
 _MAX_CURSOR = 2**63 - 1
+# A readiness probe must answer before its caller gives up (the image's
+# HEALTHCHECK waits 4 s); a database slower than this is not ready.
+_READY_TIMEOUT_S = 2.0
 
 
 def _package_version() -> str:
@@ -116,6 +121,22 @@ async def _not_ready_reason(runtime: Runtime | None, database: Database) -> str 
     """Why the service cannot do its job right now, or None if it can."""
     if runtime is not None and not runtime.running:
         return "detection pipeline is not running"
+    try:
+        async with asyncio.timeout(_READY_TIMEOUT_S):
+            reason = await _database_problem(database)
+    except TimeoutError:
+        return "database not responding"
+    if reason is not None:
+        return reason
+    if runtime is not None and not runtime.persisting:
+        # Reads can succeed while every write fails (a full disk, a read-only
+        # volume): without this the probe reported ready while data was lost.
+        return "database writes failing"
+    return None
+
+
+async def _database_problem(database: Database) -> str | None:
+    """Why the database cannot serve the runtime, or None if it can."""
     try:
         async with database.session() as session:
             await session.execute(text("SELECT 1"))

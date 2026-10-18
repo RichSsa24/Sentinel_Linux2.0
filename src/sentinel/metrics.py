@@ -48,6 +48,8 @@ class RuntimeSnapshot:
     sink_errors: int = 0
     alert_deliveries_dropped: Mapping[str, int] = field(default_factory=dict)
     alerts_unpersisted: int = 0
+    persist_buffered: Mapping[str, int] = field(default_factory=dict)
+    persist_failures: int = 0
     pipeline_up: bool = False
     collector_restarts: Mapping[str, int] = field(default_factory=dict)
 
@@ -111,6 +113,20 @@ class _RuntimeCollector(Collector):
         )
         unpersisted.add_metric([], snap.alerts_unpersisted)
         yield unpersisted
+        buffered = GaugeMetricFamily(
+            "sentinel_persist_buffered",
+            "Records waiting to be written to the database, by kind.",
+            labels=["kind"],
+        )
+        for kind in sorted(snap.persist_buffered):
+            buffered.add_metric([kind], snap.persist_buffered[kind])
+        yield buffered
+        failures = CounterMetricFamily(
+            "sentinel_persist_failures",
+            "Database writes that failed (outage, timeout, full disk) and were retried.",
+        )
+        failures.add_metric([], snap.persist_failures)
+        yield failures
 
 
 def _labelled_counter(

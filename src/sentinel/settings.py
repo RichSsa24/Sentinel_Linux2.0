@@ -214,6 +214,14 @@ class Settings(BaseSettings):
         description="Records held for retry while the database is unavailable; beyond "
         "this the oldest are dropped and counted. Must be >= persist_batch_size.",
     )
+    persist_write_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0.0,
+        le=300.0,
+        description="Deadline for one batch write. A database that stops answering "
+        "(a network partition) fails the write instead of hanging it, so the batch is "
+        "retried and shutdown stays bounded.",
+    )
 
     # --- Read API ------------------------------------------------------------
     api_key: SecretStr | None = Field(
