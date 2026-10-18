@@ -337,6 +337,24 @@ class TestScanning:
 
         assert collector.stats["tracked"] == 2
 
+    @pytest.mark.security
+    @pytest.mark.asyncio
+    async def test_a_connection_flood_cannot_hide_an_ipv6_listener(self, tmp_path: Path) -> None:
+        # Regression: the cap was hit while reading tcp and tcp6 was never read,
+        # so a backdoor listening on [::]:4444 went unseen.
+        flood = [
+            _row(local="10.0.0.5", lport=40_000 + i, remote="198.51.100.1", rport=443,
+                 state=_ESTABLISHED, inode=1_000 + i)
+            for i in range(5)
+        ]  # fmt: skip
+        backdoor = _row(local="::", lport=4444, remote="::", inode=9, ipv6=True)
+        _mk_net(tmp_path, tcp=flood, tcp6=[backdoor])
+        collector = _collector(tmp_path, max_sockets=3)
+        await _drain(collector)  # baseline
+        snapshot = collector._scan()
+        assert any(sock.local_port == 4444 for sock in snapshot.values())
+        assert len(snapshot) == 3
+
     @pytest.mark.asyncio
     async def test_run_does_a_final_scan_when_already_stopped(self, tmp_path: Path) -> None:
         # stopping is set before run() → the poll loop is skipped and run()

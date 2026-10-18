@@ -121,6 +121,7 @@ class NetworkCollector(AbstractCollector):
         self._poll = poll_interval
         self._host = host or socket.gethostname() or "localhost"
         self._max_sockets = max_sockets
+        self._capped = False  # warn once per stretch of capped scans, not every poll
         # When False, only listening sockets are tracked — far lower volume on a
         # busy host, at the cost of outbound-connection (beaconing) visibility.
         self._tracked_states = _TRACKED_STATES if track_connections else _LISTEN_ONLY
@@ -158,16 +159,29 @@ class NetworkCollector(AbstractCollector):
     # ------------------------------------------------------------------ scanning
 
     def _scan(self) -> dict[SocketKey, Socket]:
-        """Snapshot every tracked socket across IPv4/IPv6 (runs in a thread)."""
-        snapshot: dict[SocketKey, Socket] = {}
+        """Snapshot every tracked socket across IPv4/IPv6 (runs in a thread).
+
+        Listeners are taken first, from every table: they are few and they are
+        what a backdoor looks like, so a flood of connections (ours or an
+        attacker's) can fill the ``max_sockets`` budget without hiding one —
+        previously the cap was hit in the IPv4 table and IPv6 was never read.
+        """
+        listeners: list[Socket] = []
+        connections: list[Socket] = []
         for proto, filename in _SOURCES:
             for line in self._read_proc_net(filename).splitlines():
-                if len(snapshot) >= self._max_sockets:
-                    self._log.warning("network.max_sockets_reached", max_sockets=self._max_sockets)
-                    return snapshot
                 sock = parse_net_line(line, proto=proto)
                 if sock is not None and sock.state in self._tracked_states:
-                    snapshot[sock.key] = sock
+                    (listeners if sock.state == STATE_LISTEN else connections).append(sock)
+        snapshot: dict[SocketKey, Socket] = {}
+        for sock in (*listeners, *connections):
+            if len(snapshot) >= self._max_sockets:
+                if not self._capped:
+                    self._log.warning("network.max_sockets_reached", max_sockets=self._max_sockets)
+                self._capped = True
+                return snapshot
+            snapshot[sock.key] = sock
+        self._capped = False
         return snapshot
 
     def _read_proc_net(self, filename: str) -> str:
