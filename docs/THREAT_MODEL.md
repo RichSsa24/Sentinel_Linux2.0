@@ -41,7 +41,7 @@ the way. Residual risks are listed explicitly at the end.
 | **Spoofing** | API clients | An attacker queries the API to learn what is detected or to read events. | Every data endpoint depends on `require_api_key`: default-deny (no key configured → 503), constant-time comparison on bytes, generic 401. Failed attempts are logged with reason and client address only — never the presented or configured key (regression-tested). |
 | **Spoofing** | Event sources | A local attacker writes forged lines into `auth.log`. | Auth events are only one signal; process, file and socket collectors read kernel-maintained state. Log deletion fires `log-tampering`; watching `/var/log` with FIM is supported. Root-level forgery is a residual risk (below). |
 | **Tampering** | Rule library | An attacker edits YAML rules to blind detection. | Rules load once at startup through a fail-closed loader. In the container the rules and code are root-owned on a read-only root filesystem, and the service runs as an unprivileged user. |
-| **Tampering** | Watched files | An attacker edits `/etc/sudoers` with the same length and restores `mtime` (`touch -d`). | FIM compares SHA-256 digests; its stat cache and its fallback for unreadable files both key on `ctime`, which userspace cannot set. Tested explicitly. |
+| **Tampering** | Watched files | An attacker edits `/etc/sudoers` with the same length and restores `mtime` (`touch -d`). | FIM compares SHA-256 digests; its stat cache and its fallback for unreadable files both key on `ctime`, which userspace cannot set, and a metadata change made alongside an edit cannot mask it. Content and permission/ownership changes are reported independently (a rewrite plus `chmod u+s` yields both). Tested explicitly. |
 | **Tampering** | Log output | Attacker-controlled bytes (usernames, command lines) inject fake log lines or terminal escapes. | The logging pipeline replaces control characters before rendering (CWE-117) and emits structured JSON in production. |
 | **Repudiation** | Persistence | An attacker erases evidence through the application. | The API and repository expose no update or delete operations; rows carry insertion timestamps. Direct database access is out of scope for the application (see residual risks). |
 | **Information disclosure** | Logs | Secrets end up in logs or alerts. | Sensitive keys (`password`, `token`, `secret`, `authorization`, …) are redacted recursively by the logging pipeline, which is configured before any other component logs. Sink failures log the exception type only. |
@@ -66,9 +66,10 @@ the way. Residual risks are listed explicitly at the end.
   event sources (eBPF) would close this gap.
 - **Reduced visibility when unprivileged.** Without ptrace-read access to a
   process, its executable path cannot be resolved; unreadable files are tracked
-  by metadata rather than content. For those files a change that moves only
-  `ctime` (ACL, xattr, SELinux label, `chattr`) is reported as a modification:
-  fail-safe, at the cost of a false positive.
+  by metadata rather than content. For those files any change that moves
+  `ctime` (`chmod`, `chown`, a hard link, ACL, xattr, SELinux label) is also
+  reported as a possible modification, so it cannot mask a forged edit:
+  fail-safe, at the cost of false positives.
 - **Database custody.** Whoever holds the database credentials can delete rows.
   Ship events to an external SIEM (via the webhook sink or log forwarding) when
   tamper-evidence matters.

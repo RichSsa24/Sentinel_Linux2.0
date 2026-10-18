@@ -280,10 +280,11 @@ Stated plainly, because a detector's blind spots matter as much as its rules:
   access to the target (`proc(5)`), so the non-root container records the
   executable path only for processes it may inspect; command-line rules are
   unaffected. Unreadable files (e.g. `/etc/shadow`) are tracked by metadata,
-  including `ctime`, instead of by hash. Because only `ctime` reveals them, an
-  ACL, xattr, SELinux-label or `chattr` change to such a file is reported as a
-  modification (fail-safe: a false positive, never a miss). Grant read access
-  for content-accurate monitoring.
+  including `ctime`, instead of by hash. Because only `ctime` reveals an edit
+  to such a file, any change that moves it (`chmod`, `chown`, a hard link, an
+  ACL, xattr or SELinux label) is also reported as a possible modification, so
+  a metadata change cannot mask a forged edit (fail-safe: a false positive,
+  never a miss). Grant read access for content-accurate monitoring.
 - **SQLite trades durability for speed** (`synchronous=NORMAL` in WAL mode): the
   last transactions can roll back on power loss. Use PostgreSQL in production.
 - **No retention policy yet** — the events table grows until pruned externally.

@@ -2,7 +2,7 @@
 
 Watches a configured set of paths and emits an :class:`~sentinel.events.Event`
 whenever a watched regular file is created, has its content changed, has its
-POSIX permission bits changed, or is deleted. This is the AIDE/Tripwire-style
+POSIX permission bits or ownership changed, or is deleted. This is the AIDE/Tripwire-style
 detection surface — tampering with ``/etc/passwd``, dropping a binary into
 ``/usr/local/bin``, or ``chmod 777`` on a sensitive file all surface here.
 
@@ -101,11 +101,9 @@ class _FileState(NamedTuple):
     inode: int = 0
     device: int = 0
     cacheable: bool = False
-    # Metadata that also moves ctime; used to tell a metadata-only change from a
-    # content edit when the file cannot be hashed.
+    # Ownership: a `chown` is reported as an attributes change, like a `chmod`.
     uid: int = 0
     gid: int = 0
-    nlink: int = 0
 
     def same_stat(self, other: _FileState) -> bool:
         """True if `other` has the identical stat fingerprint (content assumed same)."""
@@ -256,7 +254,6 @@ class FileIntegrityCollector(AbstractCollector):
             cacheable=lst.st_ctime_ns < racy_after_ns,
             uid=lst.st_uid,
             gid=lst.st_gid,
-            nlink=lst.st_nlink,
         )
         if previous is not None and previous.cacheable and previous.same_stat(state):
             self._hash_reused += 1
@@ -280,15 +277,21 @@ class FileIntegrityCollector(AbstractCollector):
     # ------------------------------------------------------------------ diffing
 
     def _diff(self, old: dict[str, _FileState], new: dict[str, _FileState]) -> list[RawFileEvent]:
-        """Compute create/modify/attrs/delete raw records between two snapshots."""
+        """Compute create/modify/attrs/delete raw records between two snapshots.
+
+        Content and attribute changes are reported independently: a rewrite plus
+        ``chmod u+s`` in one poll yields both events, so the setuid change still
+        reaches the rules that match attribute changes.
+        """
         records: list[RawFileEvent] = []
         for path, state in new.items():
             previous = old.get(path)
             if previous is None:
                 records.append(self._created(path, state))
-            elif _content_changed(previous, state):
+                continue
+            if _content_changed(previous, state):
                 records.append(self._modified(path, state))
-            elif previous.mode != state.mode:
+            if _attributes_changed(previous, state):
                 records.append(self._attrs_modified(path, state))
         for path, previous in old.items():
             if path not in new:
@@ -304,7 +307,8 @@ class FileIntegrityCollector(AbstractCollector):
         return self._raw(path, state, _ACTION_MODIFIED, _SEV_MODIFIED, _fingerprint(state))
 
     def _attrs_modified(self, path: str, state: _FileState) -> RawFileEvent:
-        return self._raw(path, state, _ACTION_ATTRS, _SEV_ATTRS, f"{state.mode:04o}")
+        seed = f"{state.mode:04o}:{state.uid}:{state.gid}"
+        return self._raw(path, state, _ACTION_ATTRS, _SEV_ATTRS, seed)
 
     def _deleted(self, path: str, state: _FileState) -> RawFileEvent:
         return self._raw(path, state, _ACTION_DELETED, _SEV_DELETED, _fingerprint(state))
@@ -349,23 +353,23 @@ def _fingerprint(state: _FileState) -> str:
 
 
 def _content_changed(old: _FileState, new: _FileState) -> bool:
-    """True if file content changed between snapshots.
+    """True if file content changed — or, for an unhashable file, may have.
 
     Prefers the hash. For unhashable files (unreadable — e.g. /etc/shadow for a
     non-root collector — or over the size cap) it falls back to size or mtime
     drift, and then to ctime: size+mtime alone can be forged (a same-length edit
-    followed by ``touch -d``), ctime cannot. A ctime move that visible metadata
-    explains — a mode change (left to the attributes check, so ``chmod u+s``
-    still reads as ``file_attributes_modified``), a ``chown``, or a hard link
-    added or removed — is not reported as a content change.
+    followed by ``touch -d``), ctime cannot. Any ctime move counts, even one a
+    visible ``chmod``, ``chown`` or hard link could explain, because an attacker
+    can make that change alongside the edit to mask it. Fail-safe: metadata
+    changes to such a file are also reported as possible modifications.
     """
     if old.sha256 is not None and new.sha256 is not None:
         return old.sha256 != new.sha256
     if old.size != new.size or old.mtime_ns != new.mtime_ns:
         return True
-    if not (old.ctime_ns and new.ctime_ns) or old.ctime_ns == new.ctime_ns:
-        return False
-    metadata_explains = (
-        old.mode != new.mode or old.uid != new.uid or old.gid != new.gid or old.nlink != new.nlink
-    )
-    return not metadata_explains
+    return bool(old.ctime_ns and new.ctime_ns) and old.ctime_ns != new.ctime_ns
+
+
+def _attributes_changed(old: _FileState, new: _FileState) -> bool:
+    """True if permission bits or ownership changed between snapshots."""
+    return (old.mode, old.uid, old.gid) != (new.mode, new.uid, new.gid)

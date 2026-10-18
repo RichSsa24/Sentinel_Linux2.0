@@ -100,14 +100,30 @@ class TestDiff:
         assert records[0].action == "file_attributes_modified"
         assert records[0].mode == "0600"
 
-    def test_content_change_takes_precedence_over_mode(self, tmp_path: Path) -> None:
+    @pytest.mark.security
+    def test_content_and_mode_change_in_one_poll_report_both(self, tmp_path: Path) -> None:
+        # Regression: content took precedence, so overwriting a binary and making
+        # it setuid inside one poll emitted only file_modified, which the
+        # new-suid-binary rule (created / attributes_modified) never sees.
         records = _collector(tmp_path)._diff(
-            {"/etc/x": _state(H1, mode=0o644)},
-            {"/etc/x": _state(H2, mode=0o600)},
+            {"/usr/local/bin/helper": _state(H1, mode=0o755)},
+            {"/usr/local/bin/helper": _state(H2, mode=0o4755)},
         )
 
-        assert len(records) == 1
-        assert records[0].action == "file_modified"
+        assert [r.action for r in records] == ["file_modified", "file_attributes_modified"]
+        assert records[1].mode == "4755"
+
+    @pytest.mark.parametrize("owner", [{"uid": 1000}, {"gid": 42}], ids=["chown", "chgrp"])
+    def test_ownership_change_is_an_attributes_change(
+        self, tmp_path: Path, owner: dict[str, int]
+    ) -> None:
+        # `chown attacker /etc/sudoers` leaves content and mode intact.
+        before = _state(H1)
+        after = before._replace(uid=owner.get("uid", 0), gid=owner.get("gid", 0))
+        records = _collector(tmp_path)._diff({"/etc/sudoers": before}, {"/etc/sudoers": after})
+
+        assert [r.action for r in records] == ["file_attributes_modified"]
+        assert records[0].id_seed != _collector(tmp_path)._attrs_modified("/x", before).id_seed
 
     def test_deleted(self, tmp_path: Path) -> None:
         records = _collector(tmp_path)._diff({"/etc/x": _state(H1)}, {})
@@ -155,29 +171,25 @@ class TestContentChanged:
         new = _state(None)._replace(ctime_ns=200)
         assert _content_changed(old, new) is True
 
-    def test_unhashable_ctime_move_explained_by_chmod_is_not_content(self) -> None:
-        # Leave it to the attributes check so `chmod u+s` stays an attrs event.
-        old = _state(None, mode=0o755)._replace(ctime_ns=100)
-        new = _state(None, mode=0o4755)._replace(ctime_ns=200)
-        assert _content_changed(old, new) is False
-
+    @pytest.mark.security
     @pytest.mark.parametrize(
         "after",
         [
-            _state(None)._replace(ctime_ns=200, nlink=1, uid=1000),
-            _state(None)._replace(ctime_ns=200, nlink=1, gid=42),
-            _state(None)._replace(ctime_ns=200, nlink=2),
+            _state(None, mode=0o600)._replace(ctime_ns=200),
+            _state(None)._replace(ctime_ns=200, uid=1000),
+            _state(None)._replace(ctime_ns=200, gid=42),
         ],
-        ids=["chown-user", "chown-group", "hard-link"],
+        ids=["chmod", "chown", "chgrp"],
     )
-    def test_unhashable_ctime_move_explained_by_metadata_is_not_content(
+    def test_unhashable_ctime_move_with_metadata_change_is_still_change(
         self, after: _FileState
     ) -> None:
-        # `chown root:shadow /etc/shadow` or `ln /etc/shadow x` moves ctime but is
-        # not an edit; reporting it as file_modified would fire a high-severity
-        # rule on routine administration.
-        before = _state(None)._replace(ctime_ns=100, nlink=1)
-        assert _content_changed(before, after) is False
+        # Regression: a ctime move that a metadata change could explain was
+        # treated as metadata only, so a forged edit of an unreadable file
+        # (same length, mtime restored) followed by `chgrp` emitted nothing.
+        # The collector cannot tell the two apart, so it must not stay silent.
+        before = _state(None)._replace(ctime_ns=100)
+        assert _content_changed(before, after) is True
 
 
 class TestFingerprint:
@@ -288,6 +300,29 @@ class TestScanning:
         assert events[0].event.action == "file_modified"
         assert events[0].file is not None
         assert events[0].file.hash.sha256 is None
+
+    @pytest.mark.security
+    @pytest.mark.asyncio
+    async def test_forged_edit_of_unhashable_file_is_not_masked_by_a_hard_link(
+        self, tmp_path: Path
+    ) -> None:
+        # Regression: a same-length edit with the mtime restored, plus a hard
+        # link (which also moves ctime), was taken for metadata only: no event.
+        watched = tmp_path / "etc"
+        watched.mkdir()
+        target = watched / "shadow"
+        target.write_text("root:AAAA\n", encoding="utf-8")
+        collector = _collector(watched, max_hash_bytes=0)  # like an unreadable file
+        await _drain(collector)
+        before = target.stat()
+        await asyncio.sleep(0.05)  # past the kernel's coarse timestamp tick, so ctime moves
+
+        target.write_text("root:BBBB\n", encoding="utf-8")
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.link(target, tmp_path / "elsewhere")
+
+        events = await _drain(collector)
+        assert [e.event.action for e in events] == ["file_modified"]
 
     @pytest.mark.asyncio
     async def test_subdirectories_are_not_tracked_as_files(self, tmp_path: Path) -> None:
