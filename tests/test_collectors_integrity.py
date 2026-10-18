@@ -25,6 +25,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from sentinel.collectors.integrity import (
     FileIntegrityCollector,
@@ -415,6 +416,21 @@ class TestScanning:
         assert events[0].file is not None
         assert len(events[0].file.path) <= MAX_PATH
         assert events[0].file.path.endswith("/payload")
+
+    @pytest.mark.asyncio
+    async def test_a_missing_watch_path_is_reported_once(self, tmp_path: Path) -> None:
+        # Regression: a missing path (e.g. no /var/spool/cron) logged a warning
+        # on every poll, forever.
+        missing = tmp_path / "absent"
+        collector = FileIntegrityCollector([missing], host="testhost")
+        with capture_logs() as logs:
+            for _ in range(3):
+                await _drain(collector)
+            missing.mkdir()
+            await _drain(collector)
+        events = [entry["event"] for entry in logs]
+        assert events.count("integrity.scan_error") == 1
+        assert events.count("integrity.path_available") == 1
 
     @pytest.mark.asyncio
     async def test_subdirectories_are_not_tracked_as_files(self, tmp_path: Path) -> None:

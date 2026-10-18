@@ -64,6 +64,7 @@ from sentinel.collectors.integrity import FileIntegrityCollector
 from sentinel.collectors.network import NetworkCollector
 from sentinel.collectors.process import ProcessCollector
 from sentinel.detection import DetectionEngine, Rule
+from sentinel.detection.schema import Condition, Operator
 from sentinel.events import Event
 from sentinel.logging import get_logger
 from sentinel.metrics import Metrics, RuntimeSnapshot
@@ -95,6 +96,73 @@ def _is_rejection(exc: Exception) -> bool:
         sqlstate = getattr(exc.orig, "sqlstate", None)
         return isinstance(sqlstate, str) and sqlstate[:2] in _REJECTED_SQLSTATE_CLASSES
     return False
+
+
+_REGEX_META: Final[str] = ".^$*+?{}[]()|\\"
+_QUANTIFIERS: Final[str] = "?*{"
+
+
+def _literal_prefix(pattern: str) -> str:
+    """The literal text a regex alternative starts with (empty if none)."""
+    prefix: list[str] = []
+    for index, char in enumerate(pattern):
+        if char in _REGEX_META:
+            if char in _QUANTIFIERS and prefix:
+                prefix.pop()  # `g?` makes the g optional
+            break
+        prefix.append(char)
+        if index + 1 < len(pattern) and pattern[index + 1] in _QUANTIFIERS:
+            prefix.pop()
+            break
+    return "".join(prefix)
+
+
+def _regex_path_prefixes(pattern: str) -> list[str]:
+    """Literal path prefixes of an anchored regex such as ``^(?:/etc/cron|/var/spool)``."""
+    if not pattern.startswith("^"):
+        return []
+    body = pattern[1:]
+    if body.startswith("(?:") and ")" in body:
+        group, rest = body[3:].split(")", 1)
+        return [_literal_prefix(alternative + rest) for alternative in group.split("|")]
+    return [_literal_prefix(body)]
+
+
+def _file_path_prefixes(condition: Condition) -> list[str]:
+    """Every literal ``file.path`` prefix a condition tree tests."""
+    if condition.threshold is not None:
+        return _file_path_prefixes(condition.threshold.match)
+    children = condition.all_ or condition.any_ or ([condition.not_] if condition.not_ else [])
+    if children:
+        return [prefix for child in children for prefix in _file_path_prefixes(child)]
+    if condition.field != "file.path" or not isinstance(condition.value, str):
+        return []
+    if condition.op in (Operator.EQUALS, Operator.STARTSWITH):
+        return [condition.value]
+    if condition.op is Operator.REGEX:
+        return [prefix for prefix in _regex_path_prefixes(condition.value) if prefix]
+    return []
+
+
+def unwatched_rule_paths(rules: Iterable[Rule], watched: Sequence[str]) -> dict[str, list[str]]:
+    """Rules whose file paths no watched path covers, with those paths.
+
+    Such a rule can never fire (e.g. log-tampering while /var/log is not
+    watched); the runtime warns about them once at startup.
+    """
+
+    def covered(prefix: str) -> bool:
+        return any(
+            prefix.startswith(root.rstrip("/") + "/") or prefix == root or root.startswith(prefix)
+            for root in watched
+        )
+
+    uncovered: dict[str, list[str]] = {}
+    for rule in rules:
+        missing = [p for p in _file_path_prefixes(rule.condition) if not covered(p)]
+        if missing:
+            uncovered[rule.id] = missing
+    return uncovered
 
 
 class ConfigurationError(ValueError):
@@ -224,6 +292,8 @@ class Runtime:
     ) -> None:
         rule_list = tuple(rules)
         self._on_fatal = on_fatal
+        self._fim_paths = settings.fim_path_list
+        self._enabled = settings.enabled_collectors
         self._database = database
         self._metrics = metrics
         self._log = get_logger("sentinel.runtime")
@@ -267,6 +337,14 @@ class Runtime:
             raise RuntimeError(msg)
         if not self._engine.rules:
             self._log.warning("runtime.no_enabled_rules")
+        watched = self._fim_paths if "file-integrity" in self._enabled else ()
+        unwatched = unwatched_rule_paths(self._engine.rules, watched)
+        if unwatched:
+            self._log.warning(
+                "runtime.rule_paths_not_watched",
+                rules=unwatched,
+                hint="add the paths to SENTINEL_FIM_PATHS or these rules cannot fire",
+            )
         self._task = asyncio.create_task(self._pipeline.run(), name="sentinel.runtime")
         self._task.add_done_callback(self._on_pipeline_exit)
         self._flusher = asyncio.create_task(self._flush_periodically(), name="sentinel.flusher")

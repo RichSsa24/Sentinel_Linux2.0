@@ -230,7 +230,7 @@ class TestCollectorSettings:
         s = settings_no_env_file()
         assert s.enabled_collectors == ("auth-log", "file-integrity", "process", "network")
         assert str(s.host_root) == "/"
-        assert s.fim_path_list == ("/etc",)
+        assert s.fim_path_list == ("/etc", "/var/spool/cron")  # user crontabs too
 
     def test_csv_lists_are_trimmed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SENTINEL_ENV", "test")

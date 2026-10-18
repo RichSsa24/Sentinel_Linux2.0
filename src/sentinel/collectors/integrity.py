@@ -150,6 +150,8 @@ class FileIntegrityCollector(AbstractCollector):
         self._max_files = max_files
         self._normalizer = normalizer or Normalizer()
         self._log = get_logger("sentinel.collectors.integrity")
+        # Watched roots currently missing: warned about once, not every poll.
+        self._missing: set[str] = set()
         self._baseline: dict[str, _FileState] = {}
         self._seeded = False
         self._emitted = 0
@@ -217,8 +219,13 @@ class FileIntegrityCollector(AbstractCollector):
         try:
             lst = root.lstat()
         except OSError as exc:
-            self._log.warning("integrity.scan_error", path=str(root), error=str(exc))
+            if str(root) not in self._missing:
+                self._missing.add(str(root))
+                self._log.warning("integrity.scan_error", path=str(root), error=str(exc))
             return
+        if str(root) in self._missing:
+            self._missing.discard(str(root))
+            self._log.info("integrity.path_available", path=str(root))
         if stat.S_ISREG(lst.st_mode):
             yield root
         elif stat.S_ISDIR(lst.st_mode):

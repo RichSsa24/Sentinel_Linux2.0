@@ -32,7 +32,7 @@ from sentinel.collectors.base import AbstractCollector
 from sentinel.collectors.integrity import FileIntegrityCollector
 from sentinel.collectors.network import NetworkCollector
 from sentinel.collectors.process import ProcessCollector
-from sentinel.detection.schema import Rule
+from sentinel.detection.schema import Condition, Rule
 from sentinel.events import Event
 from sentinel.logging import redact_sensitive_processor
 from sentinel.metrics import Metrics
@@ -42,10 +42,12 @@ from sentinel.pipeline.runner import Pipeline
 from sentinel.runtime import (
     ConfigurationError,
     Runtime,
+    _file_path_prefixes,
     build_alert_manager,
     build_collectors,
     build_sinks,
     resolve_host_name,
+    unwatched_rule_paths,
 )
 from sentinel.storage import Database, Repository
 from tests.conftest import auth_header, make_api_settings, make_detection, make_event
@@ -844,3 +846,46 @@ def test_the_production_app_shuts_down_gracefully_when_the_pipeline_dies(
     monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
     app_module._shut_down_for_restart()
     assert sent == [(os.getpid(), signal.SIGTERM)]  # uvicorn's graceful-shutdown path
+
+
+class TestRuleCoverage:
+    """Regression: with the default paths, log-tampering could never fire, silently."""
+
+    def test_the_library_is_covered_by_the_default_paths_except_log_tampering(
+        self, rules: tuple[Rule, ...]
+    ) -> None:
+        default = make_api_settings().fim_path_list
+        assert unwatched_rule_paths(rules, default) == {"log-tampering": ["/var/log/"]}
+
+    def test_watching_var_log_covers_it(self, rules: tuple[Rule, ...]) -> None:
+        assert unwatched_rule_paths(rules, ["/etc", "/var/spool/cron", "/var/log"]) == {}
+
+    async def test_startup_warns_about_rules_that_cannot_fire(
+        self, database: Database, rules: tuple[Rule, ...]
+    ) -> None:
+        runtime = Runtime(
+            make_api_settings(), database=database, metrics=Metrics(), rules=rules,
+            collectors=[_Replay([])], sinks=[],
+        )  # fmt: skip
+        with structlog.testing.capture_logs() as logs:
+            runtime.start()
+            await runtime.stop()
+        warning = next(e for e in logs if e["event"] == "runtime.rule_paths_not_watched")
+        assert warning["rules"] == {"log-tampering": ["/var/log/"]}
+
+
+@pytest.mark.parametrize(
+    ("pattern", "prefixes"),
+    [
+        ("^/etc/g?shadow$", ["/etc/"]),
+        (
+            "^(?:/etc/cron|/etc/crontab|/var/spool/cron)",
+            ["/etc/cron", "/etc/crontab", "/var/spool/cron"],
+        ),
+        ("^/(?:etc|bin)/", ["/"]),
+        ("shadow$", []),  # unanchored: nothing can be said, so nothing is claimed
+    ],
+)
+def test_path_prefixes_of_rule_regexes(pattern: str, prefixes: list[str]) -> None:
+    condition = Condition.model_validate({"field": "file.path", "op": "regex", "value": pattern})
+    assert _file_path_prefixes(condition) == prefixes

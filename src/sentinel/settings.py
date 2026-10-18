@@ -256,8 +256,9 @@ class Settings(BaseSettings):
         default=Path("/var/log/auth.log"), description="Host path of the sshd auth log."
     )
     fim_paths: str = Field(
-        default="/etc",
-        description="Comma-separated absolute host paths watched for file integrity.",
+        default="/etc,/var/spool/cron",
+        description="Comma-separated absolute host paths watched for file integrity. "
+        "Add /var/log to enable log-tampering (busy: every append is a change).",
     )
     rules_dir: Path = Field(
         default=Path("rules"),
