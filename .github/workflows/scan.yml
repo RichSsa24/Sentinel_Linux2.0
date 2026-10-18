@@ -1,0 +1,101 @@
+# Weekly vulnerability scan of every image the deployment runs: advisories
+# change even when this repository does not.
+#
+# - Sentinel's image (built from the default branch): fixable HIGH/CRITICAL
+#   findings fail the job, as in CI.
+# - The Compose stack's third-party images (listed from docker-compose.yml,
+#   so the scan cannot drift from what is deployed): findings are reported in
+#   the job summary, not failed. They are upstream's to fix — on 2026-10-18
+#   the newest releases all carried Go standard-library advisories (gosu in
+#   PostgreSQL, Grafana's plugins, Prometheus) — and Dependabot moves the
+#   pinned digests when upstream ships a rebuild; this report shows whether
+#   it helped.
+
+name: Scheduled scan
+
+on:
+  schedule:
+    - cron: "23 5 * * 1" # Mondays, 05:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sentinel-image:
+    name: Trivy — Sentinel image
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: docker build -f deploy/docker/Dockerfile -t sentinel-linux:scan .
+
+      - name: Trivy — fixable HIGH/CRITICAL vulnerabilities fail the job
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: sentinel-linux:scan
+          scanners: vuln
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: table
+
+  stack-images:
+    name: List the Compose images
+    runs-on: ubuntu-24.04
+    outputs:
+      images: ${{ steps.list.outputs.images }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: List
+        id: list
+        # Placeholders for the file's required `:?` variables: nothing is
+        # started, the file is only rendered.
+        env:
+          SENTINEL_API_KEY: render-only  # pragma: allowlist secret
+          POSTGRES_PASSWORD: render-only  # pragma: allowlist secret
+          POSTGRES_APP_PASSWORD: render-only  # pragma: allowlist secret
+          GRAFANA_ADMIN_PASSWORD: render-only  # pragma: allowlist secret
+        run: |
+          images=$(docker compose -f deploy/docker-compose.yml config --images \
+            | grep -v '^sentinel-linux:' | jq -Rnc '[inputs]')
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+
+  third-party:
+    name: Trivy — ${{ matrix.image }}
+    needs: stack-images
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.stack-images.outputs.images) }}
+    steps:
+      - name: Trivy — fixable HIGH/CRITICAL vulnerabilities, reported
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}
+          scanners: vuln
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          format: table
+          output: trivy.txt
+
+      - name: Job summary
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          {
+            echo "### $IMAGE"
+            echo '```'
+            cat trivy.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
