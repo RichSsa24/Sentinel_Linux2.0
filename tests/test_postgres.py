@@ -1,0 +1,129 @@
+"""Integration tests against PostgreSQL, the production database.
+
+Everything else runs on SQLite; these cover what only PostgreSQL does: its
+error classes (a value it refuses arrives from asyncpg as a bare DBAPIError
+carrying a SQLSTATE), ``timestamptz``, the migrations on its dialect, and
+bulk deletes. Skipped unless SENTINEL_TEST_POSTGRES_URL names a disposable
+database, e.g. ``postgresql+asyncpg://sentinel:pw@127.0.0.1:5432/sentinel_test``
+— CI runs them against a postgres:16 service. The schema is built by the
+migrations (the production path) and removed afterwards.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import httpx
+import pytest
+from alembic import command
+from alembic.autogenerate import compare_metadata
+from alembic.config import Config
+from alembic.migration import MigrationContext
+from sqlalchemy import create_engine
+from structlog.testing import capture_logs
+
+from sentinel.api import create_app
+from sentinel.detection.schema import Rule
+from sentinel.metrics import Metrics
+from sentinel.runtime import Runtime
+from sentinel.storage import Database, Repository
+from sentinel.storage.models import Base
+from tests.conftest import make_alert, make_api_settings, make_event
+
+_URL = os.environ.get("SENTINEL_TEST_POSTGRES_URL", "")
+_ROOT = Path(__file__).resolve().parent.parent
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not _URL, reason="SENTINEL_TEST_POSTGRES_URL is not set"),
+]
+
+
+def _sync_url() -> str:
+    return _URL.replace("+asyncpg", "+psycopg")
+
+
+def _alembic() -> Config:
+    config = Config(str(_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(_ROOT / "migrations"))
+    config.set_main_option("sqlalchemy.url", _sync_url())
+    return config
+
+
+@pytest.fixture
+def migrated() -> Iterator[None]:
+    command.downgrade(_alembic(), "base")  # a previous run may have been interrupted
+    command.upgrade(_alembic(), "head")
+    yield
+    command.downgrade(_alembic(), "base")
+
+
+@pytest.fixture
+async def pg(migrated: None) -> AsyncIterator[Database]:
+    database = Database(_URL)
+    yield database
+    await database.dispose()
+
+
+def test_the_migrations_build_exactly_the_orm_schema(migrated: None) -> None:
+    engine = create_engine(_sync_url())
+    with engine.connect() as connection:
+        differences = compare_metadata(MigrationContext.configure(connection), Base.metadata)
+    engine.dispose()
+    assert differences == []
+
+
+async def test_records_round_trip_with_utc_timestamps(pg: Database) -> None:
+    occurred = datetime(2026, 6, 16, 12, 0, 1, tzinfo=UTC)
+    async with pg.session() as session:
+        repo = Repository(session)
+        await repo.save_batch(
+            events=[make_event(event_id="1" * 64, timestamp=occurred)],
+            alerts=[make_alert(event_id="1" * 64).model_copy(update={"notified": False})],
+        )
+        (event,) = await repo.list_events(limit=10)
+        (alert,) = await repo.list_alerts(limit=10)
+    assert event.occurred_at == occurred
+    assert event.occurred_at.tzinfo is not None
+    assert alert.notified is False
+
+
+async def test_retention_deletes_in_bounded_batches(pg: Database) -> None:
+    async with pg.session() as session:
+        repo = Repository(session)
+        await repo.save_batch(events=[make_event(event_id=f"{i:064d}") for i in range(5)])
+        later = datetime.now(tz=UTC) + timedelta(days=1)
+        assert await repo.delete_stored_before(later, limit=2) == (2, 0)
+        assert await repo.delete_stored_before(later, limit=10) == (3, 0)
+        assert await repo.count_events() == 0
+
+
+@pytest.mark.security
+async def test_a_row_postgres_refuses_is_isolated_not_retried_forever(
+    pg: Database, rules: tuple[Rule, ...]
+) -> None:
+    # PostgreSQL refuses NUL in text (SQLSTATE 22021); asyncpg's adapter
+    # raises a bare DBAPIError for it, which only the SQLSTATE identifies as
+    # a rejection rather than an outage. Retrying it would stall every write.
+    runtime = Runtime(make_api_settings(), database=pg, metrics=Metrics(), rules=rules, sinks=[])
+    for i, message in enumerate(["before", "nul \x00 byte", "after"]):
+        await runtime._consume(make_event(event_id=f"{i:064d}", message=message))
+    with capture_logs() as logs:
+        assert await runtime.flush() is True
+    async with pg.session() as session:
+        assert await Repository(session).count_events() == 2
+    assert runtime.snapshot().dropped["persist_error"] == 1
+    assert runtime.persisting
+    assert [e["event"] for e in logs] == ["runtime.persist_rejected"]
+
+
+async def test_the_api_is_ready_on_a_migrated_database(
+    pg: Database, rules: tuple[Rule, ...]
+) -> None:
+    app = create_app(make_api_settings(), database=pg, metrics=Metrics(), rules=rules)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        assert (await client.get("/readyz")).status_code == 200

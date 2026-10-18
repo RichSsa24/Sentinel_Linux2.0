@@ -9,6 +9,8 @@
 #              hardening as the Compose stack, and scans it with Trivy.
 #   alerting   validates and unit-tests the Prometheus alert rules (promtool)
 #              with the Prometheus image the Compose stack runs.
+#   postgres   the PostgreSQL integration tests (migrations, timestamptz,
+#              rejected rows, retention) against the database production uses.
 #
 # Supply chain:
 # - `permissions: contents: read` everywhere; no job can write to the repo.
@@ -164,3 +166,44 @@ jobs:
           }
           promtool check rules alerts.yml
           promtool test rules alerts.test.yml
+
+  postgres:
+    name: PostgreSQL integration
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: ci-throwaway  # pragma: allowlist secret
+          POSTGRES_DB: sentinel_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sentinel -d sentinel_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      SENTINEL_TEST_POSTGRES_URL: postgresql+asyncpg://sentinel:ci-throwaway@127.0.0.1:5432/sentinel_test  # pragma: allowlist secret
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies (frozen)
+        run: uv sync --frozen
+
+      - name: Pytest — PostgreSQL integration (a skip fails the job)
+        run: |
+          set -o pipefail
+          uv run pytest tests/test_postgres.py -rs | tee pytest.log
+          if grep -q SKIPPED pytest.log; then
+            echo "::error::the PostgreSQL tests were skipped"
+            exit 1
+          fi
