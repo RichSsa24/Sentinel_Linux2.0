@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # Sentinel-Linux 2.0 — production image (CIS Docker Benchmark aligned).
 #
 # - Multi-stage: the toolchain (uv) never reaches the runtime image.

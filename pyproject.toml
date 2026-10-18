@@ -68,6 +68,9 @@ packages = ["src/sentinel"]
 # Install the `dev` group by default so `uv sync` gives contributors the
 # full toolchain (ruff, mypy, bandit, pytest, pre-commit, etc.) in one step.
 default-groups = ["dev"]
+# The build backend is fetched at build time, outside the lockfile: pin it so
+# every wheel (the image included) is built by the same, reviewed version.
+build-constraint-dependencies = ["hatchling==1.32.4"]
 
 # ---------------------------------------------------------------------------
 # Ruff — lint + format (strict but practical ruleset).

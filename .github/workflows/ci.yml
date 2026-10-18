@@ -45,10 +45,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
         with:
+          version: "0.11.32"  # the same uv as the image build
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
@@ -74,10 +77,12 @@ jobs:
         run: |
           # `--quiet` silences the resolver status line that newer `uv` prints
           # to stdout; without it the file gets a leading non-requirement line
-          # that pip-audit's strict mode rejects.
+          # that pip-audit's strict mode rejects. The export keeps its hashes,
+          # so pip-audit audits the pinned set as-is (`--disable-pip`) instead
+          # of installing an unpinned pip into a temporary venv to resolve it.
           uv export --quiet --format requirements-txt --no-emit-project \
-            --no-hashes -o requirements-audit.txt
-          uv run pip-audit -r requirements-audit.txt --strict
+            -o requirements-audit.txt
+          uv run pip-audit -r requirements-audit.txt --strict --disable-pip
 
       - name: Pytest — coverage (floor in pyproject.toml)
         run: |
@@ -91,8 +96,8 @@ jobs:
         if: matrix.python-version == '3.12'
         run: |
           uv export --quiet --format requirements-txt --no-emit-project --no-dev \
-            --no-hashes -o requirements-runtime.txt
-          uv run pip-audit -r requirements-runtime.txt --strict \
+            -o requirements-runtime.txt
+          uv run pip-audit -r requirements-runtime.txt --strict --disable-pip \
             --format cyclonedx-json -o sbom.cdx.json
 
       - name: Upload coverage and SBOM
@@ -112,10 +117,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
         with:
+          version: "0.11.32"  # the same uv as the image build
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
@@ -134,6 +142,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Build
         run: docker build -f deploy/docker/Dockerfile -t sentinel-linux:ci .
@@ -157,6 +167,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: promtool — validate and unit-test deploy/prometheus/alerts.yml
         run: |
@@ -188,10 +200,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
         with:
+          version: "0.11.32"  # the same uv as the image build
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
