@@ -18,6 +18,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import socket
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -469,3 +472,37 @@ class TestSourceAvailability:
         collector = _collector(tmp_path)
         await _drain(collector)
         assert collector.source_available
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs a Linux procfs")
+@pytest.mark.security
+class TestOwnSockets:
+    """Regression: on bare metal Sentinel reported its own API listener as a new
+    service on two starts in three (it binds after the collectors start)."""
+
+    def test_own_sockets_are_skipped_and_another_process_is_not(self) -> None:
+        collector = NetworkCollector(proc_root=Path("/proc"), host="testhost")
+        own = socket.socket()
+        own.bind(("127.0.0.1", 0))
+        own.listen()
+        own_port = own.getsockname()[1]
+        child = [
+            sys.executable,
+            "-I",
+            "-c",
+            "import socket, time; s = socket.socket(); s.bind(('127.0.0.1', 0)); "
+            "s.listen(); print(s.getsockname()[1], flush=True); time.sleep(30)",
+        ]
+        # A "backdoor" in another process must still be reported.
+        with subprocess.Popen(child, stdout=subprocess.PIPE, text=True) as other:  # noqa: S603 — fixed argv, no shell
+            try:
+                assert other.stdout is not None
+                other_port = int(other.stdout.readline())
+                listening = {
+                    sock.local_port for sock in collector._scan().values() if sock.state == "LISTEN"
+                }
+            finally:
+                other.kill()
+                own.close()
+        assert other_port in listening
+        assert own_port not in listening

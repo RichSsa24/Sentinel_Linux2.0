@@ -27,6 +27,14 @@ A containerized collector reading the host's procfs (mounted at e.g.
 ``netns_pid=1`` reads ``<proc_root>/1/net`` instead: the namespace of that
 procfs's init process, i.e. the host's.
 
+Sentinel's own sockets (its API listener, its database and webhook
+connections) are not reported: they are recognised by inode through
+``/proc/self/fd``. Its listener is bound after the collectors start, so it
+would otherwise be "a new listening service" on every start on bare metal
+(two starts in three, measured), and every webhook delivery a new connection
+to report. In a container they live in another network namespace and never
+appear in the host's tables anyway.
+
 Security posture (per the collector contract in
 :mod:`sentinel.collectors.base`):
 
@@ -48,6 +56,7 @@ conntrack) — out of scope for this poll-based collector.
 from __future__ import annotations
 
 import asyncio
+import re
 import socket
 from datetime import UTC, datetime
 from pathlib import Path
@@ -89,6 +98,27 @@ _SEV_LISTEN_OPEN: Final[int] = 4
 _SEV_LISTEN_CLOSE: Final[int] = 3
 _SEV_CONN_OPEN: Final[int] = 2
 _SEV_CONN_CLOSE: Final[int] = 1
+
+
+_SELF_FD: Final[Path] = Path("/proc/self/fd")
+_SOCKET_LINK: Final[re.Pattern[str]] = re.compile(r"socket:\[(\d+)\]")
+
+
+def _own_socket_inodes() -> frozenset[int]:
+    """Inodes of this process's open sockets (empty where /proc is unavailable)."""
+    inodes: set[int] = set()
+    try:
+        entries = list(_SELF_FD.iterdir())
+    except OSError:
+        return frozenset()
+    for entry in entries:
+        try:
+            match = _SOCKET_LINK.fullmatch(str(entry.readlink()))
+        except OSError:
+            continue  # closed since the listing
+        if match:
+            inodes.add(int(match.group(1)))
+    return frozenset(inodes)
 
 
 class NetworkCollector(AbstractCollector):
@@ -170,6 +200,7 @@ class NetworkCollector(AbstractCollector):
         """
         listeners: list[Socket] = []
         connections: list[Socket] = []
+        own = _own_socket_inodes()
         tables = {filename: self._read_proc_net(filename) for _proto, filename in _SOURCES}
         # tcp6 is absent when IPv6 is disabled; no readable table at all is an outage.
         readable = [name for name, text in tables.items() if text is not None]
@@ -177,8 +208,9 @@ class NetworkCollector(AbstractCollector):
         for proto, filename in _SOURCES:
             for line in (tables[filename] or "").splitlines():
                 sock = parse_net_line(line, proto=proto)
-                if sock is not None and sock.state in self._tracked_states:
-                    (listeners if sock.state == STATE_LISTEN else connections).append(sock)
+                if sock is None or sock.state not in self._tracked_states or sock.inode in own:
+                    continue
+                (listeners if sock.state == STATE_LISTEN else connections).append(sock)
         snapshot: dict[SocketKey, Socket] = {}
         for sock in (*listeners, *connections):
             if len(snapshot) >= self._max_sockets:
