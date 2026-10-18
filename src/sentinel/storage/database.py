@@ -149,7 +149,7 @@ class Database:
         try:
             done, _ = await asyncio.wait({task}, timeout=max_wait)
         except asyncio.CancelledError:
-            task.cancel()
+            self._abandon(task)  # its cleanup may outlive the caller too
             raise
         if done:
             return task.result()

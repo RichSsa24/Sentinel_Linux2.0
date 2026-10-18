@@ -259,6 +259,30 @@ class TestBoundedCalls:
         assert loop.time() - started < 1
         await database.dispose()
 
+    async def test_a_cancelled_caller_leaves_the_call_tracked_until_it_ends(
+        self, database: Database
+    ) -> None:
+        release = asyncio.Event()
+
+        async def slow_cleanup(_session: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.shield(release.wait())  # cleanup outlives the caller
+
+        caller = asyncio.create_task(database.run(slow_cleanup, max_wait=60))
+        await asyncio.sleep(0.01)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert len(database._abandoned) == 1  # referenced, its outcome will be consumed
+        release.set()
+        for _ in range(100):
+            if not database._abandoned:
+                break
+            await asyncio.sleep(0.01)
+        assert database._abandoned == set()
+
     async def test_run_returns_the_result_and_its_errors(self, database: Database) -> None:
         async def count(session: AsyncSession) -> int:
             return await Repository(session).count_events()
