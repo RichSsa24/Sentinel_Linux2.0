@@ -104,6 +104,10 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
             host=args.host,
             port=args.port,
             server_header=False,
+            # The peer address is the client. Trusting X-Forwarded-For (uvicorn's
+            # default for connections from 127.0.0.1) would let any local process
+            # choose its rate-limit bucket and forge the address in the logs.
+            proxy_headers=False,
         )
         return 0
     _quiet_logs()

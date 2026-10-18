@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -14,7 +15,7 @@ from sentinel.api.security import RateLimitMiddleware
 from sentinel.detection.schema import Rule
 from sentinel.metrics import Metrics
 from sentinel.storage import Database
-from tests.conftest import make_api_settings
+from tests.conftest import TEST_API_KEY, auth_header, make_api_settings
 
 pytestmark = pytest.mark.security
 
@@ -34,9 +35,13 @@ async def _ok(_request: Request) -> PlainTextResponse:
     return PlainTextResponse("ok")
 
 
-def _middleware_client(limit: int, window: float, clock: _FakeClock) -> httpx.AsyncClient:
+def _middleware_client(
+    limit: int, window: float, clock: _FakeClock, api_key: SecretStr | None = None
+) -> httpx.AsyncClient:
     app = Starlette(routes=[Route("/", _ok)])
-    app.add_middleware(RateLimitMiddleware, limit=limit, window_seconds=window, time_source=clock)
+    app.add_middleware(
+        RateLimitMiddleware, limit=limit, window_seconds=window, api_key=api_key, time_source=clock
+    )
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver")
 
 
@@ -56,6 +61,21 @@ class TestRateLimitMiddleware:
         assert blocked.status_code == 429
         assert blocked.headers["Retry-After"] == "60"
         assert blocked.json()["error"]["code"] == "RATE_LIMITED"
+
+    async def test_unauthenticated_traffic_cannot_throttle_key_holders(self) -> None:
+        # Regression: one bucket per address meant any local process (or a
+        # scanner behind the same NAT) could exhaust it and get Prometheus
+        # scrapes and API consumers answered with 429.
+        clock = _FakeClock()
+        key = SecretStr(TEST_API_KEY)
+        async with _middleware_client(limit=2, window=60.0, clock=clock, api_key=key) as client:
+            anonymous = [(await client.get("/")).status_code for _ in range(3)]
+            wrong_key = await client.get("/", headers={"Authorization": "Bearer not-the-key"})
+            keyed = [await client.get("/", headers=auth_header()) for _ in range(3)]
+        assert anonymous == [200, 200, 429]
+        assert wrong_key.status_code == 429  # a wrong key is anonymous traffic
+        # Key holders are limited too, but separately.
+        assert [response.status_code for response in keyed] == [200, 200, 429]
 
     async def test_window_slides_open_again(self) -> None:
         clock = _FakeClock()

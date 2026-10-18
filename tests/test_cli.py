@@ -148,6 +148,17 @@ def test_serve_runs_the_production_factory(monkeypatch: pytest.MonkeyPatch) -> N
     assert kwargs["factory"] is True
     assert kwargs["host"] == "127.0.0.1"  # loopback unless told otherwise
     assert kwargs["port"] == 9001
+    # X-Forwarded-For from a local process must not pick its rate-limit bucket.
+    assert kwargs["proxy_headers"] is False
+
+
+def test_the_container_serves_through_the_cli() -> None:
+    # The image must start the server the same way as bare metal, so the
+    # settings above (no proxy headers, no server header) apply there too.
+    dockerfile = (_RULES.parent / "deploy" / "docker" / "Dockerfile").read_text(encoding="utf-8")
+    cmd = next(line for line in dockerfile.splitlines() if line.startswith("CMD "))
+    assert "exec python -m sentinel serve" in cmd
+    assert "uvicorn" not in cmd
 
 
 def test_a_command_is_required() -> None:

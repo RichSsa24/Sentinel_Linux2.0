@@ -67,4 +67,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["python", "-c", "import sys, urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=4).status != 200)"]
 
 # Apply migrations, then *replace* the shell with the server (PID 1).
-CMD ["sh", "-c", "python -m alembic upgrade head && exec python -m uvicorn sentinel.api.app:get_app --factory --host 0.0.0.0 --port 8000 --no-server-header"]
+CMD ["sh", "-c", "python -m alembic upgrade head && exec python -m sentinel serve --host 0.0.0.0 --port 8000"]

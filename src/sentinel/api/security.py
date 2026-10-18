@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Final
 
 from fastapi import HTTPException, Request, status
+from pydantic import SecretStr
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 
@@ -59,6 +60,17 @@ def _log_auth_failure(request: Request, *, reason: str) -> None:
     )
 
 
+def _bearer_token(request: Request) -> str | None:
+    """The token of an ``Authorization: Bearer <token>`` header, if present."""
+    scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+    return token if scheme.lower() == "bearer" and token else None
+
+
+def _token_matches(token: str, configured: SecretStr) -> bool:
+    """Constant-time comparison of a presented token with the configured key."""
+    return hmac.compare_digest(token.encode(), configured.get_secret_value().encode())
+
+
 def require_api_key(request: Request) -> None:
     """FastAPI dependency: enforce a valid bearer token; fail closed.
 
@@ -72,15 +84,15 @@ def require_api_key(request: Request) -> None:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="authentication is not configured",
         )
-    scheme, _, token = request.headers.get("Authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not token:
+    token = _bearer_token(request)
+    if token is None:
         _log_auth_failure(request, reason="missing_bearer_token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not hmac.compare_digest(token.encode(), configured.get_secret_value().encode()):
+    if not _token_matches(token, configured):
         _log_auth_failure(request, reason="invalid_token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -117,7 +129,14 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Per-client sliding-window rate limit with bounded client tracking."""
+    """Per-client sliding-window rate limit with bounded client tracking.
+
+    The client is the TCP peer address; ``sentinel serve`` does not trust
+    ``X-Forwarded-For``, so a client cannot pick its own bucket. Callers that
+    present the API key get a budget separate from unauthenticated traffic
+    from the same address, so a scanner — or any local user on a loopback
+    deployment — cannot throttle Prometheus or the API's consumers.
+    """
 
     def __init__(
         self,
@@ -125,18 +144,24 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         *,
         limit: int,
         window_seconds: float,
+        api_key: SecretStr | None = None,
         time_source: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(app)
         self._limit = limit
         self._window = window_seconds
+        self._api_key = api_key
         self._now = time_source
         self._hits: dict[str, deque[float]] = {}
 
     async def dispatch(self, request: Request, call_next: _Dispatch) -> Response:
         client = request.client.host if request.client else "unknown"
+        token = _bearer_token(request)
+        authenticated = (
+            token is not None and self._api_key is not None and _token_matches(token, self._api_key)
+        )
         now = self._now()
-        window = self._window_for(client)
+        window = self._window_for(f"{'key' if authenticated else 'anon'}:{client}")
         cutoff = now - self._window
         while window and window[0] < cutoff:
             window.popleft()

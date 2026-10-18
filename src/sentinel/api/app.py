@@ -170,6 +170,7 @@ def create_app(
         RateLimitMiddleware,
         limit=settings.api_rate_limit,
         window_seconds=settings.api_rate_window_seconds,
+        api_key=settings.api_key,
     )
     app.add_middleware(RequestContextMiddleware)
     origins = list(settings.cors_origin_list)
