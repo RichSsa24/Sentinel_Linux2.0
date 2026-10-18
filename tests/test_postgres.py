@@ -3,10 +3,10 @@
 Everything else runs on SQLite; these cover what only PostgreSQL does: its
 error classes (a value it refuses arrives from asyncpg as a bare DBAPIError
 carrying a SQLSTATE), ``timestamptz``, the migrations on its dialect, and
-bulk deletes. Skipped unless SENTINEL_TEST_POSTGRES_URL names a disposable
-database, e.g. ``postgresql+asyncpg://sentinel:pw@127.0.0.1:5432/sentinel_test``
-— CI runs them against a postgres:16 service. The schema is built by the
-migrations (the production path) and removed afterwards.
+bulk deletes. Skipped unless SENTINEL_TEST_POSTGRES_URL is a
+``postgresql+asyncpg://`` URL of a disposable database — CI runs them against
+a postgres:16 service (see the `postgres` job in ci.yml). The schema is built
+by the migrations (the production path) and removed afterwards.
 """
 
 from __future__ import annotations
