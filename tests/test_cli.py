@@ -150,6 +150,7 @@ def test_serve_runs_the_production_factory(monkeypatch: pytest.MonkeyPatch) -> N
     assert kwargs["port"] == 9001
     # X-Forwarded-For from a local process must not pick its rate-limit bucket.
     assert kwargs["proxy_headers"] is False
+    assert kwargs["access_log"] is False  # the app's api.request log is the access log
 
 
 def test_the_container_serves_through_the_cli() -> None:

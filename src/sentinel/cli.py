@@ -111,6 +111,9 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
             # Leave logging to the app factory: uvicorn's own config would send
             # its access and error logs around the redacting JSON pipeline.
             log_config=None,
+            # The app logs every request itself (api.request, with its request
+            # id); uvicorn's access log would record each one a second time.
+            access_log=False,
         )
         return 0
     _quiet_logs()
