@@ -47,7 +47,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Final
 
-from sqlalchemy.exc import DataError, IntegrityError
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
 
 from sentinel.alerting import (
     Alert,
@@ -74,9 +74,25 @@ _HOST_ROOT: Final[Path] = Path("/")
 _PROC: Final[Path] = Path("/proc")
 # Cap on the retry backoff while the database is failing.
 _MAX_RETRY_BACKOFF_S: Final[float] = 30.0
-# Errors that mean "the database rejects this data", not "the database is
-# unavailable": retrying the same rows can never succeed.
-_REJECTED: Final[tuple[type[Exception], ...]] = (DataError, IntegrityError)
+# SQLSTATE classes meaning "the database rejects this data", not "the database
+# is unavailable": 22 data exception, 23 integrity constraint violation.
+_REJECTED_SQLSTATE_CLASSES: Final[frozenset[str]] = frozenset({"22", "23"})
+
+
+def _is_rejection(exc: Exception) -> bool:
+    """True if the database refused the rows themselves; retrying them cannot help.
+
+    Exception types alone are not enough: SQLAlchemy's asyncpg adapter maps only
+    integrity violations to IntegrityError and every other server error (a value
+    too long, a NUL byte, a numeric overflow) to a bare DBAPIError. It keeps the
+    server's SQLSTATE on the original exception, so the class decides.
+    """
+    if isinstance(exc, DataError | IntegrityError):
+        return True
+    if isinstance(exc, DBAPIError):
+        sqlstate = getattr(exc.orig, "sqlstate", None)
+        return isinstance(sqlstate, str) and sqlstate[:2] in _REJECTED_SQLSTATE_CLASSES
+    return False
 
 
 class ConfigurationError(ValueError):
@@ -305,48 +321,53 @@ class Runtime:
             alerts, self._pending_alerts = self._pending_alerts, []
             if not events and not alerts:
                 return True
-            try:
-                async with self._database.session() as session:
-                    await Repository(session).save_batch(events=events, alerts=alerts)
-            except _REJECTED:
-                await self._write_row_by_row(events, alerts)
+            failure = await self._save(events=events, alerts=alerts)
+            if failure is None:
                 return True
-            except Exception as exc:
-                self._pending_events[:0] = events
-                self._pending_alerts[:0] = alerts
-                self._trim_pending()
-                self._log.error(
-                    "runtime.persist_failed",
-                    events=len(events),
-                    alerts=len(alerts),
-                    buffered=len(self._pending_events),
-                    error=type(exc).__name__,
-                )
-                return False
-            return True
+            if _is_rejection(failure):
+                return await self._write_row_by_row(events, alerts)
+            self._requeue(events, alerts, failure)
+            return False
 
-    async def _write_row_by_row(self, events: list[Event], alerts: list[Alert]) -> None:
+    async def _save(
+        self, *, events: Sequence[Event] = (), alerts: Sequence[Alert] = ()
+    ) -> Exception | None:
+        """Write records in one transaction; return the failure instead of raising."""
+        try:
+            async with self._database.session() as session:
+                await Repository(session).save_batch(events=events, alerts=alerts)
+        except Exception as exc:
+            return exc
+        return None
+
+    async def _write_row_by_row(self, events: list[Event], alerts: list[Alert]) -> bool:
         """Isolate rows the database rejects so they cannot block the rest.
 
-        Each record gets its own transaction; one that still fails is dropped,
-        counted and logged (exception type only).
+        Each record gets its own transaction; one the database rejects is
+        dropped, counted and logged (exception type only). If the database
+        fails for any other reason midway, the records not yet written are put
+        back like a failed batch and False is returned.
         """
         rejected_events = rejected_alerts = 0
         error = ""
-        for event in events:
-            try:
-                async with self._database.session() as session:
-                    await Repository(session).save_batch(events=[event])
-            except Exception as exc:
+        outage: tuple[list[Event], list[Alert], Exception] | None = None
+        for i, event in enumerate(events):
+            failure = await self._save(events=[event])
+            if failure is not None and not _is_rejection(failure):
+                outage = (events[i:], alerts, failure)
+                break
+            if failure is not None:
                 rejected_events += 1
-                error = type(exc).__name__
-        for alert in alerts:
-            try:
-                async with self._database.session() as session:
-                    await Repository(session).save_batch(alerts=[alert])
-            except Exception as exc:
-                rejected_alerts += 1
-                error = type(exc).__name__
+                error = type(failure).__name__
+        else:
+            for j, alert in enumerate(alerts):
+                failure = await self._save(alerts=[alert])
+                if failure is not None and not _is_rejection(failure):
+                    outage = ([], alerts[j:], failure)
+                    break
+                if failure is not None:
+                    rejected_alerts += 1
+                    error = type(failure).__name__
         self._events_unpersisted += rejected_events
         self._alerts_unpersisted += rejected_alerts
         if rejected_events or rejected_alerts:
@@ -356,6 +377,23 @@ class Runtime:
                 alerts=rejected_alerts,
                 error=error,
             )
+        if outage is not None:
+            self._requeue(*outage)
+            return False
+        return True
+
+    def _requeue(self, events: list[Event], alerts: list[Alert], failure: Exception) -> None:
+        """Put unwritten records back at the front of the buffer (order kept)."""
+        self._pending_events[:0] = events
+        self._pending_alerts[:0] = alerts
+        self._trim_pending()
+        self._log.error(
+            "runtime.persist_failed",
+            events=len(events),
+            alerts=len(alerts),
+            buffered=len(self._pending_events),
+            error=type(failure).__name__,
+        )
 
     async def _flush_periodically(self) -> None:
         """Flush on a full batch or every interval; back off while writes fail."""

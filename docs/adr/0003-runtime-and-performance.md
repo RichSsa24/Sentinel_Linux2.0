@@ -47,11 +47,17 @@ back). SQLite runs in WAL mode with `synchronous=NORMAL`.
 
 A failed write is put back at the front of the buffer and retried with
 exponential backoff (capped at 30 s), so a database restart loses nothing.
-During a longer outage the buffer is capped at 16 batches: the oldest records
-are dropped, and they — like anything still unwritten at shutdown — are
-counted in `sentinel_events_dropped_total{reason="persist_error"}` and
-`sentinel_alerts_unpersisted_total`. Alerts are delivered to their sinks
+During a longer outage the buffer is capped at `SENTINEL_PERSIST_MAX_BUFFERED`
+records: the oldest are dropped, and they — like anything still unwritten at
+shutdown — are counted in `sentinel_events_dropped_total{reason="persist_error"}`
+and `sentinel_alerts_unpersisted_total`. Alerts are delivered to their sinks
 regardless.
+
+A batch the database refuses for its *content* (SQLSTATE class 22 or 23, e.g.
+a value too long) is not an outage: retrying it would block every later write.
+It is retried row by row; rows still refused are dropped and counted the same
+way. The SQLSTATE, not the exception type, decides, because SQLAlchemy's
+asyncpg adapter reports most data errors as a bare `DBAPIError`.
 
 *Trade-offs:* the read API may lag by about one flush interval (0.5 s default);
 a hard kill loses what was buffered — events that were only in memory anyway;

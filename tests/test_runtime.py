@@ -20,7 +20,7 @@ import pytest
 import structlog
 from prometheus_client.parser import text_string_to_metric_families
 from pydantic import SecretStr
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
 from sentinel.alerting import Alert, AlertSink, ConsoleSink, EmailSink, WebhookSink
 from sentinel.api import create_app
@@ -94,6 +94,14 @@ class _Replay(AbstractCollector):
         for event in self._events:
             await queue.put(event)
         await self.wait_stop()
+
+
+class _PgError(Exception):
+    """A driver error carrying a SQLSTATE, as asyncpg's adapted errors do."""
+
+    def __init__(self, message: str, sqlstate: str) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
 
 
 def _events(count: int) -> list[Event]:
@@ -435,11 +443,22 @@ class TestWriteBehind:
         assert failures["left"] == 0
         assert runtime.snapshot().dropped["persist_error"] == 0
 
+    @pytest.mark.parametrize(
+        "rejection",
+        [
+            IntegrityError("INSERT INTO events", {}, Exception("check failed")),
+            # What SQLAlchemy's asyncpg adapter raises for "value too long": a bare
+            # DBAPIError whose original exception carries the SQLSTATE.
+            DBAPIError("INSERT INTO events", {}, _PgError("value too long", "22001")),
+        ],
+        ids=["integrity-error", "asyncpg-data-error"],
+    )
     async def test_a_rejected_row_does_not_block_the_rest(
         self,
         database: Database,
         rules: tuple[Rule, ...],
         monkeypatch: pytest.MonkeyPatch,
+        rejection: DBAPIError,
     ) -> None:
         # Regression: with whole-batch retries, one row the database rejects
         # (an integrity/data error) failed every attempt and stalled persistence
@@ -449,7 +468,7 @@ class TestWriteBehind:
 
         async def picky_save(self: Repository, **batch: Any) -> int:
             if any(event.event.id == poison for event in batch.get("events", ())):
-                raise IntegrityError("INSERT INTO events", {}, Exception("check failed"))
+                raise rejection
             return await original(self, **batch)
 
         monkeypatch.setattr(Repository, "save_batch", picky_save)
@@ -473,6 +492,42 @@ class TestWriteBehind:
         assert written == 4  # everything except the rejected row
         assert runtime.snapshot().dropped["persist_error"] == 1
         assert any(entry["event"] == "runtime.persist_rejected" for entry in logs)
+
+    async def test_an_outage_while_isolating_rows_requeues_instead_of_dropping(
+        self,
+        database: Database,
+        rules: tuple[Rule, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Regression: during the row-by-row retry every failure counted as a
+        # rejection, so a database outage starting midway dropped all the rows
+        # not yet written. Only the poison row may be lost.
+        replay = _events(5)
+        poison, interrupted = replay[1].event.id, replay[3].event.id
+        original = Repository.save_batch
+        outages = [OperationalError("INSERT INTO events", {}, Exception("connection lost"))]
+
+        async def flaky_save(self: Repository, **batch: Any) -> int:
+            ids = [event.event.id for event in batch.get("events", ())]
+            if poison in ids:
+                raise IntegrityError("INSERT INTO events", {}, Exception("check failed"))
+            if ids == [interrupted] and outages:
+                raise outages.pop()
+            return await original(self, **batch)
+
+        monkeypatch.setattr(Repository, "save_batch", flaky_save)
+        runtime = Runtime(
+            make_api_settings(), database=database, metrics=Metrics(), rules=rules, sinks=[]
+        )
+        for event in replay:  # one deterministic batch, no flusher task
+            await runtime._consume(event)
+
+        assert await runtime.flush() is False  # e0, e2 written; e1 rejected; outage at e3
+        assert await _count_events(database) == 2
+        assert len(runtime._pending_events) == 2  # e3, e4 kept for the retry
+        assert await runtime.flush() is True
+        assert await _count_events(database) == 4
+        assert runtime.snapshot().dropped["persist_error"] == 1  # only the poison row
 
     async def test_outage_buffer_is_bounded_and_losses_are_counted(
         self, tmp_path: Path, rules: tuple[Rule, ...]
