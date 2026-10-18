@@ -33,7 +33,12 @@ echo "[1/3] base64-decoding pipeline (rule: base64-execution, T1027)"
 bash -c 'sleep 4; echo ZGF0ZQo= | base64 -d >/dev/null' &
 
 echo "[2/3] listener on unexpected port 4444 (rule: new-listening-service, T1571)"
-python3 -m http.server 4444 --bind 127.0.0.1 >/dev/null 2>&1 &
+# A bare listening socket that never accepts. (Not `http.server`: run under
+# sudo it would serve the working directory — e.g. deploy/.env — as root to
+# any local user for as long as the demo runs.)
+python3 -c 'import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 4444)); s.listen(); time.sleep(30)' &
 LISTENER_PID=$!
 
 if [[ $EUID -eq 0 ]]; then
@@ -54,4 +59,8 @@ for a in json.load(sys.stdin)["data"]:
     print(f"  {a['occurred_at']}  {a['rule_id']:<24} {','.join(a['attack']):<12} {a['host']}")
 PY
 )
-curl -fsS -H "Authorization: Bearer $KEY" "$API/alerts?limit=20" | python3 -c "$PRINT_ALERTS"
+# The header goes through stdin (`printf` is a builtin, so no process carries
+# it): on the command line the API key would be readable by every local user
+# in /proc/<pid>/cmdline.
+printf 'Authorization: Bearer %s\n' "$KEY" \
+    | curl -fsS -H @- "$API/alerts?limit=20" | python3 -c "$PRINT_ALERTS"

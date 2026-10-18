@@ -10,7 +10,8 @@ set -euo pipefail
 IMAGE="${1:?usage: $0 IMAGE}"
 NAME="sentinel-smoke-$$"
 PORT="${SMOKE_PORT:-18080}"
-KEY="smoke-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+# Exported, not passed as `-e NAME=value`: argv is readable by every local user.
+export SENTINEL_API_KEY="smoke-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 BASE="http://127.0.0.1:${PORT}"
 
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
@@ -27,7 +28,7 @@ docker run -d --name "$NAME" \
     --tmpfs "/data:uid=${SVC_UID},gid=${SVC_GID},mode=0700" \
     -v /etc:/host/etc:ro -v /proc:/host/proc:ro \
     -e SENTINEL_HOST_ROOT=/host \
-    -e SENTINEL_API_KEY="$KEY" \
+    -e SENTINEL_API_KEY \
     -e SENTINEL_DATABASE_URL=sqlite+aiosqlite:////data/sentinel.db \
     -p "127.0.0.1:${PORT}:8000" \
     "$IMAGE" >/dev/null
@@ -44,7 +45,8 @@ status=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/metrics")
 [[ "$status" == "401" ]] || { echo "expected 401 without a token, got $status" >&2; exit 1; }
 echo "anonymous /metrics -> 401"
 
-curl -fsS -H "Authorization: Bearer $KEY" "$BASE/metrics" | grep -E '^sentinel_(queue_depth|events_ingested_total) '
+printf 'Authorization: Bearer %s\n' "$SENTINEL_API_KEY" \
+    | curl -fsS -H @- "$BASE/metrics" | grep -E '^sentinel_(queue_depth|events_ingested_total) '
 
 docker stop -t 20 "$NAME" >/dev/null
 code=$(docker inspect -f '{{.State.ExitCode}}' "$NAME")
