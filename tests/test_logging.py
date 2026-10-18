@@ -9,8 +9,11 @@ Covers the §3.3 invariants:
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Iterator
 
 import pytest
+import structlog
 
 from sentinel.logging import (
     REDACTED_PLACEHOLDER,
@@ -146,3 +149,73 @@ class TestConfiguredPipeline:
         # Timestamp present, UTC ISO-8601.
         assert "timestamp" in payload
         assert payload["timestamp"].endswith("Z") or "+00:00" in payload["timestamp"]
+
+
+@pytest.fixture
+def _restore_logging() -> Iterator[None]:
+    """Undo configure_logging: its root handler writes to this test's captured stdout."""
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    yield
+    root.handlers[:] = handlers
+    root.setLevel(level)
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
+    structlog.reset_defaults()
+
+
+@pytest.mark.usefixtures("_restore_logging")
+class TestLibraryLogsAndExceptions:
+    """Regressions: stdlib loggers bypassed the controls; exceptions were not stripped."""
+
+    @pytest.mark.security
+    def test_library_logs_get_the_same_controls_and_format(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "test")
+        configure_logging(settings_no_env_file())
+
+        logging.getLogger("uvicorn.error").warning("bad request\x1b[2J\r\nFORGED line")
+
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert payload["logger"] == "uvicorn.error"
+        assert payload["level"] == "warning"
+        assert "\x1b" not in payload["event"]
+        assert "\r" not in payload["event"]
+
+    @pytest.mark.security
+    def test_outbound_request_urls_are_not_logged(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # httpx logs each request URL at INFO; a Slack-style webhook URL is the secret.
+        monkeypatch.setenv("SENTINEL_ENV", "test")
+        configure_logging(settings_no_env_file())
+
+        url = "https://hooks.example.com/services/T0/B0/webhook-secret"
+        logging.getLogger("httpx").info('HTTP Request: POST %s "HTTP/1.1 200 OK"', url)
+        logging.getLogger("httpx").warning("connection pool exhausted")
+
+        out = capsys.readouterr().out
+        assert "webhook-secret" not in out
+        assert "connection pool exhausted" in out  # warnings still surface
+
+    @pytest.mark.security
+    def test_exception_text_is_stripped_in_console_format(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("SENTINEL_ENV", "test")
+        monkeypatch.setenv("SENTINEL_LOG_FORMAT", "console")
+        configure_logging(settings_no_env_file())
+
+        def fail() -> None:
+            raise ValueError("boom\x1b[2J\rINJECTED 2026 [critical] forged.event")
+
+        try:
+            fail()
+        except ValueError:
+            get_logger("test").exception("op.failed")
+
+        out = capsys.readouterr().out
+        assert "op.failed" in out
+        assert "\x1b" not in out
+        assert "\r" not in out

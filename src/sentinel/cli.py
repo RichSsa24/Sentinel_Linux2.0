@@ -108,6 +108,9 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
             # default for connections from 127.0.0.1) would let any local process
             # choose its rate-limit bucket and forge the address in the logs.
             proxy_headers=False,
+            # Leave logging to the app factory: uvicorn's own config would send
+            # its access and error logs around the redacting JSON pipeline.
+            log_config=None,
         )
         return 0
     _quiet_logs()

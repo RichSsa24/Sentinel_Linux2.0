@@ -1,7 +1,13 @@
 """Structured logging pipeline.
 
 Pipeline order: contextvars merge -> level tag -> UTC ISO-8601 timestamp ->
-control-character stripping -> sensitive-key redaction -> renderer.
+stack/exception rendering -> control-character stripping -> sensitive-key
+redaction -> renderer. Exceptions are rendered to text *before* stripping, so
+attacker bytes in an exception message are cleaned like any other field.
+
+Standard-library loggers (uvicorn, httpx, SQLAlchemy, ...) are routed through
+the same chain via ``structlog.stdlib.ProcessorFormatter``: their records get
+the same stripping and format as Sentinel's own, instead of bypassing both.
 
 Security rationale:
 - **Control-char stripping (CWE-117 — log injection):** every string in the
@@ -113,22 +119,33 @@ def strip_control_chars_processor(
     return {k: _strip_value(v) for k, v in event_dict.items()}
 
 
-def build_processors(log_format: LogFormat) -> list[Processor]:
-    """Return the configured processor chain for the given renderer."""
-    processors: list[Processor] = [
+# Libraries that log every outbound request URL at INFO. A webhook URL can be
+# the credential itself (Slack, Teams, Discord), so they log warnings only.
+_URL_LOGGING_LIBRARIES: Final[tuple[str, ...]] = ("httpx", "httpcore")
+
+
+def _shared_processors() -> list[Processor]:
+    """Everything before rendering; applied to structlog and stdlib records alike."""
+    return [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
-        strip_control_chars_processor,
-        redact_sensitive_processor,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
+        strip_control_chars_processor,
+        redact_sensitive_processor,
     ]
+
+
+def _renderer(log_format: LogFormat) -> Processor:
     if log_format is LogFormat.JSON:
-        processors.append(structlog.processors.JSONRenderer())
-    else:
-        processors.append(structlog.dev.ConsoleRenderer(colors=False))
-    return processors
+        return structlog.processors.JSONRenderer()
+    return structlog.dev.ConsoleRenderer(colors=False)
+
+
+def build_processors(log_format: LogFormat) -> list[Processor]:
+    """Return the configured processor chain for the given renderer."""
+    return [*_shared_processors(), _renderer(log_format)]
 
 
 def configure_logging(settings: Settings) -> None:
@@ -137,12 +154,19 @@ def configure_logging(settings: Settings) -> None:
     Safe to call multiple times — subsequent calls reconfigure.
     """
     numeric_level = logging.getLevelNamesMapping()[settings.log_level.value]
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
-        level=numeric_level,
-        force=True,
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=[structlog.stdlib.add_logger_name, *_shared_processors()],
+            processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                _renderer(settings.log_format),
+            ],
+        )
     )
+    logging.basicConfig(handlers=[handler], level=numeric_level, force=True)
+    for name in _URL_LOGGING_LIBRARIES:
+        logging.getLogger(name).setLevel(max(numeric_level, logging.WARNING))
     structlog.configure(
         processors=build_processors(settings.log_format),
         wrapper_class=structlog.make_filtering_bound_logger(numeric_level),
