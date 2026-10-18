@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -37,11 +38,13 @@ from sentinel.normalizer import (
 )
 from sentinel.pipeline import BoundedEventQueue
 from sentinel.runtime import Runtime
-from sentinel.settings import Settings
+from sentinel.settings import BackpressurePolicy, Settings
 from sentinel.storage import Database, Repository
 
 _HOST = "web01"
 _ATTACKER = "203.0.113.7"
+# Upper bound on the replay; it normally completes in well under a second.
+_DEMO_TIMEOUT_S = 30.0
 # Where the scripted attacker drops its payload. Only ever a string in an event.
 _PAYLOAD = "/tmp/.x/kworker"  # noqa: S108  # nosec B108 — scenario data, not a temp file
 
@@ -172,7 +175,15 @@ async def run_demo(rules_dir: Path, *, stream: TextIO | None = None) -> DemoResu
         database = Database(f"sqlite+aiosqlite:///{Path(tmp) / 'demo.db'}")
         await database.create_all()
         runtime = Runtime(
-            Settings(env="development", persist_flush_interval_seconds=0.05),
+            # Self-contained: ignore any local .env and pin the pipeline knobs the
+            # replay depends on, so a caller's environment cannot change the story.
+            Settings(
+                _env_file=None,
+                env="development",
+                queue_maxsize=10_000,
+                queue_backpressure=BackpressurePolicy.BLOCK,
+                persist_flush_interval_seconds=0.05,
+            ),
             database=database,
             metrics=metrics,
             rules=load_rules(rules_dir),
@@ -180,8 +191,15 @@ async def run_demo(rules_dir: Path, *, stream: TextIO | None = None) -> DemoResu
             sinks=[sink],
         )
         runtime.start()
+        deadline = time.monotonic() + _DEMO_TIMEOUT_S
         try:
-            while metrics.events_ingested._value.get() < unique:  # noqa: ASYNC110 — polls a counter; no completion hook exists
+            # Stop polling once every event is analyzed, the pipeline has died, or
+            # the deadline passes — the summary then reports what actually happened.
+            while (  # noqa: ASYNC110 — polls a counter; no completion hook exists
+                metrics.events_ingested._value.get() < unique
+                and runtime.running
+                and time.monotonic() < deadline
+            ):
                 await asyncio.sleep(0.01)
         finally:
             await runtime.stop()

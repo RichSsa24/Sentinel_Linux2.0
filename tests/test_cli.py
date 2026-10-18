@@ -8,6 +8,7 @@ this fails in CI before anyone sees a broken demo.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import subprocess
 import sys
@@ -19,7 +20,7 @@ import structlog
 import uvicorn
 
 from sentinel import cli
-from sentinel.demo import run_demo
+from sentinel.demo import ScenarioCollector, run_demo
 
 _RULES = Path(__file__).resolve().parent.parent / "rules"
 
@@ -52,6 +53,31 @@ async def test_demo_detects_every_attack_step_and_nothing_benign() -> None:
     assert result.benign_events == 3
     assert result.duplicates_dropped == 1
     assert result.persisted_events == result.replayed - 1
+
+
+@pytest.mark.integration
+async def test_demo_returns_even_if_the_pipeline_dies(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: the demo waited for every event to be analyzed with no exit,
+    # so a pipeline failure hung `sentinel demo` forever.
+    async def crash(self: ScenarioCollector, queue: object) -> None:
+        raise RuntimeError("collector bug")
+
+    monkeypatch.setattr(ScenarioCollector, "run", crash)
+    result = await asyncio.wait_for(run_demo(_RULES, stream=io.StringIO()), timeout=10)
+    assert result.alerts == ()
+    assert result.persisted_events == 0
+
+
+def test_demo_ignores_a_local_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A developer's .env (here: a tiny dropping queue) must not change the replay.
+    (tmp_path / ".env").write_text(
+        "SENTINEL_QUEUE_MAXSIZE=1\nSENTINEL_QUEUE_BACKPRESSURE=drop_newest\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    out = io.StringIO()
+    assert cli.main(["demo", "--rules-dir", str(_RULES)], out=out) == 0
+    assert "0 alerts on the 3 benign events" in out.getvalue()
+    assert "11 alerts from 11 rules" in out.getvalue()
 
 
 def test_demo_command_prints_alerts_and_summary() -> None:
