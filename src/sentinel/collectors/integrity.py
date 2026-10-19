@@ -39,6 +39,10 @@ Security posture (per the collector contract in
   mid-scan) is logged and skipped, never fatal.
 - **Never blocks the event loop.** The whole scan runs in a worker thread via
   :func:`asyncio.to_thread`.
+- **Stops on time.** Cancellation cannot reach that thread, so the scan checks
+  a deadline between files: once stop is requested, scanning gets
+  ``_STOP_BUDGET_S`` in all. A scan cut short is discarded, never diffed (the
+  files it did not reach would read as deleted).
 
 Containerized deployments mount the host's filesystem read-only under a
 ``host_root`` (e.g. ``/host``). The collector then scans ``/host/etc`` but keys
@@ -50,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import os
 import socket
 import stat
@@ -74,6 +79,9 @@ _DEFAULT_MAX_FILES: Final[int] = 50_000
 # poll even if their stat is unchanged: far wider than the kernel's timestamp
 # granularity (one jiffy, 1-10 ms) plus ordinary clock jitter.
 _RACY_WINDOW_NS: Final[int] = 2_000_000_000
+# Scanning time left once stop is requested (the scan in progress, then the
+# final catch-up): shutdown as a whole must fit Docker's default 10 s.
+_STOP_BUDGET_S: Final[float] = 2.0
 
 _ACTION_CREATED: Final[str] = "file_created"
 _ACTION_MODIFIED: Final[str] = "file_modified"
@@ -114,6 +122,14 @@ class _FileState(NamedTuple):
             and self.inode == other.inode
             and self.device == other.device
         )
+
+
+class _ScanInterruptedError(Exception):
+    """A scan reached its stop deadline; its partial snapshot must not be used."""
+
+    def __init__(self, files_scanned: int) -> None:
+        super().__init__(files_scanned)
+        self.files_scanned = files_scanned
 
 
 class FileIntegrityCollector(AbstractCollector):
@@ -157,6 +173,9 @@ class FileIntegrityCollector(AbstractCollector):
         self._emitted = 0
         self._hashed = 0
         self._hash_reused = 0
+        # Monotonic time at which a scan gives up: set by stop(), read by the
+        # scan thread (a single attribute, so the read is atomic).
+        self._scan_deadline = math.inf
 
     async def run(self, queue: BoundedEventQueue) -> None:
         """Seed a baseline, then emit one event per change until stopped."""
@@ -167,9 +186,23 @@ class FileIntegrityCollector(AbstractCollector):
         # Final catch-up so a change made just before stop is not lost.
         await self._drain_once(queue)
 
+    async def stop(self) -> None:
+        """Request a stop; a scan in progress gives up within ``_STOP_BUDGET_S``."""
+        self._scan_deadline = time.monotonic() + _STOP_BUDGET_S
+        await super().stop()
+
     async def _drain_once(self, queue: BoundedEventQueue) -> None:
         """Scan, diff, normalize each change, and enqueue the resulting events."""
-        snapshot = await asyncio.to_thread(self._scan, self._baseline)
+        try:
+            snapshot = await asyncio.to_thread(self._scan, self._baseline)
+        except _ScanInterruptedError as interrupted:
+            # Changes since the last complete scan go unreported: say so.
+            self._log.warning(
+                "integrity.scan_interrupted",
+                files_scanned=interrupted.files_scanned,
+                baseline_seeded=self._seeded,
+            )
+            return
         if not self._seeded:
             self._baseline = snapshot
             self._seeded = True
@@ -198,6 +231,8 @@ class FileIntegrityCollector(AbstractCollector):
         snapshot: dict[str, _FileState] = {}
         for root in self._paths:
             for path in self._iter_files(under_host_root(self._host_root, root)):
+                if time.monotonic() > self._scan_deadline:
+                    raise _ScanInterruptedError(len(snapshot))
                 if len(snapshot) >= self._max_files:
                     self._log.warning("integrity.max_files_reached", max_files=self._max_files)
                     return snapshot

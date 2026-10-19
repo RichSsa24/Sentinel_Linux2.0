@@ -101,6 +101,10 @@ before deploying over an earlier version.
   discarded; they are now analyzed, and the new file is retried and reported
   unavailable until it can be read.
 - `sentinel demo` no longer warns about a rule it then fires.
+- Shutdown waited for a file-integrity scan in progress, and then for a final
+  one; over a large watched tree that outlasted Docker's stop timeout and the
+  process was killed (exit 137) before it flushed. A stop request now ends
+  scanning within 2 s, and a scan cut short is discarded rather than diffed.
 
 ### Upgrade notes
 

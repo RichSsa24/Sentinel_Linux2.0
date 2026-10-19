@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 from structlog.testing import capture_logs
 
+from sentinel.collectors import integrity
 from sentinel.collectors.integrity import (
     FileIntegrityCollector,
     _content_changed,
@@ -752,6 +753,55 @@ class TestMutationGaps:
         monkeypatch.setattr(Path, "lstat", lstat)
         state = _collector(tmp_path)._scan()[str(tmp_path / "owned")]
         assert (state.uid, state.gid) == (1234, 5678)
+
+
+@pytest.mark.security
+class TestStopsOnTime:
+    """Regression: the scan runs in a worker thread, which cancellation cannot
+    reach, so shutdown lasted as long as the scan and then a final one. On a CI
+    runner's /etc that outlasted Docker's 20 s stop timeout: SIGKILL, exit 137.
+    """
+
+    async def test_a_scan_in_progress_ends_soon_after_stop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for i in range(400):
+            (tmp_path / f"f{i}").write_text(str(i), encoding="utf-8")
+        collector = _collector(tmp_path, poll_interval=60)
+        snapshot_file = collector._snapshot_file
+        visited: list[Path] = []
+
+        def slow(path: Path, *args: object) -> object:
+            visited.append(path)
+            time.sleep(0.01)  # 400 files: a 4 s scan
+            return snapshot_file(path, *args)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(collector, "_snapshot_file", slow)
+        monkeypatch.setattr(integrity, "_STOP_BUDGET_S", 0.2)
+        queue = BoundedEventQueue(maxsize=16)
+        task = asyncio.create_task(collector.run(queue))
+        assert await _wait_for(lambda: len(visited) > 10)  # the baseline scan is under way
+        started = time.monotonic()
+        with capture_logs() as logs:
+            await collector.stop()
+            await asyncio.wait_for(task, timeout=3)
+        assert time.monotonic() - started < 1.5  # the budget, not two 4 s scans
+        assert not collector._seeded
+        assert "integrity.scan_interrupted" in [entry["event"] for entry in logs]
+
+    async def test_a_scan_cut_short_reports_no_change(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Diffing a partial snapshot would report every file it did not reach
+        # as deleted.
+        for i in range(50):
+            (tmp_path / f"f{i}").write_text(str(i), encoding="utf-8")
+        collector = _collector(tmp_path, poll_interval=60)
+        await _drain(collector)  # the baseline: 50 files
+        monkeypatch.setattr(integrity, "_STOP_BUDGET_S", -1.0)  # already past
+        await collector.stop()
+        assert await _drain(collector) == []
+        assert len(collector._baseline) == 50  # kept for a later complete scan
 
 
 class TestMutationGapsLifecycle:

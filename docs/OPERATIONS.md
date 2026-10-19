@@ -272,6 +272,7 @@ as `api.request` with its `request_id` (also returned as `X-Request-ID`).
 | `collector.source_unavailable` / `collector.source_available` | a source went missing / came back |
 | `authlog.started_at_end` | bytes of history skipped at start-up |
 | `integrity.baseline_seeded` (and process, network) | start-up baseline size |
+| `integrity.scan_interrupted` | a file-integrity scan cut short by shutdown (2 s budget): changes since the last complete scan were not reported |
 | `runtime.persist_failed` / `runtime.persist_rejected` | write failures / rows the database refused |
 | `runtime.pruned` / `runtime.prune_failed` | retention runs |
 | `alert.throttled` | the first notification withheld by a throttle in its window |
