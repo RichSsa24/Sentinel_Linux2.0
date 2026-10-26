@@ -11,7 +11,7 @@
 
 FROM ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 AS uv
 
-FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS builder
+FROM python:3.15-slim-bookworm@sha256:575f8bc12ec26542e0678bc6b60e385218248019d433157ec327264a78c3a853 AS builder
 
 COPY --from=uv /uv /bin/uv
 
@@ -31,7 +31,7 @@ RUN uv sync --frozen --no-dev --no-editable
 
 # ---------------------------------------------------------------------------
 
-FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
+FROM python:3.15-slim-bookworm@sha256:575f8bc12ec26542e0678bc6b60e385218248019d433157ec327264a78c3a853
 
 LABEL org.opencontainers.image.title="Sentinel-Linux" \
       org.opencontainers.image.description="Host-based intrusion detection for Linux: collectors, ATT&CK-mapped YAML rules, hardened alerting and API." \
