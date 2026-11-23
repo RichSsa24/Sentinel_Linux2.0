@@ -79,7 +79,7 @@ services:
         condition: service_healthy
 
   postgres:
-    image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    image: postgres:19.0-alpine@sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188
     container_name: sentinel_db
     restart: unless-stopped
     logging: *logging
